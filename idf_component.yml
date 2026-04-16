@@ -1,0 +1,8 @@
+version: ">=2.0"
+description: "Synthewi - Expressive sound generation with capacitive touch sensing on ESP32-S3"
+maintainer: "You"
+url: ""
+
+dependencies:
+  idf: ">=5.0"
+  espressif/esp_tinyusb: "^2.1.1"

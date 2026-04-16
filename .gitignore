@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ESP-IDF specific
+build/
+managed_components/
+sdkconfig.old
+.sdkconfig.swp
+*.pb.c
+*.pb.h
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local helper scripts
+capture_monitor.py
+run_monitor.ps1
+
+# Dependencies
+venv/
+env/
