@@ -1,148 +1,163 @@
-#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+#include <inttypes.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "touch_control.h"
-#include "usb_midi.h"
+#include "usb_device_uac.h"
+#include "amy_engine.h"
 
 static const char *TAG = "Synthewi";
-static const char *TOUCH_TAG = "TOUCH";
 
-#define NUM_TOUCH_PADS 4
-#define TOUCH_SCOPE_MODE 0
-#define TOUCH_LOOP_MS 20
-#define TOUCH_DEBUG_PRINT_MS 1000
-#define TOUCH_MANUAL_ON_DELTA 11000
-#define TOUCH_MANUAL_OFF_DELTA 9000
-#define TOUCH_NOTE_VELOCITY 100
+#define OUTPUT_GAIN_BOOST 8
+#define TEST_WAV_PLAYBACK 1
 
-// Touch sensors
-touch_sensor_t touch_pad[NUM_TOUCH_PADS];
+static bool is_muted = false;
+static uint32_t volume_factor = 100;
+static volatile uint32_t s_usb_in_cb_count = 0;
+static esp_err_t usb_uac_device_output_cb(uint8_t *buf, size_t len, void *arg)
+{
+    (void)buf;
+    (void)len;
+    (void)arg;
+    return ESP_OK;
+}
 
-#if !TOUCH_SCOPE_MODE
-// MIDI note for each pad
-static const uint8_t midi_notes[NUM_TOUCH_PADS] = {
-    60,  // C4
-    62,  // D4
-    64,  // E4
-    65,  // F4
-};
+static esp_err_t usb_uac_device_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void *arg)
+{
+    (void)arg;
+    size_t samples = len / sizeof(int16_t);
+    int16_t *out = (int16_t *)buf;
+    static uint32_t cb_count = 0;
+    static TickType_t last_stats_tick = 0;
+    int32_t peak = 0;
 
-// Track which notes are currently playing
-static bool note_playing[NUM_TOUCH_PADS] = {false};
+#if TEST_WAV_PLAYBACK
+    amy_engine_render_wav_mono_16(out, samples);
+#else
+    amy_engine_render_mono_16(out, samples);
 #endif
 
-static uint16_t abs_delta_u16(const touch_sensor_t *sensor)
-{
-    int32_t d = (int32_t)sensor->raw_value - (int32_t)sensor->baseline_value;
-    if (d < 0) {
-        d = -d;
+    for (size_t i = 0; i < samples; i++) {
+        int32_t sample = is_muted ? 0 : out[i];
+        sample = (sample * (int32_t)volume_factor) / 100;
+        sample = sample * OUTPUT_GAIN_BOOST;
+
+        if (sample > 32767) {
+            sample = 32767;
+        } else if (sample < -32768) {
+            sample = -32768;
+        }
+
+        int32_t abs_sample = (sample < 0) ? -sample : sample;
+        if (abs_sample > peak) {
+            peak = abs_sample;
+        }
+
+        out[i] = (int16_t)sample;
     }
-    return (uint16_t)d;
+
+    *bytes_read = samples * sizeof(int16_t);
+
+    cb_count++;
+    s_usb_in_cb_count = cb_count;
+    TickType_t now = xTaskGetTickCount();
+    if ((now - last_stats_tick) >= pdMS_TO_TICKS(1000)) {
+        ESP_LOGI(TAG, "USB IN: cb=%" PRIu32 " samples=%u peak=%ld mute=%d vol=%" PRIu32,
+                 cb_count, (unsigned)samples, (long)peak, (int)is_muted, volume_factor);
+        last_stats_tick = now;
+    }
+
+    return ESP_OK;
+}
+
+static void usb_uac_device_set_mute_cb(uint32_t mute, void *arg)
+{
+    (void)arg;
+    is_muted = (mute != 0);
+    ESP_LOGI(TAG, "USB set mute: %u", (unsigned)mute);
+}
+
+static void usb_uac_device_set_volume_cb(uint32_t _volume, void *arg)
+{
+    (void)arg;
+    int volume_ui = (int)_volume;
+    if (volume_ui < 0) {
+        volume_ui = 0;
+    } else if (volume_ui > 100) {
+        volume_ui = 100;
+    }
+
+    int volume_db = volume_ui / 2 - 50;
+    if (volume_db >= 0) {
+        volume_factor = 100;
+    } else {
+        float linear = powf(10.0f, (float)volume_db / 20.0f);
+        uint32_t mapped = (uint32_t)(linear * 100.0f);
+        // Keep an audible floor unless host explicitly mutes us.
+        if ((!is_muted) && (mapped < 8U)) {
+            mapped = 8U;
+        }
+        volume_factor = mapped;
+    }
+
+    ESP_LOGI(TAG, "USB set volume: raw=%u db=%d factor=%" PRIu32,
+             (unsigned)_volume, volume_db, volume_factor);
+}
+
+static void usb_uac_device_init(void)
+{
+    uac_device_config_t config = {
+        .output_cb = usb_uac_device_output_cb,
+        .input_cb = usb_uac_device_input_cb,
+        .set_mute_cb = usb_uac_device_set_mute_cb,
+        .set_volume_cb = usb_uac_device_set_volume_cb,
+        .cb_ctx = NULL,
+    };
+
+    ESP_ERROR_CHECK(uac_device_init(&config));
 }
 
 void app_main(void)
 {
-    // Keep global logs minimal, then enable only relevant tags for tuning.
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
-    esp_log_level_set(TOUCH_TAG, ESP_LOG_INFO);
+    esp_log_level_set("AMY_ENGINE", ESP_LOG_INFO);
 
-    ESP_LOGI(TAG, "Synthewi - Expressive Touch MIDI Controller");
-    ESP_LOGI(TAG, "Starting up...\n");
-
-#if !TOUCH_SCOPE_MODE
-    // Initialize USB MIDI
-    usb_midi_init();
-    ESP_LOGI(TAG, "USB MIDI initialized successfully");
-#else
-    ESP_LOGI(TAG, "TOUCH_SCOPE_MODE active: streaming raw data only (MIDI disabled)");
+    ESP_LOGI(TAG, "Synthewi - WAV + USB UAC transport test");
+    ESP_LOGI(TAG, "Build: %s %s", __DATE__, __TIME__);
+#if TEST_WAV_PLAYBACK
+    ESP_LOGW(TAG, "TEST MODE: streaming embedded WAV through the USB mic path");
 #endif
 
-    // Touch profile: GPIO4/GPIO5/GPIO6/GPIO7 -> touch channels 4/5/6/7.
-    uint8_t touch_channels[NUM_TOUCH_PADS] = {4, 5, 6, 7};
-    
-    for (int i = 0; i < NUM_TOUCH_PADS; i++) {
-        ESP_LOGI(TAG, "Initializing touch pad %d on touch channel %d", i, touch_channels[i]);
-        touch_sensor_init(&touch_pad[i], touch_channels[i], 80);
-    }
+    amy_engine_init();
+    usb_uac_device_init();
 
-    ESP_LOGI(TAG, "Initialization complete!");
-#if TOUCH_SCOPE_MODE
-    ESP_LOGI(TAG, "Watch smooth/base/delta values and decide threshold manually\n");
-#else
-    ESP_LOGI(TAG, "Manual threshold mode: ON >= %d, OFF < %d\n", TOUCH_MANUAL_ON_DELTA, TOUCH_MANUAL_OFF_DELTA);
-#endif
+    ESP_LOGI(TAG, "USB audio callback source: embedded WAV loop");
 
-    uint32_t tick_count = 0;
+    uint32_t last_usb_cb_count = 0;
+    TickType_t last_usb_check_tick = xTaskGetTickCount();
+    TickType_t last_usb_warn_tick = xTaskGetTickCount();
 
-    // Main control loop
     while (1) {
-#if TOUCH_SCOPE_MODE
-        // Stream raw values for visual threshold tuning.
-        for (int i = 0; i < NUM_TOUCH_PADS; i++) {
-            touch_sensor_sample(&touch_pad[i]);
-        }
-
-        uint32_t debug_period_ticks = TOUCH_DEBUG_PRINT_MS / TOUCH_LOOP_MS;
-        if ((debug_period_ticks > 0) && ((tick_count % debug_period_ticks) == 0)) {
-                ESP_LOGI(TAG,
-                     "CH4 s=%u b=%u d=%u | CH5 s=%u b=%u d=%u | CH6 s=%u b=%u d=%u | CH7 s=%u b=%u d=%u",
-                     touch_pad[0].raw_value,
-                     touch_pad[0].baseline_value,
-                     abs_delta_u16(&touch_pad[0]),
-                     touch_pad[1].raw_value,
-                     touch_pad[1].baseline_value,
-                     abs_delta_u16(&touch_pad[1]),
-                     touch_pad[2].raw_value,
-                     touch_pad[2].baseline_value,
-                     abs_delta_u16(&touch_pad[2]),
-                     touch_pad[3].raw_value,
-                     touch_pad[3].baseline_value,
-                     abs_delta_u16(&touch_pad[3]));
-        }
-#else
-        for (int i = 0; i < NUM_TOUCH_PADS; i++) {
-            // Use raw sampled data and a fixed manual threshold gate.
-            touch_sensor_sample(&touch_pad[i]);
-
-            uint16_t abs_delta = abs_delta_u16(&touch_pad[i]);
-
-            uint32_t debug_period_ticks = TOUCH_DEBUG_PRINT_MS / TOUCH_LOOP_MS;
-            if ((debug_period_ticks > 0) && ((tick_count % debug_period_ticks) == 0)) {
-                ESP_LOGI(TAG,
-                         "P%d ch%u base=%u raw=%u delta=%u gate_on=%d gate_off=%d",
-                         i,
-                         touch_pad[i].touch_channel,
-                         touch_pad[i].baseline_value,
-                         touch_pad[i].raw_value,
-                         abs_delta,
-                         TOUCH_MANUAL_ON_DELTA,
-                         TOUCH_MANUAL_OFF_DELTA);
-            }
-
-            bool touching_now = note_playing[i]
-                                   ? (abs_delta >= TOUCH_MANUAL_OFF_DELTA)
-                                   : (abs_delta >= TOUCH_MANUAL_ON_DELTA);
-
-            if (touching_now) {
-                if (!note_playing[i]) {
-                    usb_midi_note_on(midi_notes[i], TOUCH_NOTE_VELOCITY);
-                    note_playing[i] = true;
-                    ESP_LOGI(TAG, "Pad %d: Note ON (note=%d, delta=%u)", i, midi_notes[i], abs_delta);
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_usb_check_tick) >= pdMS_TO_TICKS(1000)) {
+            uint32_t current_cb_count = s_usb_in_cb_count;
+            if (current_cb_count == last_usb_cb_count) {
+                if ((now - last_usb_warn_tick) >= pdMS_TO_TICKS(5000)) {
+                    ESP_LOGW(TAG, "USB mic stream inactive: open/select Synthewi USB Audio input on host");
+                    last_usb_warn_tick = now;
                 }
             } else {
-                if (note_playing[i]) {
-                    usb_midi_note_off(midi_notes[i], 64);
-                    note_playing[i] = false;
-                    ESP_LOGI(TAG, "Pad %d: Note OFF (delta=%u)", i, abs_delta);
-                }
+                last_usb_warn_tick = now;
             }
-        }
-#endif
 
-        tick_count++;
-        // Update at 20ms interval (50 Hz) for responsive MIDI
-        vTaskDelay(TOUCH_LOOP_MS / portTICK_PERIOD_MS);
+            last_usb_cb_count = current_cb_count;
+            last_usb_check_tick = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

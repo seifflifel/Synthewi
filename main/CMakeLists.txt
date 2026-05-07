@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                        INCLUDE_DIRS "."
-                       REQUIRES esp_adc esp_timer touch_control usb_midi)
+                       REQUIRES driver freertos amy_engine espressif__usb_device_uac)
