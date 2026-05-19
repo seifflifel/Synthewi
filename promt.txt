@@ -1,0 +1,252 @@
+You are a senior embedded + fullstack engineer. Implement a PC-hosted bridge for ESP32‑S3 touch telemetry + threshold tuning with live plots.
+
+Context/goal:
+
+ESP32‑S3 reads 4 touch pads (physical touch channels GPIO4/5/6/7 mapped to UI channels ch0..ch3).
+The ESP must remain “sound-first”: it must keep producing sound and functioning without the web tooling. The web tooling is ONLY for prototyping/tuning.
+Touch telemetry should be ~30 Hz (idk im just guessing this , if it has to be changed it okay)
+UI already exists (Vite/TS) and expects a WebSocket server speaking a versioned JSON protocol: hello/telemetry/set/ping/pong. UI shows a sparkline plot for raw/baseline and lights a badge when is_touching is true. It already sends set messages like touch.ch0.threshold.
+New architecture choice: The “server” runs on the PC (not on ESP). ESP sends touch telemetry over Wi‑Fi using UDP broadcast. PC receives telemetry and exposes a WebSocket endpoint for the browser UI. When UI changes threshold, PC sends a command back to ESP (prefer unicast reply to the ESP source IP learned from telemetry). ESP must apply threshold locally.
+Hard constraints:
+
+Do NOT add JSON parsing or dynamic allocation in any audio callback on the ESP.
+Keep Wi‑Fi/UDP work in its own task(s).
+Keep changes minimal and aligned with existing code style.
+Do not add extra UI pages or features beyond: (1) live plot, (2) threshold set with slider release = apply, plus (3) a numeric input field with an Apply button per channel.
+Deliverables:
+
+ESP firmware changes
+Add a touch telemetry task at ~30 Hz:
+Initialize 4 touch sensors (touch_control component already exists).
+Each tick: sample each channel, compute:
+raw (smooth)
+baseline (benchmark)
+abs_delta = abs(raw - baseline)
+is_touching = (abs_delta >= threshold[ch])
+intensity (optional; can be derived or reuse existing helper if available)
+{this is old codde of how i made it work with midi
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "touch_control.h"
+#include "usb_midi.h"
+
+static const char *TAG = "Synthewi";
+static const char *TOUCH_TAG = "TOUCH";
+
+#define NUM_TOUCH_PADS 4
+#define TOUCH_SCOPE_MODE 0
+#define TOUCH_LOOP_MS 20
+#define TOUCH_DEBUG_PRINT_MS 1000
+#define TOUCH_MANUAL_ON_DELTA 11000
+#define TOUCH_MANUAL_OFF_DELTA 9000
+#define TOUCH_NOTE_VELOCITY 100
+
+// Touch sensors
+touch_sensor_t touch_pad[NUM_TOUCH_PADS];
+
+#if !TOUCH_SCOPE_MODE
+// MIDI note for each pad
+static const uint8_t midi_notes[NUM_TOUCH_PADS] = {
+    60,  // C4
+    62,  // D4
+    64,  // E4
+    65,  // F4
+};
+
+// Track which notes are currently playing
+static bool note_playing[NUM_TOUCH_PADS] = {false};
+#endif
+
+static uint16_t abs_delta_u16(const touch_sensor_t *sensor)
+{
+    int32_t d = (int32_t)sensor->raw_value - (int32_t)sensor->baseline_value;
+    if (d < 0) {
+        d = -d;
+    }
+    return (uint16_t)d;
+}
+
+void app_main(void)
+{
+    // Keep global logs minimal, then enable only relevant tags for tuning.
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set(TOUCH_TAG, ESP_LOG_INFO);
+
+    ESP_LOGI(TAG, "Synthewi - Expressive Touch MIDI Controller");
+    ESP_LOGI(TAG, "Starting up...\n");
+
+#if !TOUCH_SCOPE_MODE
+    // Initialize USB MIDI
+    usb_midi_init();
+    ESP_LOGI(TAG, "USB MIDI initialized successfully");
+#else
+    ESP_LOGI(TAG, "TOUCH_SCOPE_MODE active: streaming raw data only (MIDI disabled)");
+#endif
+
+    // Touch profile: GPIO4/GPIO5/GPIO6/GPIO7 -> touch channels 4/5/6/7.
+    uint8_t touch_channels[NUM_TOUCH_PADS] = {4, 5, 6, 7};
+    
+    for (int i = 0; i < NUM_TOUCH_PADS; i++) {
+        ESP_LOGI(TAG, "Initializing touch pad %d on touch channel %d", i, touch_channels[i]);
+        touch_sensor_init(&touch_pad[i], touch_channels[i], 80);
+    }
+
+    ESP_LOGI(TAG, "Initialization complete!");
+#if TOUCH_SCOPE_MODE
+    ESP_LOGI(TAG, "Watch smooth/base/delta values and decide threshold manually\n");
+#else
+    ESP_LOGI(TAG, "Manual threshold mode: ON >= %d, OFF < %d\n", TOUCH_MANUAL_ON_DELTA, TOUCH_MANUAL_OFF_DELTA);
+#endif
+
+    uint32_t tick_count = 0;
+
+    // Main control loop
+    while (1) {
+#if TOUCH_SCOPE_MODE
+        // Stream raw values for visual threshold tuning.
+        for (int i = 0; i < NUM_TOUCH_PADS; i++) {
+            touch_sensor_sample(&touch_pad[i]);
+        }
+
+        uint32_t debug_period_ticks = TOUCH_DEBUG_PRINT_MS / TOUCH_LOOP_MS;
+        if ((debug_period_ticks > 0) && ((tick_count % debug_period_ticks) == 0)) {
+                ESP_LOGI(TAG,
+                     "CH4 s=%u b=%u d=%u | CH5 s=%u b=%u d=%u | CH6 s=%u b=%u d=%u | CH7 s=%u b=%u d=%u",
+                     touch_pad[0].raw_value,
+                     touch_pad[0].baseline_value,
+                     abs_delta_u16(&touch_pad[0]),
+                     touch_pad[1].raw_value,
+                     touch_pad[1].baseline_value,
+                     abs_delta_u16(&touch_pad[1]),
+                     touch_pad[2].raw_value,
+                     touch_pad[2].baseline_value,
+                     abs_delta_u16(&touch_pad[2]),
+                     touch_pad[3].raw_value,
+                     touch_pad[3].baseline_value,
+                     abs_delta_u16(&touch_pad[3]));
+        }
+#else
+        for (int i = 0; i < NUM_TOUCH_PADS; i++) {
+            // Use raw sampled data and a fixed manual threshold gate.
+            touch_sensor_sample(&touch_pad[i]);
+
+            uint16_t abs_delta = abs_delta_u16(&touch_pad[i]);
+
+            uint32_t debug_period_ticks = TOUCH_DEBUG_PRINT_MS / TOUCH_LOOP_MS;
+            if ((debug_period_ticks > 0) && ((tick_count % debug_period_ticks) == 0)) {
+                ESP_LOGI(TAG,
+                         "P%d ch%u base=%u raw=%u delta=%u gate_on=%d gate_off=%d",
+                         i,
+                         touch_pad[i].touch_channel,
+                         touch_pad[i].baseline_value,
+                         touch_pad[i].raw_value,
+                         abs_delta,
+                         TOUCH_MANUAL_ON_DELTA,
+                         TOUCH_MANUAL_OFF_DELTA);
+            }
+
+            bool touching_now = note_playing[i]
+                                   ? (abs_delta >= TOUCH_MANUAL_OFF_DELTA)
+                                   : (abs_delta >= TOUCH_MANUAL_ON_DELTA);
+
+            if (touching_now) {
+                if (!note_playing[i]) {
+                    usb_midi_note_on(midi_notes[i], TOUCH_NOTE_VELOCITY);
+                    note_playing[i] = true;
+                    ESP_LOGI(TAG, "Pad %d: Note ON (note=%d, delta=%u)", i, midi_notes[i], abs_delta);
+                }
+            } else {
+                if (note_playing[i]) {
+                    usb_midi_note_off(midi_notes[i], 64);
+                    note_playing[i] = false;
+                    ESP_LOGI(TAG, "Pad %d: Note OFF (delta=%u)", i, abs_delta);
+                }
+            }
+        }
+#endif
+
+        tick_count++;
+        // Update at 20ms interval (50 Hz) for responsive MIDI
+        vTaskDelay(TOUCH_LOOP_MS / portTICK_PERIOD_MS);
+    }
+}
+}
+Broadcast telemetry packet via UDP at 30 Hz.
+Add a UDP command receiver:
+Listen on a UDP port for “set threshold” commands.
+Apply threshold locally (update the per-channel threshold variable used for is_touching computation).
+Optional: reply with an ACK packet (nice-to-have, but keep simple).
+Telemetry must include enough info for the PC to map device identity and reply unicast:
+Include at least: protocol version, sequence number, and optionally MAC.
+PC can always use the source IP/port of the received telemetry for replies.
+PC bridge server
+Implement a lightweight server that:
+Listens for ESP telemetry UDP broadcast packets.
+Keeps the latest state for each device (start with single device support; OK to key by source IP).
+Hosts a WebSocket server for the browser UI.
+On client connect:
+Reply to hello with {"type":"hello","v":1,"device":"Synthewi-Bridge","caps":{"touch":true},"ts":...}
+Handle ping by sending pong.
+At ~30 Hz (or on each telemetry receipt), emit UI telemetry messages:
+{"type":"telemetry","v":1,"ts":<ms>,"touch":{"ch0":{raw,baseline,abs_delta,threshold,intensity,is_touching},...}}
+Handle UI set messages for thresholds:
+Paths: touch.ch0.threshold .. touch.ch3.threshold
+Send a UDP command to ESP to update that channel threshold.
+Respond to UI with ack for the id (or error on invalid path/value).
+Prefer Node.js (TypeScript) since UI is already Node-based, unless Python is significantly simpler in this repo. Choose one and keep it minimal.
+UI changes
+Keep existing slider behavior (release slider = apply).
+For each touch channel card, add:
+A numeric input field showing the current threshold value.
+An Apply button that sends the threshold immediately (same path as slider).
+Keep UI state consistent when telemetry reports a different threshold (telemetry should “win” as source of truth).
+Protocol decisions (must implement exactly):
+
+WebSocket protocol stays as the UI expects (version v=1) with message shapes:
+hello, telemetry, set, ack/error, ping/pong.
+UDP wire format:
+Define a small, explicit binary packet format (recommended) OR minimal JSON (only if you can justify overhead).
+If binary: include magic bytes, version, seq, 4 channels * (raw u16, baseline u16, threshold u16, is_touching u8).
+Use little-endian and document it in a short README.
+Acceptance criteria:
+
+With ESP on STA mode (home router) and PC on same network:
+Running the PC bridge + npm run dev for the UI:
+UI connects to PC WebSocket URL and shows live updating sparklines for raw/baseline at ~30 Hz.
+Moving slider and releasing updates threshold; typing a number and clicking Apply updates threshold.
+The “touch” badge lights when abs_delta >= threshold.
+ESP continues running audio path normally and does not depend on the bridge to operate.
+Implementation plan (do in this order):
+
+Implement and validate ESP UDP telemetry broadcast (one direction).
+Implement PC UDP receiver + WS server that forwards telemetry to UI.
+Wire UI to connect to PC WS URL; verify plotting + badge.
+Implement UI set threshold -> PC -> ESP command -> ESP local apply -> reflected back in telemetry.
+Add minimal docs: how to run bridge, ports used, how to find WS URL.
+Be careful about:
+
+Touch channel mapping: physical touch channels 4/5/6/7 correspond to UI ch0..ch3.
+Timing: 30 Hz tasks must not starve audio; use low/medium priority and avoid heavy work.
+Wi‑Fi: use existing Wi‑Fi manager (STA mode) and do not break SoftAP config portal fallback.
+After coding:
+
+Provide run instructions for Windows PowerShell:
+Start bridge server
+Start UI (npm install, npm run dev)
+Flash ESP and verify telemetry
+Provide a quick troubleshooting section (no device found, firewall, wrong subnet).
+Before you start, quickly inspect the repo to locate:
+
+touch driver module (touch_control)
+wifi manager
+existing UI protocol types and current ws client behavior
+and align your implementation to those.
+Questions you may ask ONLY if blocked:
+
+Which UDP ports should we use (otherwise choose sensible defaults and document them).
+Single device vs multiple devices (default single device).
+End.
+

@@ -5,13 +5,17 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_err.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "usb_device_uac.h"
 #include "amy_engine.h"
+#include "wifi_manager.h"
+#include "touch_telemetry.h"
 
 static const char *TAG = "Synthewi";
 
-#define OUTPUT_GAIN_BOOST 8
+#define OUTPUT_GAIN_BOOST 4
 #define TEST_WAV_PLAYBACK 1
 
 static bool is_muted = false;
@@ -132,10 +136,36 @@ void app_main(void)
     ESP_LOGW(TAG, "TEST MODE: streaming embedded WAV through the USB mic path");
 #endif
 
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    } else {
+        ESP_ERROR_CHECK(err);
+    }
+
+    // Initialize Wi-Fi first (while heap is clean) - non-fatal on failure
+    err = wifi_manager_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi initialization failed (err=0x%x): %s; continuing with USB audio only", err, esp_err_to_name(err));
+    }
+
+    // Initialize touch telemetry (non-fatal on failure)
+    err = touch_telemetry_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Touch telemetry initialization failed (err=0x%x): %s; continuing with USB audio only", err, esp_err_to_name(err));
+    }
+
     amy_engine_init();
     usb_uac_device_init();
 
+    // Start Wi-Fi event loop task if needed (optional background monitoring)
+    // if (xTaskCreate(wifi_init_task, "wifi_init", 2048, NULL, 3, NULL) != pdPASS) {
+    //     ESP_LOGW(TAG, "Failed to create Wi-Fi init task");
+    // }
+
     ESP_LOGI(TAG, "USB audio callback source: embedded WAV loop");
+
 
     uint32_t last_usb_cb_count = 0;
     TickType_t last_usb_check_tick = xTaskGetTickCount();

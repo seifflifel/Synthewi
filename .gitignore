@@ -26,3 +26,8 @@ run_monitor.ps1
 # Dependencies
 venv/
 env/
+
+# Exclude web UI and analysis files (checkpoint branch should not push these)
+/web/
+AMY_SPARK_SYNTH_ANALYSIS.md
+ESP32S3_SYNTH_ARCHITECTURE_AND_CLAUDE_PROMPTS.md

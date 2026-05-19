@@ -1,0 +1,1 @@
+{"root":["./src/main.ts","./src/vite-env.d.ts","./src/lib/dom.ts","./src/proto/types.ts","./src/proto/wsclient.ts","./src/ui/app.ts"],"version":"5.8.3"}

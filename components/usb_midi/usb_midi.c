@@ -12,18 +12,14 @@ static const char *TAG = "USB_MIDI";
 static bool usb_initialized = false;
 
 enum interface_count {
-#if CFG_TUD_MIDI
     ITF_NUM_MIDI = 0,
     ITF_NUM_MIDI_STREAMING,
-#endif
     ITF_COUNT
 };
 
 enum usb_endpoints {
     EP_EMPTY = 0,
-#if CFG_TUD_MIDI
     EPNUM_MIDI,
-#endif
 };
 
 #define TUSB_DESCRIPTOR_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_MIDI * TUD_MIDI_DESC_LEN)
