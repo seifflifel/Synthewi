@@ -36,6 +36,7 @@ idf_component_register(
         freertos
         esp_timer
         driver
+        nvs_flash
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE AMY_WAVETABLE)

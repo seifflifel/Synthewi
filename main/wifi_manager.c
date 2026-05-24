@@ -24,8 +24,8 @@ static const char *TAG = "wifi_manager";
 // === HARDCODED CREDENTIALS (for testing) ===
 // Set these to your Wi-Fi details to enable auto-connect without using NVS
 // Leave empty ("") to disable hardcoded mode and use SoftAP setup portal
-#define WIFI_HARDCODED_SSID "TOPNET_8593"
-#define WIFI_HARDCODED_PASS "3MACYZTFURMC"
+#define WIFI_HARDCODED_SSID "Synthewi1"
+#define WIFI_HARDCODED_PASS "123456789"
 // ===================================
 
 #define WIFI_CONNECTED_BIT BIT0
