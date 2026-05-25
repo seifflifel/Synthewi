@@ -35,17 +35,31 @@ static embedded_wav_t s_wav = {0};
 // ---------------------------------------------------------------------------
 // Session synth state (all uint16 params use 0-10000 scale)
 // ---------------------------------------------------------------------------
-static uint8_t  s_wave_id          = AMY_ENGINE_WAVE_SINE;
-static uint16_t s_reverb_amount    = 0;
-static uint16_t s_reverb_decay     = 5000;
-static uint16_t s_echo_amount      = 0;
-static uint16_t s_echo_feedback    = 3000;
-static uint16_t s_filter_cutoff    = 10000; // fully open by default
-static uint16_t s_filter_resonance = 0;
-static uint16_t s_env_attack       = 50;    // ~6 ms
-static uint16_t s_env_release      = 200;   // ~149 ms
+static uint8_t  s_wave_id            = AMY_ENGINE_WAVE_PULSE;
+static uint8_t  s_filter_type        = AMY_ENGINE_FILTER_LPF;
+// reverb and echo removed — delay lines need large contiguous heap blocks that are
+// unavailable after WiFi init fragments SRAM on ESP32-S3.
+static uint16_t s_filter_cutoff      = 10000; // fully open by default
+static uint16_t s_filter_resonance   = 0;
+static uint16_t s_env_attack         = 50;    // ~6 ms
+static uint16_t s_env_release        = 200;   // ~149 ms
+static uint16_t s_filter_env_depth   = 0;
+static uint16_t s_filter_env_decay   = 1000;  // ~205 ms
+static uint16_t s_lfo_rate           = 2000;  // ~2 Hz
+static uint16_t s_lfo_depth          = 0;
+static uint16_t s_chorus_amount      = 0;
 
-static bool s_pad_active[SYNTH_PAD_COUNT] = {false};
+static bool s_pad_active[SYNTH_PAD_COUNT]  = {false};
+static bool s_lfo_started[SYNTH_PAD_COUNT] = {false};
+
+// AMY filter type constants (FILTER_NONE=0, FILTER_LPF=1, FILTER_BPF=2, FILTER_HPF=3)
+static const uint8_t s_filter_type_map[3] = { FILTER_LPF, FILTER_BPF, FILTER_HPF };
+
+// Per-pad stereo pan (left→right across 4 pads)
+static const float s_pan_pos[SYNTH_PAD_COUNT] = { 0.2f, 0.4f, 0.6f, 0.8f };
+
+// LFO oscillators occupy indices SYNTH_PAD_COUNT .. SYNTH_PAD_COUNT*2-1
+#define LFO_OSC(pad) ((uint16_t)(SYNTH_PAD_COUNT + (pad)))
 
 // ---------------------------------------------------------------------------
 // Render state — protected by s_render_lock against the USB audio callback
@@ -58,14 +72,17 @@ static bool              s_initialized    = false;
 // ---------------------------------------------------------------------------
 // Scaling helpers (0-10000 → physical units for AMY)
 // ---------------------------------------------------------------------------
-static float    sc_reverb_level(uint16_t v) { return (v / 10000.0f) * 2.0f; }
-static float    sc_reverb_live(uint16_t v)  { return 0.5f + (v / 10000.0f) * 0.45f; }
-static float    sc_echo_level(uint16_t v)   { return v / 10000.0f; }
-static float    sc_echo_fb(uint16_t v)      { return (v / 10000.0f) * 0.9f; }
-static float    sc_filter_hz(uint16_t v)    { return 200.0f + (v / 10000.0f) * 9800.0f; }
-static float    sc_filter_res(uint16_t v)   { return (v / 10000.0f) * 0.9f; }
-static uint32_t sc_attack_ms(uint16_t v)    { return (uint32_t)(5.0f   + (v / 10000.0f) * 1995.0f); }
-static uint32_t sc_release_ms(uint16_t v)   { return (uint32_t)(50.0f  + (v / 10000.0f) * 4950.0f); }
+static float    sc_filter_hz(uint16_t v)     { return 200.0f + (v / 10000.0f) * 9800.0f; }
+static float    sc_filter_res(uint16_t v)    { return (v / 10000.0f) * 0.9f; }
+static uint32_t sc_attack_ms(uint16_t v)     { return (uint32_t)(5.0f  + (v / 10000.0f) * 1995.0f); }
+static uint32_t sc_release_ms(uint16_t v)    { return (uint32_t)(50.0f + (v / 10000.0f) * 4950.0f); }
+static float    sc_lfo_hz(uint16_t v)        { return 0.1f + (v / 10000.0f) * 9.9f; }
+static float    sc_lfo_depth_hz(uint16_t v)  { return (v / 10000.0f) * 5000.0f; }
+static float    sc_fenv_depth_hz(uint16_t v) { return (v / 10000.0f) * 8000.0f; }
+static uint32_t sc_fenv_decay_ms(uint16_t v) { return (uint32_t)(5.0f  + (v / 10000.0f) * 1995.0f); }
+// KS feedback: high value = long string decay. Map env_release to 0.85-0.995.
+static float    sc_ks_feedback(uint16_t v)   { return 0.85f + (v / 10000.0f) * 0.145f; }
+static float    sc_chorus_level(uint16_t v)  { return v / 10000.0f; }
 
 static float midi_note_to_hz(uint8_t note)
 {
@@ -80,14 +97,16 @@ static void nvs_save_all(void)
     nvs_handle_t h;
     if (nvs_open("synth", NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_u8(h,  "wave",     s_wave_id);
-    nvs_set_u16(h, "rev_amt",  s_reverb_amount);
-    nvs_set_u16(h, "rev_dec",  s_reverb_decay);
-    nvs_set_u16(h, "echo_amt", s_echo_amount);
-    nvs_set_u16(h, "echo_fb",  s_echo_feedback);
+    nvs_set_u8(h,  "flt_typ",  s_filter_type);
     nvs_set_u16(h, "flt_cut",  s_filter_cutoff);
     nvs_set_u16(h, "flt_res",  s_filter_resonance);
     nvs_set_u16(h, "env_atk",  s_env_attack);
     nvs_set_u16(h, "env_rel",  s_env_release);
+    nvs_set_u16(h, "flt_envd", s_filter_env_depth);
+    nvs_set_u16(h, "flt_envc", s_filter_env_decay);
+    nvs_set_u16(h, "lfo_rt",   s_lfo_rate);
+    nvs_set_u16(h, "lfo_dp",   s_lfo_depth);
+    nvs_set_u16(h, "chorus",   s_chorus_amount);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -98,29 +117,48 @@ static void nvs_load_all(void)
     if (nvs_open("synth", NVS_READONLY, &h) != ESP_OK) return;
     uint8_t  u8;
     uint16_t u16;
-    if (nvs_get_u8(h,  "wave",     &u8)  == ESP_OK) s_wave_id          = u8;
-    if (nvs_get_u16(h, "rev_amt",  &u16) == ESP_OK) s_reverb_amount    = u16;
-    if (nvs_get_u16(h, "rev_dec",  &u16) == ESP_OK) s_reverb_decay     = u16;
-    if (nvs_get_u16(h, "echo_amt", &u16) == ESP_OK) s_echo_amount      = u16;
-    if (nvs_get_u16(h, "echo_fb",  &u16) == ESP_OK) s_echo_feedback    = u16;
-    if (nvs_get_u16(h, "flt_cut",  &u16) == ESP_OK) s_filter_cutoff    = u16;
-    if (nvs_get_u16(h, "flt_res",  &u16) == ESP_OK) s_filter_resonance = u16;
-    if (nvs_get_u16(h, "env_atk",  &u16) == ESP_OK) s_env_attack       = u16;
-    if (nvs_get_u16(h, "env_rel",  &u16) == ESP_OK) s_env_release      = u16;
+    if (nvs_get_u8(h,  "wave",     &u8)  == ESP_OK) s_wave_id            = u8;
+    if (nvs_get_u8(h,  "flt_typ",  &u8)  == ESP_OK) s_filter_type        = u8;
+    if (nvs_get_u16(h, "flt_cut",  &u16) == ESP_OK) s_filter_cutoff      = u16;
+    if (nvs_get_u16(h, "flt_res",  &u16) == ESP_OK) s_filter_resonance   = u16;
+    if (nvs_get_u16(h, "env_atk",  &u16) == ESP_OK) s_env_attack         = u16;
+    if (nvs_get_u16(h, "env_rel",  &u16) == ESP_OK) s_env_release        = u16;
+    if (nvs_get_u16(h, "flt_envd", &u16) == ESP_OK) s_filter_env_depth   = u16;
+    if (nvs_get_u16(h, "flt_envc", &u16) == ESP_OK) s_filter_env_decay   = u16;
+    if (nvs_get_u16(h, "lfo_rt",   &u16) == ESP_OK) s_lfo_rate           = u16;
+    if (nvs_get_u16(h, "lfo_dp",   &u16) == ESP_OK) s_lfo_depth          = u16;
+    if (nvs_get_u16(h, "chorus",   &u16) == ESP_OK) s_chorus_amount      = u16;
     nvs_close(h);
 }
 
-// Update filter on any currently-playing oscillators (live param change).
+// Apply filter params to all currently-playing oscillators (live param change).
 static void update_active_osc_filter(void)
 {
-    amy_execute_deltas(); // drain pool before queuing more filter events
+    amy_execute_deltas();
+    uint8_t amy_ftype = s_filter_type_map[s_filter_type];
     for (uint8_t i = 0; i < SYNTH_PAD_COUNT; i++) {
         if (!s_pad_active[i]) continue;
         amy_event e = amy_default_event();
         e.osc = i;
-        e.filter_type = FILTER_LPF;
+        e.filter_type = amy_ftype;
         e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
+        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
+        e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
         e.resonance = sc_filter_res(s_filter_resonance);
+        amy_add_event(&e);
+    }
+}
+
+// Update LFO frequency on all started LFO oscillators.
+static void update_lfo_rate(void)
+{
+    float hz = sc_lfo_hz(s_lfo_rate);
+    amy_execute_deltas();
+    for (uint8_t i = 0; i < SYNTH_PAD_COUNT; i++) {
+        if (!s_lfo_started[i]) continue;
+        amy_event e = amy_default_event();
+        e.osc = LFO_OSC(i);
+        e.freq_coefs[COEF_CONST] = hz;
         amy_add_event(&e);
     }
 }
@@ -200,43 +238,37 @@ void amy_engine_init(void)
 
     nvs_load_all();
 
-    amy_config_t cfg       = amy_default_config();
-    cfg.audio              = AMY_AUDIO_IS_NONE;
-    cfg.midi               = AMY_MIDI_IS_NONE;
+    amy_config_t cfg            = amy_default_config();
+    cfg.audio                   = AMY_AUDIO_IS_NONE;
+    cfg.midi                    = AMY_MIDI_IS_NONE;
     cfg.features.startup_bleep  = 0;
     cfg.features.default_synths = 0;
-    cfg.features.reverb    = 0; // managed manually — see amy_engine_set_reverb
-    cfg.features.echo      = 0; // managed manually — see amy_engine_set_echo
-    cfg.features.chorus    = 0;
-    cfg.features.partials  = 0; // not used — saves heap
-    cfg.features.custom    = 0; // not used — saves heap
-    cfg.platform.multicore = 0;
-    cfg.platform.multithread = 0;
-    // Keep footprint small — we use 4 oscillators (one per pad).
-    // Set unused subsystems to 1 (not 0) to avoid malloc(0) edge-cases in AMY internals.
-    cfg.max_oscs             = SYNTH_PAD_COUNT + 4; // 8 — 4 pads + 4 headroom for reset events
+    cfg.features.reverb         = 0; // managed manually — config_reverb guards re-alloc
+    cfg.features.echo           = 0; // managed manually — config_echo guards re-alloc
+    cfg.features.chorus         = 0; // chorus needs a mod-source osc at index max_oscs+1; heap too tight after WiFi+reverb
+    cfg.features.partials       = 0;
+    cfg.features.custom         = 0;
+    cfg.platform.multicore      = 0;
+    cfg.platform.multithread    = 0;
+    // Oscs 0-3: audio (one per pad). Oscs 4-7: LFO (one per pad, SINE mod sources).
+    // Chorus allocates its own mod source at index max_oscs (index 8), handled internally.
+    cfg.max_oscs             = SYNTH_PAD_COUNT * 2; // 8
+    cfg.ks_oscs              = 0; // KS delay lines (~32 KB) exhaust heap before USB task stack
     cfg.max_sequencer_tags   = 1;
     cfg.max_voices           = 1;
     cfg.max_synths           = 1;
     cfg.max_memory_patches   = 1;
-    cfg.ks_oscs              = 0;  // no Karplus-Strong
     amy_start(cfg);
-
-    // Restore non-zero reverb/echo from NVS (first call allocates delay lines once).
-    // Skip if zero — config_reverb(level=0) would mark reverb uninitialized,
-    // causing double-allocation on the next call (heap corruption).
-    if (s_reverb_amount > 0)
-        config_reverb(sc_reverb_level(s_reverb_amount), sc_reverb_live(s_reverb_decay), 0.5f, 3000.0f);
-    if (s_echo_amount > 0)
-        config_echo(sc_echo_level(s_echo_amount), 200.0f, 2000.0f, sc_echo_fb(s_echo_feedback), 0.0f);
 
     embedded_wav_init();
 
     s_block_frame_pos = (size_t)AMY_BLOCK_SIZE; // force refill on first render
     s_initialized = true;
-    ESP_LOGI(TAG, "init — wave=%u rev=%u/%u echo=%u/%u flt=%u/%u atk=%u rel=%u",
-             s_wave_id, s_reverb_amount, s_reverb_decay, s_echo_amount, s_echo_feedback,
-             s_filter_cutoff, s_filter_resonance, s_env_attack, s_env_release);
+    ESP_LOGI(TAG, "init wave=%u ftype=%u flt=%u/%u atk=%u rel=%u fenv=%u/%u lfo=%u/%u chorus=%u",
+             s_wave_id, s_filter_type,
+             s_filter_cutoff, s_filter_resonance, s_env_attack, s_env_release,
+             s_filter_env_depth, s_filter_env_decay, s_lfo_rate, s_lfo_depth,
+             s_chorus_amount);
 }
 
 void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
@@ -245,14 +277,9 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
 
     if (xSemaphoreTake(s_render_lock, portMAX_DELAY) != pdTRUE) return;
 
-    // Drain any pending deltas before adding new ones.
-    // When no USB host is connected, amy_simple_fill_buffer() is never called, so
-    // deltas accumulate until the pool is exhausted.  amy_execute_deltas() processes
-    // and releases all due deltas (all ours have time=0) without rendering audio,
-    // keeping the pool available.
     amy_execute_deltas();
 
-    // Reset oscillator cleanly before reconfiguring
+    // Reset audio oscillator cleanly before reconfiguring.
     amy_event rst = amy_default_event();
     rst.osc = pad;
     rst.reset_osc = pad;
@@ -260,30 +287,74 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
 
     uint32_t atk = sc_attack_ms(s_env_attack);
     uint32_t rel = sc_release_ms(s_env_release);
+    uint8_t  amy_ftype = s_filter_type_map[s_filter_type];
 
     amy_event e = amy_default_event();
     e.osc  = pad;
-    e.wave = s_wave_id;
+    // PULSE and SQUARE both use AMY's PULSE oscillator, differing only in duty cycle:
+    //   PULSE  → duty=0.2 (narrow, nasal/buzzy classic synth timbre)
+    //   SQUARE → duty=0.5 (symmetric square, fuller/darker)
+    // All other wave IDs map directly to AMY constants (SAW_DOWN=2, TRIANGLE=4, KS=6).
+    if (s_wave_id == AMY_ENGINE_WAVE_SQUARE) {
+        e.wave = PULSE;
+        e.duty_coefs[COEF_CONST] = 0.5f;
+    } else if (s_wave_id == AMY_ENGINE_WAVE_PULSE) {
+        e.wave = PULSE;
+        e.duty_coefs[COEF_CONST] = 0.2f;
+    } else {
+        e.wave = s_wave_id;
+    }
     e.freq_coefs[COEF_CONST] = midi_note_to_hz(midi_note);
+
+    // Pan: spread pads across stereo field
+    e.pan_coefs[COEF_CONST] = s_pan_pos[pad];
 
     // Amplitude driven entirely by EG0
     e.amp_coefs[COEF_EG0] = 1.0f;
 
-    // EG0: attack → hold at sustain → release on note_off (velocity=0)
-    e.eg0_times[0]  = atk;  e.eg0_values[0] = 1.0f;
-    e.eg0_times[1]  = 0;    e.eg0_values[1] = 1.0f; // hold
-    e.eg0_times[2]  = rel;  e.eg0_values[2] = 0.0f;
+    // EG0: attack → hold → release on note_off (velocity=0)
+    e.eg0_times[0]  = atk; e.eg0_values[0] = 1.0f;
+    e.eg0_times[1]  = 0;   e.eg0_values[1] = 1.0f; // hold
+    e.eg0_times[2]  = rel; e.eg0_values[2] = 0.0f;
 
-    e.filter_type = FILTER_LPF;
+    // KS: use env_release to set string decay (feedback coefficient)
+    if (s_wave_id == AMY_ENGINE_WAVE_KS)
+        e.feedback = sc_ks_feedback(s_env_release);
+
+    // Filter: base cutoff + filter envelope (EG1) + LFO mod
+    e.filter_type = amy_ftype;
     e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
+    e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
+    e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
     e.resonance = sc_filter_res(s_filter_resonance);
+
+    // EG1: filter envelope — quick rise to full depth, then decay to base
+    e.eg1_times[0]  = 5;                              e.eg1_values[0] = 1.0f;
+    e.eg1_times[1]  = sc_fenv_decay_ms(s_filter_env_decay); e.eg1_values[1] = 0.0f;
+    e.eg1_times[2]  = 0;                              e.eg1_values[2] = 0.0f;
+
+    // LFO mod source: each audio osc tracks its own LFO osc
+    e.mod_source = LFO_OSC(pad);
 
     e.velocity = 1.0f;
     amy_add_event(&e);
 
+    // Start LFO osc for this pad on its first note (runs continuously after that).
+    if (!s_lfo_started[pad]) {
+        amy_event lfo = amy_default_event();
+        lfo.osc = LFO_OSC(pad);
+        lfo.wave = SINE;
+        lfo.amp_coefs[COEF_CONST]  = 1.0f;
+        lfo.freq_coefs[COEF_CONST] = sc_lfo_hz(s_lfo_rate);
+        lfo.velocity = 1.0f;
+        amy_add_event(&lfo);
+        s_lfo_started[pad] = true;
+    }
+
     s_pad_active[pad] = true;
     xSemaphoreGive(s_render_lock);
-    ESP_LOGD(TAG, "note_on pad=%u note=%u wave=%u atk=%ums rel=%ums", pad, midi_note, s_wave_id, atk, rel);
+    ESP_LOGD(TAG, "note_on pad=%u note=%u wave=%u ftype=%u atk=%ums rel=%ums",
+             pad, midi_note, s_wave_id, s_filter_type, atk, rel);
 }
 
 void amy_engine_note_off(uint8_t pad)
@@ -292,7 +363,7 @@ void amy_engine_note_off(uint8_t pad)
 
     if (xSemaphoreTake(s_render_lock, portMAX_DELAY) != pdTRUE) return;
 
-    amy_execute_deltas(); // keep pool drained
+    amy_execute_deltas();
 
     amy_event e = amy_default_event();
     e.osc      = pad;
@@ -314,38 +385,63 @@ void amy_engine_set_wave(uint8_t wave_id)
 
 void amy_engine_set_reverb(uint16_t amount, uint16_t decay)
 {
-    s_reverb_amount = amount;
-    s_reverb_decay  = decay;
-    // config_reverb(level=0) re-allocates delay lines without freeing the old ones.
-    // Keep reverb silent by leaving level at 0 (already the AMY default).
-    if (amount > 0)
-        config_reverb(sc_reverb_level(amount), sc_reverb_live(decay), 0.5f, 3000.0f);
-    nvs_save_all();
-    ESP_LOGI(TAG, "reverb amt=%u dec=%u", amount, decay);
+    (void)amount; (void)decay; // reverb disabled — delay lines exhaust heap after WiFi init
 }
 
 void amy_engine_set_echo(uint16_t amount, uint16_t feedback)
 {
-    s_echo_amount   = amount;
-    s_echo_feedback = feedback;
-    // Same guard as reverb — config_echo(level=0) double-allocates delay lines.
-    if (amount > 0)
-        config_echo(sc_echo_level(amount), 200.0f, 2000.0f, sc_echo_fb(feedback), 0.0f);
-    nvs_save_all();
-    ESP_LOGI(TAG, "echo amt=%u fb=%u", amount, feedback);
+    (void)amount; (void)feedback; // echo disabled — delay lines exhaust heap after WiFi init
 }
 
 void amy_engine_set_filter(uint16_t cutoff, uint16_t resonance)
 {
     s_filter_cutoff    = cutoff;
     s_filter_resonance = resonance;
-    // Apply to any already-playing oscillators immediately
     if (xSemaphoreTake(s_render_lock, portMAX_DELAY) == pdTRUE) {
         update_active_osc_filter();
         xSemaphoreGive(s_render_lock);
     }
     nvs_save_all();
     ESP_LOGI(TAG, "filter cut=%u res=%u", cutoff, resonance);
+}
+
+void amy_engine_set_filter_type(uint8_t type)
+{
+    if (type > AMY_ENGINE_FILTER_HPF) return;
+    s_filter_type = type;
+    if (xSemaphoreTake(s_render_lock, portMAX_DELAY) == pdTRUE) {
+        update_active_osc_filter();
+        xSemaphoreGive(s_render_lock);
+    }
+    nvs_save_all();
+    ESP_LOGI(TAG, "filter_type → %u", type);
+}
+
+void amy_engine_set_filter_env(uint16_t depth, uint16_t decay)
+{
+    s_filter_env_depth = depth;
+    s_filter_env_decay = decay;
+    // EG1 depth applied on next note_on; no live update needed (would retrigger envelope)
+    nvs_save_all();
+    ESP_LOGI(TAG, "filter_env depth=%u decay=%u", depth, decay);
+}
+
+void amy_engine_set_lfo(uint16_t rate, uint16_t depth)
+{
+    s_lfo_rate  = rate;
+    s_lfo_depth = depth;
+    if (xSemaphoreTake(s_render_lock, portMAX_DELAY) == pdTRUE) {
+        update_lfo_rate();
+        update_active_osc_filter(); // refresh COEF_MOD depth on active oscs
+        xSemaphoreGive(s_render_lock);
+    }
+    nvs_save_all();
+    ESP_LOGI(TAG, "lfo rate=%u depth=%u", rate, depth);
+}
+
+void amy_engine_set_chorus(uint16_t amount)
+{
+    (void)amount; // chorus disabled (features.chorus=0 — heap too tight after WiFi+reverb)
 }
 
 void amy_engine_set_envelope(uint16_t attack, uint16_t release)
@@ -360,14 +456,20 @@ void amy_engine_get_state(amy_engine_state_t *out)
 {
     if (!out) return;
     out->wave_id          = s_wave_id;
-    out->reverb_amount    = s_reverb_amount;
-    out->reverb_decay     = s_reverb_decay;
-    out->echo_amount      = s_echo_amount;
-    out->echo_feedback    = s_echo_feedback;
+    out->filter_type      = s_filter_type;
+    out->reverb_amount    = 0;
+    out->reverb_decay     = 0;
+    out->echo_amount      = 0;
+    out->echo_feedback    = 0;
     out->filter_cutoff    = s_filter_cutoff;
     out->filter_resonance = s_filter_resonance;
     out->env_attack       = s_env_attack;
     out->env_release      = s_env_release;
+    out->filter_env_depth = s_filter_env_depth;
+    out->filter_env_decay = s_filter_env_decay;
+    out->lfo_rate         = s_lfo_rate;
+    out->lfo_depth        = s_lfo_depth;
+    out->chorus_amount    = s_chorus_amount;
 }
 
 void amy_engine_render_mono_16(int16_t *out, size_t samples)

@@ -21,6 +21,12 @@ typedef void (*touch_param_cb_t)(uint8_t param_id, uint16_t value);
 #define SYNTH_PARAM_FILTER_RES    6
 #define SYNTH_PARAM_ENV_ATTACK    7
 #define SYNTH_PARAM_ENV_RELEASE   8
+#define SYNTH_PARAM_FILTER_TYPE   9
+#define SYNTH_PARAM_FENV_DEPTH    10
+#define SYNTH_PARAM_FENV_DECAY    11
+#define SYNTH_PARAM_LFO_RATE      12
+#define SYNTH_PARAM_LFO_DEPTH     13
+#define SYNTH_PARAM_CHORUS        14
 
 esp_err_t touch_telemetry_start(void);
 void      touch_telemetry_set_event_cb(touch_event_cb_t cb);

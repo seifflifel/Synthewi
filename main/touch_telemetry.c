@@ -29,7 +29,7 @@ static const char *TAG = "touch_telemetry";
 #define TOUCH_TELEM_PERIOD_MS (1000 / TOUCH_TELEM_HZ)
 #define TOUCH_TELEM_MAGIC    "SYNT"
 #define TOUCH_CMD_MAGIC      "SYNC"
-#define TOUCH_PROTO_VERSION  2   // bumped: v2 appends synth state
+#define TOUCH_PROTO_VERSION  3   // bumped: v3 extends synth state to 28 bytes
 #define TOUCH_CHANNEL_COUNT  4
 
 // Command types
@@ -47,10 +47,10 @@ typedef struct __attribute__((packed)) {
     uint8_t  intensity;
 } touch_telemetry_channel_t;
 
-// v2 synth state appended after channel data
+// v3 synth state appended after channel data (28 bytes)
 typedef struct __attribute__((packed)) {
     uint8_t  wave_id;
-    uint8_t  reserved;
+    uint8_t  filter_type;     // AMY_ENGINE_FILTER_LPF/BPF/HPF (was reserved in v2)
     uint16_t reverb_amount;
     uint16_t reverb_decay;
     uint16_t echo_amount;
@@ -59,6 +59,11 @@ typedef struct __attribute__((packed)) {
     uint16_t filter_resonance;
     uint16_t env_attack;
     uint16_t env_release;
+    uint16_t filter_env_depth;
+    uint16_t filter_env_decay;
+    uint16_t lfo_rate;
+    uint16_t lfo_depth;
+    uint16_t chorus_amount;
 } touch_telemetry_synth_t;
 
 typedef struct __attribute__((packed)) {
@@ -198,10 +203,11 @@ static void touch_telemetry_task(void *arg)
             }
         }
 
-        // Append current synth state (v2)
+        // Append current synth state (v3)
         amy_engine_state_t st;
         amy_engine_get_state(&st);
         pkt.synth.wave_id          = st.wave_id;
+        pkt.synth.filter_type      = st.filter_type;
         pkt.synth.reverb_amount    = st.reverb_amount;
         pkt.synth.reverb_decay     = st.reverb_decay;
         pkt.synth.echo_amount      = st.echo_amount;
@@ -210,6 +216,11 @@ static void touch_telemetry_task(void *arg)
         pkt.synth.filter_resonance = st.filter_resonance;
         pkt.synth.env_attack       = st.env_attack;
         pkt.synth.env_release      = st.env_release;
+        pkt.synth.filter_env_depth = st.filter_env_depth;
+        pkt.synth.filter_env_decay = st.filter_env_decay;
+        pkt.synth.lfo_rate         = st.lfo_rate;
+        pkt.synth.lfo_depth        = st.lfo_depth;
+        pkt.synth.chorus_amount    = st.chorus_amount;
 
         if (wifi_manager_is_connected()) {
             int sent = sendto(sock, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dest, sizeof(dest));
@@ -242,7 +253,7 @@ static void touch_cmd_task(void *arg)
 
         const touch_cmd_packet_t *cmd = (const touch_cmd_packet_t *)rx_buf;
         if (memcmp(cmd->magic, TOUCH_CMD_MAGIC, 4) != 0) continue;
-        if (cmd->version != TOUCH_PROTO_VERSION && cmd->version != 1) continue;
+        if (cmd->version == 0) continue; // accept any non-zero version (command format is stable)
 
         if (cmd->cmd == TOUCH_CMD_SET_THRESHOLD) {
             if (cmd->channel >= TOUCH_CHANNEL_COUNT || cmd->threshold == 0) continue;

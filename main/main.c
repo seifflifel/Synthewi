@@ -85,6 +85,30 @@ static void on_synth_param(uint8_t param_id, uint16_t value)
         amy_engine_set_envelope(atk, rel);
         break;
     }
+    case SYNTH_PARAM_FILTER_TYPE:
+        amy_engine_set_filter_type((uint8_t)value);
+        break;
+    case SYNTH_PARAM_FENV_DEPTH:
+    case SYNTH_PARAM_FENV_DECAY: {
+        amy_engine_state_t st;
+        amy_engine_get_state(&st);
+        uint16_t dep = (param_id == SYNTH_PARAM_FENV_DEPTH) ? value : st.filter_env_depth;
+        uint16_t dec = (param_id == SYNTH_PARAM_FENV_DECAY) ? value : st.filter_env_decay;
+        amy_engine_set_filter_env(dep, dec);
+        break;
+    }
+    case SYNTH_PARAM_LFO_RATE:
+    case SYNTH_PARAM_LFO_DEPTH: {
+        amy_engine_state_t st;
+        amy_engine_get_state(&st);
+        uint16_t rt = (param_id == SYNTH_PARAM_LFO_RATE)  ? value : st.lfo_rate;
+        uint16_t dp = (param_id == SYNTH_PARAM_LFO_DEPTH) ? value : st.lfo_depth;
+        amy_engine_set_lfo(rt, dp);
+        break;
+    }
+    case SYNTH_PARAM_CHORUS:
+        amy_engine_set_chorus(value);
+        break;
     default:
         ESP_LOGW(TAG, "unknown synth param %u", param_id);
         break;

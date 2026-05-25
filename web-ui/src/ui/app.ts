@@ -5,9 +5,15 @@ import type { TouchTelemetry, SynthState, WsDeviceToClient } from '../proto/type
 const TOUCH_THR_MIN = 1
 const TOUCH_THR_MAX = 20000
 
-// Wave names and their AMY wave_id values (SINE=0,PULSE=1,SAW_DOWN=2,SAW_UP=3,TRIANGLE=4)
-const WAVE_NAMES: string[]   = ['sine', 'pulse', 'saw↓', 'saw↑', 'tri']
-const WAVE_IDS:  number[]    = [0, 1, 2, 3, 4]
+// Wave names and their engine wave_id values.
+// pulse=1 (duty 0.2, nasal), saw=2, tri=4, square=5 (duty 0.5, fuller).
+// sine(0) and saw_up(3) removed — sine sounds thin, saw_up identical to saw_down.
+const WAVE_NAMES: string[] = ['pulse', 'saw↓', 'tri', 'square']
+const WAVE_IDS:  number[]  = [1, 2, 4, 5]
+
+// Filter type names and values (maps to AMY_ENGINE_FILTER_*)
+const FTYPE_NAMES: string[] = ['lpf', 'bpf', 'hpf']
+const FTYPE_IDS:   number[] = [0, 1, 2]
 
 type TouchState = Required<TouchTelemetry> & { rawHist: number[]; baselineHist: number[] }
 type AppState   = { wsUrl: string; conn: ConnectionState; connDetail: string; lastLine: string; touch: TouchState[] }
@@ -169,8 +175,10 @@ export function mountApp(root: HTMLDivElement) {
   }
 
   // ------- synth param slider handles (keyed for state sync) -------
-  let activeWaveIdx = 0
-  let waveBtns: HTMLButtonElement[] = []
+  let activeWaveIdx  = 0
+  let activeFtypeIdx = 0
+  let waveBtns:  HTMLButtonElement[] = []
+  let ftypeBtns: HTMLButtonElement[] = []
 
   // Filter
   const sFilterCut = mkSlider('cutoff', 200, 10000, 10, 10000, fmtHz,
@@ -181,23 +189,23 @@ export function mountApp(root: HTMLDivElement) {
     v => sender.set('fx.filter.resonance', displayToNorm(v, 0, 0.9)),
     v => sender.flush('fx.filter.resonance', displayToNorm(v, 0, 0.9)))
 
-  // Reverb
-  const sRevAmt = mkSlider('amount', 0, 100, 1, 0, fmtPct,
-    v => sender.set('fx.reverb.amount', v / 100),
-    v => sender.flush('fx.reverb.amount', v / 100))
+  // Filter envelope
+  const sFenvDepth = mkSlider('depth', 0, 8000, 50, 0, fmtHz,
+    v => sender.set('fx.filter.env.depth', displayToNorm(v, 0, 8000)),
+    v => sender.flush('fx.filter.env.depth', displayToNorm(v, 0, 8000)))
 
-  const sRevDec = mkSlider('decay', 0, 100, 1, 50, fmtPct,
-    v => sender.set('fx.reverb.decay', v / 100),
-    v => sender.flush('fx.reverb.decay', v / 100))
+  const sFenvDecay = mkSlider('decay', 5, 2000, 5, 205, fmtMs,
+    v => sender.set('fx.filter.env.decay', displayToNorm(v, 5, 2000)),
+    v => sender.flush('fx.filter.env.decay', displayToNorm(v, 5, 2000)))
 
-  // Echo
-  const sEchoAmt = mkSlider('amount', 0, 100, 1, 0, fmtPct,
-    v => sender.set('fx.echo.amount', v / 100),
-    v => sender.flush('fx.echo.amount', v / 100))
+  // LFO
+  const sLfoRate = mkSlider('rate', 0.1, 10, 0.1, 2, v => `${v.toFixed(1)} Hz`,
+    v => sender.set('fx.lfo.rate', displayToNorm(v, 0.1, 10)),
+    v => sender.flush('fx.lfo.rate', displayToNorm(v, 0.1, 10)))
 
-  const sEchoFb = mkSlider('feedback', 0, 90, 1, 30, fmtPct,
-    v => sender.set('fx.echo.feedback', v / 90),
-    v => sender.flush('fx.echo.feedback', v / 90))
+  const sLfoDepth = mkSlider('depth', 0, 5000, 50, 0, fmtHz,
+    v => sender.set('fx.lfo.depth', displayToNorm(v, 0, 5000)),
+    v => sender.flush('fx.lfo.depth', displayToNorm(v, 0, 5000)))
 
   // Envelope
   const sEnvAtk = mkSlider('attack', 5, 2000, 5, 5, fmtMs,
@@ -208,20 +216,24 @@ export function mountApp(root: HTMLDivElement) {
     v => sender.set('env.release', displayToNorm(v, 50, 5000)),
     v => sender.flush('env.release', displayToNorm(v, 50, 5000)))
 
-  // Apply synth state from ESP to all sliders (called on connect and on every telemetry if changed)
+  // Apply synth state from ESP to all sliders (called on connect and on telemetry change)
   function applySynthState(s: SynthState) {
-    // Wave buttons
     const wIdx = WAVE_IDS.indexOf(s.wave_id)
     if (wIdx >= 0 && wIdx !== activeWaveIdx) {
       activeWaveIdx = wIdx
       for (let i = 0; i < waveBtns.length; i++) waveBtns[i].classList.toggle('sel', i === wIdx)
     }
+    const fIdx = FTYPE_IDS.indexOf(s.filter_type ?? 0)
+    if (fIdx >= 0 && fIdx !== activeFtypeIdx) {
+      activeFtypeIdx = fIdx
+      for (let i = 0; i < ftypeBtns.length; i++) ftypeBtns[i].classList.toggle('sel', i === fIdx)
+    }
     sFilterCut.setValue(espToDisplay(s.filter_cutoff,    200,  10000))
     sFilterRes.setValue(espToDisplay(s.filter_resonance, 0,    0.9))
-    sRevAmt.setValue(   espToDisplay(s.reverb_amount,    0,    100))
-    sRevDec.setValue(   espToDisplay(s.reverb_decay,     0,    100))
-    sEchoAmt.setValue(  espToDisplay(s.echo_amount,      0,    100))
-    sEchoFb.setValue(   espToDisplay(s.echo_feedback,    0,    90))
+    sFenvDepth.setValue(espToDisplay(s.filter_env_depth ?? 0, 0, 8000))
+    sFenvDecay.setValue(espToDisplay(s.filter_env_decay ?? 1000, 5, 2000))
+    sLfoRate.setValue(  espToDisplay(s.lfo_rate  ?? 2000, 0.1, 10))
+    sLfoDepth.setValue( espToDisplay(s.lfo_depth ?? 0,    0,   5000))
     sEnvAtk.setValue(   espToDisplay(s.env_attack,       5,    2000))
     sEnvRel.setValue(   espToDisplay(s.env_release,      50,   5000))
   }
@@ -262,7 +274,6 @@ export function mountApp(root: HTMLDivElement) {
       touchBadgeEls[i].textContent = cur.is_touching ? 'touch' : 'idle'
       touchThrEls[i].textContent   = `${cur.threshold}`
 
-      // Update threshold slider/input only when user is not actively dragging
       if (!touchThrInteracting[i]) {
         touchThrSliders[i].value = `${cur.threshold}`
         touchThrInputs[i].value  = `${cur.threshold}`
@@ -312,7 +323,7 @@ export function mountApp(root: HTMLDivElement) {
     el('div', { className: 'topbar-l' }, [wsUrlInput, connectBtn]),
   ])
 
-  // ------- Synth card (wave + master) -------
+  // ------- Synth card (wave + filter type) -------
   waveBtns = WAVE_NAMES.map((name, idx) => {
     const b = el('button', { className: `wb${idx === 0 ? ' sel' : ''}`, textContent: name }) as HTMLButtonElement
     b.addEventListener('click', () => {
@@ -320,6 +331,17 @@ export function mountApp(root: HTMLDivElement) {
       for (const o of waveBtns) o.classList.remove('sel')
       b.classList.add('sel')
       sender.flush('synth.wave', WAVE_IDS[idx])
+    })
+    return b
+  })
+
+  ftypeBtns = FTYPE_NAMES.map((name, idx) => {
+    const b = el('button', { className: `wb${idx === 0 ? ' sel' : ''}`, textContent: name }) as HTMLButtonElement
+    b.addEventListener('click', () => {
+      activeFtypeIdx = idx
+      for (const o of ftypeBtns) o.classList.remove('sel')
+      b.classList.add('sel')
+      sender.flush('fx.filter.type', FTYPE_IDS[idx])
     })
     return b
   })
@@ -334,24 +356,25 @@ export function mountApp(root: HTMLDivElement) {
     ]),
   ])
 
-  // ------- FX card (only AMY-supported effects) -------
+  // ------- FX card -------
   const fxCard = el('div', { className: 'card' }, [
     el('div', { className: 'sec-label', textContent: 'fx' }),
     el('div', { className: 'fx-grid' }, [
       el('div', { className: 'fx-card' }, [
         el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'filter' })]),
+        el('div', { className: 'wave-btns' }, ftypeBtns),
         sFilterCut.el,
         sFilterRes.el,
       ]),
       el('div', { className: 'fx-card' }, [
-        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'reverb' })]),
-        sRevAmt.el,
-        sRevDec.el,
+        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'filter env' })]),
+        sFenvDepth.el,
+        sFenvDecay.el,
       ]),
       el('div', { className: 'fx-card' }, [
-        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'echo' })]),
-        sEchoAmt.el,
-        sEchoFb.el,
+        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'lfo → filter' })]),
+        sLfoRate.el,
+        sLfoDepth.el,
       ]),
     ]),
   ])
@@ -386,7 +409,6 @@ export function mountApp(root: HTMLDivElement) {
     }) as HTMLInputElement
     const thrBtn = el('button', { className: 'btn btn-mini', textContent: 'apply' }) as HTMLButtonElement
 
-    // Pointer tracking — suppress telemetry updates while dragging
     thrS.addEventListener('pointerdown', () => { touchThrInteracting[i] = true })
     thrS.addEventListener('pointerup', () => {
       touchThrInteracting[i] = false
@@ -444,7 +466,6 @@ export function mountApp(root: HTMLDivElement) {
 
   const logLine = el('div', { className: 'logline', textContent: state.lastLine })
 
-  // ------- Layout (no keyboard column) -------
   root.replaceChildren(el('div', { className: 'container' }, [
     topbar,
     statusHint,

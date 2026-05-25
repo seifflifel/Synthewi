@@ -14,6 +14,7 @@ type TouchTelemetry = Record<string, TouchChannel>
 
 type SynthState = {
   wave_id: number
+  filter_type: number
   reverb_amount: number
   reverb_decay: number
   echo_amount: number
@@ -22,6 +23,11 @@ type SynthState = {
   filter_resonance: number
   env_attack: number
   env_release: number
+  filter_env_depth: number
+  filter_env_decay: number
+  lfo_rate: number
+  lfo_depth: number
+  chorus_amount: number
 }
 
 type DeviceState = {
@@ -50,25 +56,28 @@ const CMD_PORT = Number.parseInt(process.env.BRIDGE_CMD_PORT ?? '4211', 10)
 
 const MAGIC_TELEM = Buffer.from('SYNT')
 const MAGIC_CMD = Buffer.from('SYNC')
-const PROTO_VERSION = 2
+const PROTO_VERSION = 3
 const CHANNELS = 4
 
 const CMD_SET_THRESHOLD   = 1
 const CMD_SET_SYNTH_PARAM = 2
 
 // Maps UI path → { paramId (matches SYNTH_PARAM_* in touch_telemetry.h), scale }
-// scale=1: value is already a direct integer (wave_id 0-4)
+// scale=1: value is already a direct integer
 // scale=10000: value is a 0-1 float from displayToNorm — multiply to get ESP 0-10000
 const PATH_TO_CMD: Record<string, { paramId: number; scale: number }> = {
-  'synth.wave':          { paramId: 0, scale: 1     },
-  'fx.reverb.amount':    { paramId: 1, scale: 10000 },
-  'fx.reverb.decay':     { paramId: 2, scale: 10000 },
-  'fx.echo.amount':      { paramId: 3, scale: 10000 },
-  'fx.echo.feedback':    { paramId: 4, scale: 10000 },
-  'fx.filter.cutoff':    { paramId: 5, scale: 10000 },
-  'fx.filter.resonance': { paramId: 6, scale: 10000 },
-  'env.attack':          { paramId: 7, scale: 10000 },
-  'env.release':         { paramId: 8, scale: 10000 },
+  'synth.wave':             { paramId: 0,  scale: 1     },
+  // reverb (1,2) and echo (3,4) disabled — delay lines exhaust heap after WiFi init on ESP32-S3
+  'fx.filter.cutoff':       { paramId: 5,  scale: 10000 },
+  'fx.filter.resonance':    { paramId: 6,  scale: 10000 },
+  'env.attack':             { paramId: 7,  scale: 10000 },
+  'env.release':            { paramId: 8,  scale: 10000 },
+  'fx.filter.type':         { paramId: 9,  scale: 1     },
+  'fx.filter.env.depth':    { paramId: 10, scale: 10000 },
+  'fx.filter.env.decay':    { paramId: 11, scale: 10000 },
+  'fx.lfo.rate':            { paramId: 12, scale: 10000 },
+  'fx.lfo.depth':           { paramId: 13, scale: 10000 },
+  // fx.chorus removed — AMY chorus disabled (heap too tight with WiFi+reverb on ESP32-S3)
 }
 
 let lastDevice: DeviceState | null = null
@@ -113,12 +122,13 @@ function parseTelemetry(buf: Buffer): { seq: number; mac?: string; touch: TouchT
     touch[`ch${i}`] = { raw, baseline, abs_delta, threshold, intensity, is_touching }
   }
 
-  // Parse v2 synth state (18 bytes after channel data)
+  // Parse v3 synth state (28 bytes after channel data)
   let synth: SynthState | undefined
   const synthBase = 16 + CHANNELS * 8
-  if (buf.length >= synthBase + 18) {
+  if (buf.length >= synthBase + 28) {
     synth = {
       wave_id:          buf.readUInt8(synthBase + 0),
+      filter_type:      buf.readUInt8(synthBase + 1),
       reverb_amount:    buf.readUInt16LE(synthBase + 2),
       reverb_decay:     buf.readUInt16LE(synthBase + 4),
       echo_amount:      buf.readUInt16LE(synthBase + 6),
@@ -127,6 +137,11 @@ function parseTelemetry(buf: Buffer): { seq: number; mac?: string; touch: TouchT
       filter_resonance: buf.readUInt16LE(synthBase + 12),
       env_attack:       buf.readUInt16LE(synthBase + 14),
       env_release:      buf.readUInt16LE(synthBase + 16),
+      filter_env_depth: buf.readUInt16LE(synthBase + 18),
+      filter_env_decay: buf.readUInt16LE(synthBase + 20),
+      lfo_rate:         buf.readUInt16LE(synthBase + 22),
+      lfo_depth:        buf.readUInt16LE(synthBase + 24),
+      chorus_amount:    buf.readUInt16LE(synthBase + 26),
     }
   }
 

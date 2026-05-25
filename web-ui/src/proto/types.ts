@@ -12,9 +12,10 @@ export type TouchTelemetry = {
   is_touching?: boolean
 }
 
-// All uint16 values from the ESP (0-10000 scale)
+// All uint16 values from the ESP (0-10000 scale), plus filter_type uint8
 export type SynthState = {
   wave_id: number
+  filter_type: number
   reverb_amount: number
   reverb_decay: number
   echo_amount: number
@@ -23,6 +24,11 @@ export type SynthState = {
   filter_resonance: number
   env_attack: number
   env_release: number
+  filter_env_depth: number
+  filter_env_decay: number
+  lfo_rate: number
+  lfo_depth: number
+  chorus_amount: number
 }
 
 export type WsDeviceToClient =
