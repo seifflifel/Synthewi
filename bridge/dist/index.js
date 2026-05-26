@@ -7,7 +7,7 @@ const CMD_PORT = Number.parseInt(process.env.BRIDGE_CMD_PORT ?? '4211', 10);
 const MAGIC_TELEM = Buffer.from('SYNT');
 const MAGIC_CMD = Buffer.from('SYNC');
 const PROTO_VERSION = 3;
-const CHANNELS = 4;
+const CHANNELS = 8;
 const CMD_SET_THRESHOLD = 1;
 const CMD_SET_SYNTH_PARAM = 2;
 // Maps UI path → { paramId (matches SYNTH_PARAM_* in touch_telemetry.h), scale }
@@ -186,7 +186,7 @@ wss.on('connection', (ws) => {
                 return;
             }
             // touch.ch[0-3].threshold
-            const threshMatch = /^touch\.ch([0-3])\.threshold$/.exec(msg.path);
+            const threshMatch = /^touch\.ch([0-7])\.threshold$/.exec(msg.path);
             if (threshMatch) {
                 const channel = Number.parseInt(threshMatch[1], 10);
                 const threshold = Math.max(1, Math.min(65535, Math.round(msg.value)));

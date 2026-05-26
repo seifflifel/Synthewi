@@ -57,7 +57,7 @@ const CMD_PORT = Number.parseInt(process.env.BRIDGE_CMD_PORT ?? '4211', 10)
 const MAGIC_TELEM = Buffer.from('SYNT')
 const MAGIC_CMD = Buffer.from('SYNC')
 const PROTO_VERSION = 3
-const CHANNELS = 4
+const CHANNELS = 8
 
 const CMD_SET_THRESHOLD   = 1
 const CMD_SET_SYNTH_PARAM = 2
@@ -78,6 +78,11 @@ const PATH_TO_CMD: Record<string, { paramId: number; scale: number }> = {
   'fx.lfo.rate':            { paramId: 12, scale: 10000 },
   'fx.lfo.depth':           { paramId: 13, scale: 10000 },
   // fx.chorus removed — AMY chorus disabled (heap too tight with WiFi+reverb on ESP32-S3)
+  'touch.pressure.depth':   { paramId: 15, scale: 10000 },
+  'touch.pressure.range':   { paramId: 16, scale: 100  },
+  'synth.glide':            { paramId: 17, scale: 10000 },
+  'synth.mode':             { paramId: 18, scale: 1     }, // 0=CUSTOM 1=JUNO 2=DX7
+  'synth.patch':            { paramId: 19, scale: 1     }, // 0-127 within current bank
 }
 
 let lastDevice: DeviceState | null = null
@@ -253,7 +258,7 @@ wss.on('connection', (ws) => {
       }
 
       // touch.ch[0-3].threshold
-      const threshMatch = /^touch\.ch([0-3])\.threshold$/.exec(msg.path)
+      const threshMatch = /^touch\.ch([0-7])\.threshold$/.exec(msg.path)
       if (threshMatch) {
         const channel = Number.parseInt(threshMatch[1], 10)
         const threshold = Math.max(1, Math.min(65535, Math.round(msg.value)))

@@ -20,8 +20,15 @@
 #define AMY_ENGINE_FILTER_BPF     1
 #define AMY_ENGINE_FILTER_HPF     2
 
+// Synthesis mode
+typedef enum {
+    SYNTH_MODE_CUSTOM = 0,  // Manual oscillator + filter + LFO + pressure
+    SYNTH_MODE_JUNO   = 1,  // AMY built-in Juno patches (patch 0-127)
+    SYNTH_MODE_DX7    = 2,  // AMY built-in DX7 patches  (patch 128-255)
+} synth_mode_t;
+
 // Maximum simultaneous pads.
-#define SYNTH_PAD_COUNT 4
+#define SYNTH_PAD_COUNT 8
 
 // All 0-10000 scaled values map to a physical range inside amy_engine.
 typedef struct {
@@ -40,6 +47,10 @@ typedef struct {
     uint16_t lfo_rate;          // 0-10000 → 0.1-10 Hz
     uint16_t lfo_depth;         // 0-10000 → 0-5000 Hz filter swing
     uint16_t chorus_amount;     // 0-10000 → level 0.0-1.0
+    uint16_t pressure_depth;   // 0-10000 → 0-8000 Hz added to filter at max press
+    uint16_t glide;            // 0-10000 → 0-500 ms portamento time
+    uint8_t  synth_mode;       // 0=CUSTOM 1=JUNO 2=DX7
+    uint8_t  patch_num;        // 0-127 within current bank
 } amy_engine_state_t;
 
 void amy_engine_init(void);
@@ -58,6 +69,13 @@ void amy_engine_set_filter_env(uint16_t depth, uint16_t decay);       // EG1 →
 void amy_engine_set_envelope(uint16_t attack, uint16_t release);
 void amy_engine_set_lfo(uint16_t rate, uint16_t depth);               // sine LFO → filter
 void amy_engine_set_chorus(uint16_t amount);
+void amy_engine_set_pressure_depth(uint16_t depth); // 0-10000 → Hz range added at max press
+void amy_engine_set_glide(uint16_t glide);          // 0-10000 → 0-500 ms portamento time
+void amy_engine_set_mode(uint8_t mode);             // synth_mode_t: 0=CUSTOM 1=JUNO 2=DX7
+void amy_engine_set_patch(uint8_t patch_in_bank);  // 0-127 within current bank
+
+// Called from touch task at 30 Hz while pad is held. Updates per-pad filter cutoff live.
+void amy_engine_update_pressure(uint8_t pad, float pressure_norm);
 
 // Returns current state for telemetry broadcast.
 void amy_engine_get_state(amy_engine_state_t *out);

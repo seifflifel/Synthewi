@@ -30,7 +30,7 @@ static const char *TAG = "touch_telemetry";
 #define TOUCH_TELEM_MAGIC    "SYNT"
 #define TOUCH_CMD_MAGIC      "SYNC"
 #define TOUCH_PROTO_VERSION  3   // bumped: v3 extends synth state to 28 bytes
-#define TOUCH_CHANNEL_COUNT  4
+#define TOUCH_CHANNEL_COUNT  8
 
 // Command types
 #define TOUCH_CMD_SET_THRESHOLD  1
@@ -91,20 +91,24 @@ typedef struct __attribute__((packed)) {
 // State
 // ---------------------------------------------------------------------------
 static touch_sensor_t   s_touch_pads[TOUCH_CHANNEL_COUNT];
-static volatile uint16_t s_thresholds[TOUCH_CHANNEL_COUNT] = {100, 100, 100, 100};
-static const uint8_t    s_touch_channels[TOUCH_CHANNEL_COUNT] = {4, 5, 6, 7};
+static volatile uint16_t s_thresholds[TOUCH_CHANNEL_COUNT] = {100, 100, 100, 100, 100, 100, 100, 100};
+static const uint8_t    s_touch_channels[TOUCH_CHANNEL_COUNT] = {4, 5, 6, 7, 8, 12, 1, 2}; // ch0-7 mapped to these GPIOs (ESP32 touch channel numbers, not pin numbers)
 static uint8_t          s_sta_mac[6] = {0};
 static bool             s_started = false;
 static bool             s_prev_touching[TOUCH_CHANNEL_COUNT] = {false};
 
-static volatile touch_event_cb_t s_event_cb = NULL;
-static volatile touch_param_cb_t s_param_cb = NULL;
+static volatile touch_event_cb_t    s_event_cb    = NULL;
+static volatile touch_param_cb_t    s_param_cb    = NULL;
+static volatile touch_pressure_cb_t s_pressure_cb = NULL;
+static volatile uint16_t            s_pressure_range = 200; // 2.0× default
 
 // ---------------------------------------------------------------------------
 // Public callback registration
 // ---------------------------------------------------------------------------
-void touch_telemetry_set_event_cb(touch_event_cb_t cb) { s_event_cb = cb; }
-void touch_telemetry_set_param_cb(touch_param_cb_t cb) { s_param_cb = cb; }
+void touch_telemetry_set_event_cb(touch_event_cb_t cb)        { s_event_cb    = cb; }
+void touch_telemetry_set_param_cb(touch_param_cb_t cb)        { s_param_cb    = cb; }
+void touch_telemetry_set_pressure_cb(touch_pressure_cb_t cb)  { s_pressure_cb = cb; }
+void touch_telemetry_set_pressure_range(uint16_t range_x100)  { s_pressure_range = range_x100 ? range_x100 : 100; }
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -200,6 +204,20 @@ static void touch_telemetry_task(void *arg)
                 s_prev_touching[i] = touching;
                 touch_event_cb_t cb = s_event_cb;
                 if (cb) cb((uint8_t)i, touching);
+            }
+
+            // Continuous pressure update while pad is held (30 Hz)
+            if (touching) {
+                touch_pressure_cb_t pcb = s_pressure_cb;
+                if (pcb) {
+                    uint16_t range = s_pressure_range;
+                    float ceiling  = (float)threshold * (range / 100.0f);
+                    float excess   = (float)delta - (float)threshold;
+                    float norm     = (ceiling > 0.0f) ? (excess / ceiling) : 0.0f;
+                    if (norm < 0.0f) norm = 0.0f;
+                    if (norm > 1.0f) norm = 1.0f;
+                    pcb((uint8_t)i, norm);
+                }
             }
         }
 

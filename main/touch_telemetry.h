@@ -27,7 +27,18 @@ typedef void (*touch_param_cb_t)(uint8_t param_id, uint16_t value);
 #define SYNTH_PARAM_LFO_RATE      12
 #define SYNTH_PARAM_LFO_DEPTH     13
 #define SYNTH_PARAM_CHORUS        14
+#define SYNTH_PARAM_PRESSURE_DEPTH 15  // 0-10000 → 0-8000 Hz added to filter cutoff at max press
+#define SYNTH_PARAM_PRESSURE_RANGE 16  // sent as 100-500 (= 1.0×-5.0× threshold ceiling)
+#define SYNTH_PARAM_GLIDE          17  // 0-10000 → 0-500 ms portamento time
+#define SYNTH_PARAM_MODE           18  // 0=CUSTOM 1=JUNO 2=DX7 (scale=1, raw integer)
+#define SYNTH_PARAM_PATCH          19  // 0-127 patch within current bank (scale=1, raw integer)
+
+// Called continuously (30 Hz) while a pad is held.
+// pressure_norm: 0.0 = just triggered at threshold, 1.0 = full press (ceiling reached).
+typedef void (*touch_pressure_cb_t)(uint8_t pad, float pressure_norm);
 
 esp_err_t touch_telemetry_start(void);
 void      touch_telemetry_set_event_cb(touch_event_cb_t cb);
 void      touch_telemetry_set_param_cb(touch_param_cb_t cb);
+void      touch_telemetry_set_pressure_cb(touch_pressure_cb_t cb);
+void      touch_telemetry_set_pressure_range(uint16_t range_x100); // 100=1.0× … 500=5.0×

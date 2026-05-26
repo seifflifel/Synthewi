@@ -25,18 +25,28 @@ static bool     is_muted     = false;
 static uint32_t volume_factor = 100;
 static volatile uint32_t s_usb_in_cb_count = 0;
 
+// C pentatonic scale across two octaves: C4 D4 E4 G4 A4 C5 D5 E5
+static const uint8_t s_pad_notes[8] = { 60, 62, 64, 67, 69, 72, 74, 76 };
+
 // ---------------------------------------------------------------------------
 // Touch → synth bridge (called from touch_telemetry task on state edges)
 // ---------------------------------------------------------------------------
 static void on_touch_event(uint8_t pad, bool is_touching)
 {
+    if (pad >= 8) return;
     if (is_touching) {
-        // Note mapping is owned by amy_engine (s_pad_notes[]).
-        // We pass pad; amy_engine resolves the MIDI note internally.
-        amy_engine_note_on(pad, 60 + pad * 2); // C4, D4, E4, F4 — mirrors s_pad_notes
+        amy_engine_note_on(pad, s_pad_notes[pad]);
     } else {
         amy_engine_note_off(pad);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pressure → filter (called from touch_telemetry task at 30 Hz while pad held)
+// ---------------------------------------------------------------------------
+static void on_pressure(uint8_t pad, float pressure_norm)
+{
+    amy_engine_update_pressure(pad, pressure_norm);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +118,21 @@ static void on_synth_param(uint8_t param_id, uint16_t value)
     }
     case SYNTH_PARAM_CHORUS:
         amy_engine_set_chorus(value);
+        break;
+    case SYNTH_PARAM_PRESSURE_DEPTH:
+        amy_engine_set_pressure_depth(value);
+        break;
+    case SYNTH_PARAM_PRESSURE_RANGE:
+        touch_telemetry_set_pressure_range(value);
+        break;
+    case SYNTH_PARAM_GLIDE:
+        amy_engine_set_glide(value);
+        break;
+    case SYNTH_PARAM_MODE:
+        amy_engine_set_mode((uint8_t)value);
+        break;
+    case SYNTH_PARAM_PATCH:
+        amy_engine_set_patch((uint8_t)value);
         break;
     default:
         ESP_LOGW(TAG, "unknown synth param %u", param_id);
@@ -226,6 +251,7 @@ void app_main(void)
     // Register callbacks before starting telemetry so no edge is missed
     touch_telemetry_set_event_cb(on_touch_event);
     touch_telemetry_set_param_cb(on_synth_param);
+    touch_telemetry_set_pressure_cb(on_pressure);
 
     err = touch_telemetry_start();
     if (err != ESP_OK)

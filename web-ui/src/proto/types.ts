@@ -29,6 +29,8 @@ export type SynthState = {
   lfo_rate: number
   lfo_depth: number
   chorus_amount: number
+  pressure_depth?: number
+  glide?: number
 }
 
 export type WsDeviceToClient =

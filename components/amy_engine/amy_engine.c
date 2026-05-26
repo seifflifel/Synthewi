@@ -48,15 +48,20 @@ static uint16_t s_filter_env_decay   = 1000;  // ~205 ms
 static uint16_t s_lfo_rate           = 2000;  // ~2 Hz
 static uint16_t s_lfo_depth          = 0;
 static uint16_t s_chorus_amount      = 0;
+static uint16_t s_pressure_depth     = 0; // 0 = feature off
+static uint16_t    s_portamento         = 0; // 0 = instant (no glide)
+static synth_mode_t s_mode             = SYNTH_MODE_CUSTOM;
+static uint8_t      s_patch_num        = 0;  // 0-127 within current bank
 
-static bool s_pad_active[SYNTH_PAD_COUNT]  = {false};
-static bool s_lfo_started[SYNTH_PAD_COUNT] = {false};
+static bool    s_pad_active[SYNTH_PAD_COUNT]    = {false};
+static bool    s_lfo_started[SYNTH_PAD_COUNT]   = {false};
+static uint8_t s_pad_midi_note[SYNTH_PAD_COUNT] = {0}; // last midi note played per pad
 
 // AMY filter type constants (FILTER_NONE=0, FILTER_LPF=1, FILTER_BPF=2, FILTER_HPF=3)
 static const uint8_t s_filter_type_map[3] = { FILTER_LPF, FILTER_BPF, FILTER_HPF };
 
-// Per-pad stereo pan (left→right across 4 pads)
-static const float s_pan_pos[SYNTH_PAD_COUNT] = { 0.2f, 0.4f, 0.6f, 0.8f };
+// Per-pad stereo pan (left→right across 8 pads)
+static const float s_pan_pos[SYNTH_PAD_COUNT] = { 0.1f, 0.2f, 0.35f, 0.45f, 0.55f, 0.65f, 0.8f, 0.9f };
 
 // LFO oscillators occupy indices SYNTH_PAD_COUNT .. SYNTH_PAD_COUNT*2-1
 #define LFO_OSC(pad) ((uint16_t)(SYNTH_PAD_COUNT + (pad)))
@@ -83,6 +88,8 @@ static uint32_t sc_fenv_decay_ms(uint16_t v) { return (uint32_t)(5.0f  + (v / 10
 // KS feedback: high value = long string decay. Map env_release to 0.85-0.995.
 static float    sc_ks_feedback(uint16_t v)   { return 0.85f + (v / 10000.0f) * 0.145f; }
 static float    sc_chorus_level(uint16_t v)  { return v / 10000.0f; }
+static float    sc_pressure_depth_hz(uint16_t v) { return (v / 10000.0f) * 8000.0f; }
+static uint16_t sc_portamento_ms(uint16_t v)     { return (uint16_t)((v / 10000.0f) * 500.0f); }
 
 static float midi_note_to_hz(uint8_t note)
 {
@@ -107,6 +114,8 @@ static void nvs_save_all(void)
     nvs_set_u16(h, "lfo_rt",   s_lfo_rate);
     nvs_set_u16(h, "lfo_dp",   s_lfo_depth);
     nvs_set_u16(h, "chorus",   s_chorus_amount);
+    nvs_set_u16(h, "pres_dep", s_pressure_depth);
+    nvs_set_u16(h, "portamento", s_portamento);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -128,12 +137,15 @@ static void nvs_load_all(void)
     if (nvs_get_u16(h, "lfo_rt",   &u16) == ESP_OK) s_lfo_rate           = u16;
     if (nvs_get_u16(h, "lfo_dp",   &u16) == ESP_OK) s_lfo_depth          = u16;
     if (nvs_get_u16(h, "chorus",   &u16) == ESP_OK) s_chorus_amount      = u16;
+    if (nvs_get_u16(h, "pres_dep",  &u16) == ESP_OK) s_pressure_depth    = u16;
+    if (nvs_get_u16(h, "portamento",&u16) == ESP_OK) s_portamento        = u16;
     nvs_close(h);
 }
 
 // Apply filter params to all currently-playing oscillators (live param change).
 static void update_active_osc_filter(void)
 {
+    if (s_mode != SYNTH_MODE_CUSTOM) return; // don't touch patch-managed oscs
     amy_execute_deltas();
     uint8_t amy_ftype = s_filter_type_map[s_filter_type];
     for (uint8_t i = 0; i < SYNTH_PAD_COUNT; i++) {
@@ -152,6 +164,7 @@ static void update_active_osc_filter(void)
 // Update LFO frequency on all started LFO oscillators.
 static void update_lfo_rate(void)
 {
+    if (s_mode != SYNTH_MODE_CUSTOM) return;
     float hz = sc_lfo_hz(s_lfo_rate);
     amy_execute_deltas();
     for (uint8_t i = 0; i < SYNTH_PAD_COUNT; i++) {
@@ -226,6 +239,30 @@ static void embedded_wav_render_mono_16(int16_t *out, size_t samples)
 }
 
 // ---------------------------------------------------------------------------
+// PATCH mode helpers
+// ---------------------------------------------------------------------------
+
+// Reset all oscs and set up one AMY synth with the current patch + 2 voices.
+// Must be called with s_render_lock held.
+static void apply_patch_synth(void)
+{
+    amy_execute_deltas();
+    amy_event rst = amy_default_event();
+    rst.reset_osc = RESET_ALL_OSCS;
+    amy_add_event(&rst);
+
+    uint16_t actual_patch = (s_mode == SYNTH_MODE_DX7)
+                            ? (uint16_t)(128 + s_patch_num)
+                            : (uint16_t)s_patch_num; // JUNO: 0-127 direct
+
+    amy_event e = amy_default_event();
+    e.patch_number = actual_patch;
+    e.num_voices   = 2; // 2 voices = 12 oscs (Juno) or 16 oscs (DX7), fits max_oscs=16
+    e.synth        = 0;
+    amy_add_event(&e);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -252,10 +289,10 @@ void amy_engine_init(void)
     cfg.platform.multithread    = 0;
     // Oscs 0-3: audio (one per pad). Oscs 4-7: LFO (one per pad, SINE mod sources).
     // Chorus allocates its own mod source at index max_oscs (index 8), handled internally.
-    cfg.max_oscs             = SYNTH_PAD_COUNT * 2; // 8
+    cfg.max_oscs             = SYNTH_PAD_COUNT * 2; // 16 (8 audio + 8 LFO)
     cfg.ks_oscs              = 0; // KS delay lines (~32 KB) exhaust heap before USB task stack
     cfg.max_sequencer_tags   = 1;
-    cfg.max_voices           = 1;
+    cfg.max_voices           = 2; // 2 voices for PATCH mode (2×Juno=12 oscs, 2×DX7=16 oscs)
     cfg.max_synths           = 1;
     cfg.max_memory_patches   = 1;
     amy_start(cfg);
@@ -277,7 +314,20 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
 
     if (xSemaphoreTake(s_render_lock, portMAX_DELAY) != pdTRUE) return;
 
+    s_pad_midi_note[pad] = midi_note;
     amy_execute_deltas();
+
+    if (s_mode != SYNTH_MODE_CUSTOM) {
+        // PATCH mode: let AMY synth voice allocator handle the note
+        amy_event e = amy_default_event();
+        e.synth     = 0;
+        e.midi_note = (float)midi_note;
+        e.velocity  = 1.0f;
+        amy_add_event(&e);
+        s_pad_active[pad] = true;
+        xSemaphoreGive(s_render_lock);
+        return;
+    }
 
     // Reset audio oscillator cleanly before reconfiguring.
     amy_event rst = amy_default_event();
@@ -336,6 +386,7 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
     // LFO mod source: each audio osc tracks its own LFO osc
     e.mod_source = LFO_OSC(pad);
 
+    e.portamento_ms = sc_portamento_ms(s_portamento);
     e.velocity = 1.0f;
     amy_add_event(&e);
 
@@ -364,12 +415,19 @@ void amy_engine_note_off(uint8_t pad)
     if (xSemaphoreTake(s_render_lock, portMAX_DELAY) != pdTRUE) return;
 
     amy_execute_deltas();
-
     amy_event e = amy_default_event();
-    e.osc      = pad;
-    e.velocity = 0.0f; // triggers EG0 release phase
-    amy_add_event(&e);
 
+    if (s_mode != SYNTH_MODE_CUSTOM) {
+        // PATCH mode: release by MIDI note through the synth voice allocator
+        e.synth     = 0;
+        e.midi_note = (float)s_pad_midi_note[pad];
+        e.velocity  = 0.0f;
+    } else {
+        e.osc      = pad;
+        e.velocity = 0.0f; // triggers EG0 release phase
+    }
+
+    amy_add_event(&e);
     s_pad_active[pad] = false;
     xSemaphoreGive(s_render_lock);
     ESP_LOGD(TAG, "note_off pad=%u", pad);
@@ -444,6 +502,75 @@ void amy_engine_set_chorus(uint16_t amount)
     (void)amount; // chorus disabled (features.chorus=0 — heap too tight after WiFi+reverb)
 }
 
+void amy_engine_set_pressure_depth(uint16_t depth)
+{
+    s_pressure_depth = depth;
+    nvs_save_all();
+    ESP_LOGI(TAG, "pressure_depth → %u", depth);
+}
+
+void amy_engine_set_glide(uint16_t glide)
+{
+    s_portamento = glide;
+    nvs_save_all();
+    ESP_LOGI(TAG, "glide → %u (%u ms)", glide, sc_portamento_ms(glide));
+}
+
+void amy_engine_set_mode(uint8_t mode)
+{
+    if (mode > (uint8_t)SYNTH_MODE_DX7) return;
+    s_mode = (synth_mode_t)mode;
+
+    if (xSemaphoreTake(s_render_lock, portMAX_DELAY) != pdTRUE) return;
+    for (int i = 0; i < SYNTH_PAD_COUNT; i++) {
+        s_pad_active[i]  = false;
+        s_lfo_started[i] = false;
+    }
+    if (s_mode == SYNTH_MODE_CUSTOM) {
+        // Reset oscs; CUSTOM note_on will reconfigure fresh on next touch
+        amy_execute_deltas();
+        amy_event rst = amy_default_event();
+        rst.reset_osc = RESET_ALL_OSCS;
+        amy_add_event(&rst);
+    } else {
+        apply_patch_synth();
+    }
+    xSemaphoreGive(s_render_lock);
+    ESP_LOGI(TAG, "mode → %u (patch=%u)", mode, s_patch_num);
+}
+
+void amy_engine_set_patch(uint8_t patch_in_bank)
+{
+    s_patch_num = patch_in_bank > 127 ? 127 : patch_in_bank;
+    if (s_mode == SYNTH_MODE_CUSTOM) return; // no-op in CUSTOM
+
+    if (xSemaphoreTake(s_render_lock, portMAX_DELAY) != pdTRUE) return;
+    apply_patch_synth();
+    xSemaphoreGive(s_render_lock);
+    ESP_LOGI(TAG, "patch → bank=%u actual=%u",
+             s_patch_num, s_mode == SYNTH_MODE_DX7 ? 128 + s_patch_num : s_patch_num);
+}
+
+void amy_engine_update_pressure(uint8_t pad, float pressure_norm)
+{
+    if (!s_initialized || pad >= SYNTH_PAD_COUNT || !s_pad_active[pad]) return;
+    if (s_mode != SYNTH_MODE_CUSTOM) return; // no pressure override in PATCH mode
+    if (!s_pressure_depth) return; // fast path: feature off
+
+    // 2 ms timeout — called from touch task at 30 Hz, must not stall telemetry
+    if (xSemaphoreTake(s_render_lock, pdMS_TO_TICKS(2)) != pdTRUE) return;
+    amy_execute_deltas();
+    amy_event e = amy_default_event();
+    e.osc = pad;
+    e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff)
+                                    + sc_pressure_depth_hz(s_pressure_depth) * pressure_norm;
+    e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
+    e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
+    e.resonance = sc_filter_res(s_filter_resonance);
+    amy_add_event(&e);
+    xSemaphoreGive(s_render_lock);
+}
+
 void amy_engine_set_envelope(uint16_t attack, uint16_t release)
 {
     s_env_attack  = attack;
@@ -470,6 +597,10 @@ void amy_engine_get_state(amy_engine_state_t *out)
     out->lfo_rate         = s_lfo_rate;
     out->lfo_depth        = s_lfo_depth;
     out->chorus_amount    = s_chorus_amount;
+    out->pressure_depth   = s_pressure_depth;
+    out->glide            = s_portamento;
+    out->synth_mode       = (uint8_t)s_mode;
+    out->patch_num        = s_patch_num;
 }
 
 void amy_engine_render_mono_16(int16_t *out, size_t samples)

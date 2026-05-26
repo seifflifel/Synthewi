@@ -171,7 +171,7 @@ export function mountApp(root: HTMLDivElement) {
     conn: 'disconnected',
     connDetail: '',
     lastLine: '// no websocket data',
-    touch: [createTouchState(), createTouchState(), createTouchState(), createTouchState()],
+    touch: Array.from({ length: 8 }, createTouchState),
   }
 
   // ------- synth param slider handles (keyed for state sync) -------
@@ -179,6 +179,13 @@ export function mountApp(root: HTMLDivElement) {
   let activeFtypeIdx = 0
   let waveBtns:  HTMLButtonElement[] = []
   let ftypeBtns: HTMLButtonElement[] = []
+
+  // ------- PATCH mode state -------
+  type SynthModeId = 0 | 1 | 2  // 0=CUSTOM 1=JUNO 2=DX7
+  let activeMode:  SynthModeId = 0
+  let activePatch: number       = 0  // 0-127 within current bank
+  const PATCH_BANK_SIZE = 128
+  const MODE_NAMES = ['CUSTOM', 'JUNO', 'DX7'] as const
 
   // Filter
   const sFilterCut = mkSlider('cutoff', 200, 10000, 10, 10000, fmtHz,
@@ -188,6 +195,18 @@ export function mountApp(root: HTMLDivElement) {
   const sFilterRes = mkSlider('res', 0, 0.9, 0.01, 0, v => v.toFixed(2),
     v => sender.set('fx.filter.resonance', displayToNorm(v, 0, 0.9)),
     v => sender.flush('fx.filter.resonance', displayToNorm(v, 0, 0.9)))
+
+  const sGlide = mkSlider('glide', 0, 500, 5, 0, fmtMs,
+    v => sender.set('synth.glide', displayToNorm(v, 0, 500)),
+    v => sender.flush('synth.glide', displayToNorm(v, 0, 500)))
+
+  const sPresDepth = mkSlider('pres depth', 0, 8000, 50, 0, fmtHz,
+    v => sender.set('touch.pressure.depth', displayToNorm(v, 0, 8000)),
+    v => sender.flush('touch.pressure.depth', displayToNorm(v, 0, 8000)))
+
+  const sPresRange = mkSlider('pres range', 1.0, 5.0, 0.1, 2.0, v => `${v.toFixed(1)}×`,
+    v => sender.set('touch.pressure.range', v),
+    v => sender.flush('touch.pressure.range', v))
 
   // Filter envelope
   const sFenvDepth = mkSlider('depth', 0, 8000, 50, 0, fmtHz,
@@ -236,6 +255,19 @@ export function mountApp(root: HTMLDivElement) {
     sLfoDepth.setValue( espToDisplay(s.lfo_depth ?? 0,    0,   5000))
     sEnvAtk.setValue(   espToDisplay(s.env_attack,       5,    2000))
     sEnvRel.setValue(   espToDisplay(s.env_release,      50,   5000))
+    if (s.pressure_depth !== undefined)
+      sPresDepth.setValue(espToDisplay(s.pressure_depth, 0, 8000))
+    if (s.glide !== undefined)
+      sGlide.setValue(espToDisplay(s.glide, 0, 500))
+  }
+
+  // ------- mode switch (called when mode buttons are clicked) -------
+  function applyModeVisibility() {
+    const isCustom = activeMode === 0
+    customControls.style.display  = isCustom ? '' : 'none'
+    patchControls.style.display   = isCustom ? 'none' : ''
+    patchBankLabel.textContent    = MODE_NAMES[activeMode]
+    patchNumDisplay.textContent   = String(activePatch + 1).padStart(3, '0')
   }
 
   // ------- touch telemetry display elements -------
@@ -247,11 +279,13 @@ export function mountApp(root: HTMLDivElement) {
   const touchThrEls:    HTMLSpanElement[]  = []
   const touchThrSliders: HTMLInputElement[] = []
   const touchThrInputs:  HTMLInputElement[] = []
-  const touchThrInteracting: boolean[]     = [false, false, false, false]
+  const touchThrInteracting: boolean[]     = Array(8).fill(false)
+  const touchThrLastSentMs: number[]       = Array(8).fill(0)
+  const THR_HOLD_MS = 1500 // block telemetry overwrites for this long after sending a command
   const touchSpark:     HTMLCanvasElement[] = []
 
   function applyTouchTelemetry(touch: Record<string, TouchTelemetry>) {
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 8; i++) {
       const t = touch[`ch${i}`]
       if (!t) continue
       const cur = state.touch[i]
@@ -266,17 +300,22 @@ export function mountApp(root: HTMLDivElement) {
       pushHist(cur.rawHist, cur.raw)
       pushHist(cur.baselineHist, cur.baseline)
 
-      touchRawEls[i].textContent   = `${cur.raw}`
-      touchBaseEls[i].textContent  = `${cur.baseline}`
-      touchDeltaEls[i].textContent = `${cur.abs_delta}`
-      touchIntEls[i].textContent   = fmtPct(cur.intensity)
+      // Change-detection: only write to DOM if value actually changed (avoids 30Hz reflow)
+      const setT = (el: HTMLSpanElement, v: string) => { if (el.textContent !== v) el.textContent = v }
+      setT(touchRawEls[i],   `${cur.raw}`)
+      setT(touchBaseEls[i],  `${cur.baseline}`)
+      setT(touchDeltaEls[i], `${cur.abs_delta}`)
+      setT(touchIntEls[i],   fmtPct(cur.intensity))
+      const touchStr = cur.is_touching ? 'touch' : 'idle'
       touchBadgeEls[i].classList.toggle('on', cur.is_touching)
-      touchBadgeEls[i].textContent = cur.is_touching ? 'touch' : 'idle'
-      touchThrEls[i].textContent   = `${cur.threshold}`
+      setT(touchBadgeEls[i] as HTMLSpanElement, touchStr)
+      setT(touchThrEls[i],   `${cur.threshold}`)
 
-      if (!touchThrInteracting[i]) {
-        touchThrSliders[i].value = `${cur.threshold}`
-        touchThrInputs[i].value  = `${cur.threshold}`
+      // Only update slider from telemetry if not interacting AND command hold has expired
+      if (!touchThrInteracting[i] && Date.now() - touchThrLastSentMs[i] > THR_HOLD_MS) {
+        const thrStr = `${cur.threshold}`
+        if (touchThrSliders[i].value !== thrStr) touchThrSliders[i].value = thrStr
+        if (touchThrInputs[i].value  !== thrStr) touchThrInputs[i].value  = thrStr
       }
     }
   }
@@ -304,6 +343,42 @@ export function mountApp(root: HTMLDivElement) {
   })
 
   const sender = createParamSender(ws)
+
+  // ------- Mode row (CUSTOM / JUNO / DX7) -------
+  let modeBtns: HTMLButtonElement[] = []
+  let patchBankLabel  = el('span', { className: 'fx-name', textContent: 'JUNO' })
+  let patchNumDisplay = el('span', { className: 'patch-num', textContent: '001' })
+
+  function sendMode(mode: SynthModeId) {
+    activeMode = mode
+    modeBtns.forEach((b, i) => b.classList.toggle('sel', i === mode))
+    sender.flush('synth.mode', mode)
+    applyModeVisibility()
+  }
+
+  function sendPatch(delta: number) {
+    activePatch = (activePatch + delta + PATCH_BANK_SIZE) % PATCH_BANK_SIZE
+    patchNumDisplay.textContent = String(activePatch + 1).padStart(3, '0')
+    sender.flush('synth.patch', activePatch)
+  }
+
+  modeBtns = (['CUSTOM', 'JUNO', 'DX7'] as const).map((name, idx) => {
+    const b = el('button', {
+      className: `wb${idx === 0 ? ' sel' : ''}`,
+      textContent: name,
+    }) as HTMLButtonElement
+    b.addEventListener('click', () => sendMode(idx as SynthModeId))
+    return b
+  })
+
+  const prevPatchBtn = el('button', { className: 'btn btn-mini', textContent: '◀' }) as HTMLButtonElement
+  const nextPatchBtn = el('button', { className: 'btn btn-mini', textContent: '▶' }) as HTMLButtonElement
+  prevPatchBtn.addEventListener('click', () => sendPatch(-1))
+  nextPatchBtn.addEventListener('click', () => sendPatch(+1))
+
+  // placeholder refs — filled after card construction
+  let customControls: HTMLElement
+  let patchControls: HTMLElement
 
   // ------- Topbar -------
   const pill       = el('span', { className: pillClass('disconnected'), textContent: 'demo' })
@@ -346,45 +421,39 @@ export function mountApp(root: HTMLDivElement) {
     return b
   })
 
-  const synthCard = el('div', { className: 'card' }, [
-    el('div', { className: 'sec-label', textContent: 'synth' }),
-    el('div', { className: 'fx-grid' }, [
-      el('div', { className: 'fx-card' }, [
-        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'waveform' })]),
-        el('div', { className: 'wave-btns' }, waveBtns),
-      ]),
-    ]),
+  // ------- OSC card -------
+  const oscCard = el('div', { className: 'card' }, [
+    el('div', { className: 'sec-label', textContent: 'osc' }),
+    el('div', { className: 'wave-btns' }, waveBtns),
+    sGlide.el,
   ])
 
-  // ------- FX card -------
-  const fxCard = el('div', { className: 'card' }, [
-    el('div', { className: 'sec-label', textContent: 'fx' }),
-    el('div', { className: 'fx-grid' }, [
-      el('div', { className: 'fx-card' }, [
-        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'filter' })]),
-        el('div', { className: 'wave-btns' }, ftypeBtns),
-        sFilterCut.el,
-        sFilterRes.el,
-      ]),
-      el('div', { className: 'fx-card' }, [
-        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'filter env' })]),
-        sFenvDepth.el,
-        sFenvDecay.el,
-      ]),
-      el('div', { className: 'fx-card' }, [
-        el('div', { className: 'fx-head' }, [el('span', { className: 'fx-name', textContent: 'lfo → filter' })]),
-        sLfoRate.el,
-        sLfoDepth.el,
-      ]),
-    ]),
+  // ------- FILTER card -------
+  const filterCard = el('div', { className: 'card' }, [
+    el('div', { className: 'sec-label', textContent: 'filter' }),
+    el('div', { className: 'wave-btns' }, ftypeBtns),
+    sFilterCut.el,
+    sFilterRes.el,
+    sPresDepth.el,
+    sPresRange.el,
   ])
 
-  // ------- Envelope card -------
+  // ------- MOD card (LFO + filter env) -------
+  const modCard = el('div', { className: 'card' }, [
+    el('div', { className: 'sec-label', textContent: 'mod' }),
+    el('div', { className: 'sec-label', style: 'margin-top:6px', textContent: 'lfo' }),
+    sLfoRate.el,
+    sLfoDepth.el,
+    el('div', { className: 'sec-label', style: 'margin-top:8px', textContent: 'filter env' }),
+    sFenvDepth.el,
+    sFenvDecay.el,
+  ])
+
+  // ------- ENV card -------
   const envCard = el('div', { className: 'card' }, [
-    el('div', { className: 'sec-label', textContent: 'envelope' }),
-    el('div', { className: 'fx-grid' }, [
-      el('div', { className: 'fx-card' }, [sEnvAtk.el, sEnvRel.el]),
-    ]),
+    el('div', { className: 'sec-label', textContent: 'env' }),
+    sEnvAtk.el,
+    sEnvRel.el,
   ])
 
   // ------- Touch threshold cards -------
@@ -393,7 +462,7 @@ export function mountApp(root: HTMLDivElement) {
   ])
   const touchGrid = el('div', { className: 'touch-grid' })
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 8; i++) {
     const badge = el('span', { className: 'touch-badge', textContent: 'idle' }) as HTMLSpanElement
     const rawV  = el('span', { textContent: '0' }) as HTMLSpanElement
     const baseV = el('span', { textContent: '0' }) as HTMLSpanElement
@@ -409,18 +478,21 @@ export function mountApp(root: HTMLDivElement) {
     }) as HTMLInputElement
     const thrBtn = el('button', { className: 'btn btn-mini', textContent: 'apply' }) as HTMLButtonElement
 
-    thrS.addEventListener('pointerdown', () => { touchThrInteracting[i] = true })
-    thrS.addEventListener('pointerup', () => {
-      touchThrInteracting[i] = false
-      const v = parseInt(thrS.value, 10)
+    const sendThreshold = (v: number) => {
+      touchThrLastSentMs[i] = Date.now()
       thrV.textContent = `${v}`; thrN.value = `${v}`
       sender.flush(`touch.ch${i}.threshold`, v)
-    })
+      // Hold the interacting lock so incoming telemetry can't snap the slider back
+      // before the command reaches the ESP and the new threshold is reflected.
+      setTimeout(() => { touchThrInteracting[i] = false }, 200)
+    }
+
+    thrS.addEventListener('pointerdown', () => { touchThrInteracting[i] = true })
+    thrS.addEventListener('pointerup',   () => { sendThreshold(parseInt(thrS.value, 10)) })
     thrS.addEventListener('pointercancel', () => { touchThrInteracting[i] = false })
     thrS.addEventListener('input', () => {
       const v = parseInt(thrS.value, 10)
       thrV.textContent = `${v}`; thrN.value = `${v}`
-      sender.set(`touch.ch${i}.threshold`, v)
     })
 
     thrN.addEventListener('input', () => {
@@ -432,8 +504,8 @@ export function mountApp(root: HTMLDivElement) {
 
     const applyThreshold = () => {
       const v = clamp(parseInt(thrN.value, 10) || 0, TOUCH_THR_MIN, TOUCH_THR_MAX)
-      thrN.value = `${v}`; thrS.value = `${v}`; thrV.textContent = `${v}`
-      sender.flush(`touch.ch${i}.threshold`, v)
+      thrS.value = `${v}`
+      sendThreshold(v)
     }
     thrBtn.addEventListener('click', applyThreshold)
     thrN.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyThreshold() })
@@ -441,7 +513,13 @@ export function mountApp(root: HTMLDivElement) {
     const canvas = el('canvas', { className: 'spark' }) as HTMLCanvasElement
 
     touchGrid.append(el('div', { className: 'touch-card' }, [
-      el('div', { className: 'touch-top' }, [el('span', { className: 'touch-name', textContent: `pad ch${i}` }), badge]),
+      el('div', { className: 'touch-top' }, [
+        el('span', { className: 'touch-name' }, [
+          el('span', { textContent: `ch${i} ` }),
+          el('span', { className: 'touch-note', textContent: ['C4','D4','E4','G4','A4','C5','D5','E5'][i] }),
+        ]),
+        badge,
+      ]),
       canvas,
       el('div', { className: 'sl-row' }, [el('label', { textContent: 'raw' }),   el('div', {}), rawV]),
       el('div', { className: 'sl-row' }, [el('label', { textContent: 'base' }),  el('div', {}), baseV]),
@@ -460,18 +538,35 @@ export function mountApp(root: HTMLDivElement) {
 
   // Sparkline render loop
   ;(function sparkLoop() {
-    for (let i = 0; i < 4; i++) drawSpark(touchSpark[i], state.touch[i].rawHist, state.touch[i].baselineHist)
+    for (let i = 0; i < 8; i++) drawSpark(touchSpark[i], state.touch[i].rawHist, state.touch[i].baselineHist)
     requestAnimationFrame(sparkLoop)
   })()
 
   const logLine = el('div', { className: 'logline', textContent: state.lastLine })
 
+  const modeRow = el('div', { className: 'mode-row' }, [
+    el('div', { className: 'wave-btns' }, modeBtns),
+  ])
+
+  customControls = el('div', { className: 'controls-row' }, [oscCard, filterCard, modCard, envCard])
+
+  patchControls = el('div', { className: 'card', style: 'display:none' }, [
+    el('div', { className: 'sec-label' }, [patchBankLabel]),
+    el('div', { className: 'patch-row' }, [
+      prevPatchBtn,
+      patchNumDisplay,
+      nextPatchBtn,
+    ]),
+  ])
+
   root.replaceChildren(el('div', { className: 'container' }, [
     topbar,
     statusHint,
-    el('div', { className: 'grid2' }, [
-      el('div', {}, [synthCard, fxCard, envCard]),
-      el('div', {}, [touchCard, el('div', { className: 'sec-label', textContent: 'log' }), logLine]),
-    ]),
+    modeRow,
+    customControls,
+    patchControls,
+    touchCard,
+    el('div', { className: 'sec-label', textContent: 'log' }),
+    logLine,
   ]))
 }
