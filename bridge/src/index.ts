@@ -83,6 +83,7 @@ const PATH_TO_CMD: Record<string, { paramId: number; scale: number }> = {
   'synth.glide':            { paramId: 17, scale: 10000 },
   'synth.mode':             { paramId: 18, scale: 1     }, // 0=CUSTOM 1=JUNO 2=DX7
   'synth.patch':            { paramId: 19, scale: 1     }, // 0-127 within current bank
+  'synth.octave':           { paramId: 20, scale: 1     }, // 0=neutral 1=+1oct 2=-1oct
 }
 
 let lastDevice: DeviceState | null = null

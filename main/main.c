@@ -19,7 +19,7 @@ static const char *TAG = "Synthewi";
 // Useful for validating USB audio transport quality without the synth.
 #define TEST_WAV_PLAYBACK 0
 
-#define OUTPUT_GAIN_BOOST 4
+#define OUTPUT_GAIN_BOOST 2
 
 static bool     is_muted     = false;
 static uint32_t volume_factor = 100;
@@ -27,6 +27,7 @@ static volatile uint32_t s_usb_in_cb_count = 0;
 
 // C pentatonic scale across two octaves: C4 D4 E4 G4 A4 C5 D5 E5
 static const uint8_t s_pad_notes[8] = { 60, 62, 64, 67, 69, 72, 74, 76 };
+static volatile int8_t s_octave_shift = 0; // -1 / 0 / +1, set by SYNTH_PARAM_OCTAVE
 
 // ---------------------------------------------------------------------------
 // Touch → synth bridge (called from touch_telemetry task on state edges)
@@ -35,7 +36,8 @@ static void on_touch_event(uint8_t pad, bool is_touching)
 {
     if (pad >= 8) return;
     if (is_touching) {
-        amy_engine_note_on(pad, s_pad_notes[pad]);
+        uint8_t note = (uint8_t)((int)s_pad_notes[pad] + s_octave_shift * 12);
+        amy_engine_note_on(pad, note);
     } else {
         amy_engine_note_off(pad);
     }
@@ -133,6 +135,9 @@ static void on_synth_param(uint8_t param_id, uint16_t value)
         break;
     case SYNTH_PARAM_PATCH:
         amy_engine_set_patch((uint8_t)value);
+        break;
+    case SYNTH_PARAM_OCTAVE:
+        s_octave_shift = (value == 1) ? 1 : (value == 2) ? -1 : 0;
         break;
     default:
         ESP_LOGW(TAG, "unknown synth param %u", param_id);

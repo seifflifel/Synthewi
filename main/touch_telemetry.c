@@ -17,6 +17,8 @@
 #include "touch_control.h"
 #include "wifi_manager.h"
 #include "amy_engine.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "touch_telemetry";
 
@@ -101,6 +103,36 @@ static volatile touch_event_cb_t    s_event_cb    = NULL;
 static volatile touch_param_cb_t    s_param_cb    = NULL;
 static volatile touch_pressure_cb_t s_pressure_cb = NULL;
 static volatile uint16_t            s_pressure_range = 200; // 2.0× default
+
+// ---------------------------------------------------------------------------
+// NVS persistence for thresholds
+// ---------------------------------------------------------------------------
+static void nvs_save_thresholds(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("touch", NVS_READWRITE, &h) != ESP_OK) return;
+    char key[6];
+    for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
+        snprintf(key, sizeof(key), "thr%d", i);
+        nvs_set_u16(h, key, s_thresholds[i]);
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void nvs_load_thresholds(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("touch", NVS_READONLY, &h) != ESP_OK) return;
+    char key[6];
+    uint16_t val;
+    for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
+        snprintf(key, sizeof(key), "thr%d", i);
+        if (nvs_get_u16(h, key, &val) == ESP_OK && val > 0)
+            s_thresholds[i] = val;
+    }
+    nvs_close(h);
+}
 
 // ---------------------------------------------------------------------------
 // Public callback registration
@@ -278,8 +310,10 @@ static void touch_cmd_task(void *arg)
             uint16_t prev = s_thresholds[cmd->channel];
             s_thresholds[cmd->channel] = cmd->threshold;
             s_touch_pads[cmd->channel].threshold = cmd->threshold;
-            if (prev != cmd->threshold)
+            if (prev != cmd->threshold) {
                 ESP_LOGI(TAG, "threshold ch%u: %u → %u", cmd->channel, prev, cmd->threshold);
+                nvs_save_thresholds();
+            }
 
         } else if (cmd->cmd == TOUCH_CMD_SET_SYNTH_PARAM) {
             touch_param_cb_t cb = s_param_cb;
@@ -296,6 +330,7 @@ esp_err_t touch_telemetry_start(void)
 {
     if (s_started) return ESP_OK;
 
+    nvs_load_thresholds();
     esp_read_mac(s_sta_mac, ESP_MAC_WIFI_STA);
 
     for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {

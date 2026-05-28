@@ -544,8 +544,25 @@ export function mountApp(root: HTMLDivElement) {
 
   const logLine = el('div', { className: 'logline', textContent: state.lastLine })
 
+  function makeMomentaryOctBtn(label: string, sendValue: number): HTMLButtonElement {
+    const b = el('button', { className: 'wb', textContent: label }) as HTMLButtonElement
+    const press = () => { b.classList.add('sel'); sender.flush('synth.octave', sendValue) }
+    const release = () => { b.classList.remove('sel'); sender.flush('synth.octave', 0) }
+    b.addEventListener('mousedown', press)
+    b.addEventListener('mouseup', release)
+    b.addEventListener('mouseleave', release)
+    b.addEventListener('touchstart', (e) => { e.preventDefault(); press() })
+    b.addEventListener('touchend', release)
+    b.addEventListener('touchcancel', release)
+    return b
+  }
+
+  const octDownBtn = makeMomentaryOctBtn('OCT−', 2)
+  const octUpBtn   = makeMomentaryOctBtn('OCT+', 1)
+
   const modeRow = el('div', { className: 'mode-row' }, [
     el('div', { className: 'wave-btns' }, modeBtns),
+    el('div', { className: 'wave-btns', style: 'margin-left:8px' }, [octDownBtn, octUpBtn]),
   ])
 
   customControls = el('div', { className: 'controls-row' }, [oscCard, filterCard, modCard, envCard])

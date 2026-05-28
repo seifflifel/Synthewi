@@ -91,6 +91,13 @@ static float    sc_chorus_level(uint16_t v)  { return v / 10000.0f; }
 static float    sc_pressure_depth_hz(uint16_t v) { return (v / 10000.0f) * 8000.0f; }
 static uint16_t sc_portamento_ms(uint16_t v)     { return (uint16_t)((v / 10000.0f) * 500.0f); }
 
+// LFO depth clamped so it can never swing the filter cutoff below 50 Hz.
+static float safe_lfo_depth_hz(uint16_t lfo_depth, float base_cutoff_hz) {
+    float depth = sc_lfo_depth_hz(lfo_depth);
+    float max   = base_cutoff_hz - 50.0f;
+    return depth < max ? depth : (max > 0.0f ? max : 0.0f);
+}
+
 static float midi_note_to_hz(uint8_t note)
 {
     return 440.0f * powf(2.0f, ((float)note - 69.0f) / 12.0f);
@@ -152,10 +159,11 @@ static void update_active_osc_filter(void)
         if (!s_pad_active[i]) continue;
         amy_event e = amy_default_event();
         e.osc = i;
+        float upd_hz = sc_filter_hz(s_filter_cutoff);
         e.filter_type = amy_ftype;
-        e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
+        e.filter_freq_coefs[COEF_CONST] = upd_hz;
         e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
-        e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
+        e.filter_freq_coefs[COEF_MOD]   = safe_lfo_depth_hz(s_lfo_depth, upd_hz);
         e.resonance = sc_filter_res(s_filter_resonance);
         amy_add_event(&e);
     }
@@ -373,9 +381,10 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
 
     // Filter: base cutoff + filter envelope (EG1) + LFO mod
     e.filter_type = amy_ftype;
-    e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
+    float base_hz = sc_filter_hz(s_filter_cutoff);
+    e.filter_freq_coefs[COEF_CONST] = base_hz;
     e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
-    e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
+    e.filter_freq_coefs[COEF_MOD]   = safe_lfo_depth_hz(s_lfo_depth, base_hz);
     e.resonance = sc_filter_res(s_filter_resonance);
 
     // EG1: filter envelope — quick rise to full depth, then decay to base
@@ -562,10 +571,11 @@ void amy_engine_update_pressure(uint8_t pad, float pressure_norm)
     amy_execute_deltas();
     amy_event e = amy_default_event();
     e.osc = pad;
-    e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff)
-                                    + sc_pressure_depth_hz(s_pressure_depth) * pressure_norm;
+    float pres_hz = sc_filter_hz(s_filter_cutoff)
+                  + sc_pressure_depth_hz(s_pressure_depth) * pressure_norm;
+    e.filter_freq_coefs[COEF_CONST] = pres_hz;
     e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
-    e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
+    e.filter_freq_coefs[COEF_MOD]   = safe_lfo_depth_hz(s_lfo_depth, pres_hz);
     e.resonance = sc_filter_res(s_filter_resonance);
     amy_add_event(&e);
     xSemaphoreGive(s_render_lock);

@@ -4,6 +4,18 @@ Session: 2026-05-25. Starting from commit `27e7c6c` (working prototype: filter, 
 
 ---
 
+## Progress Checklist
+
+- [x] **Phase 1** — 8 Pads (ESP + bridge + web UI)
+- [x] **Phase 2** — Pressure Expressiveness (depth + range, filter modulation) (still needs work)
+- [x] **Phase 3** — Portamento / Glide (still needs work)
+- [x] **Phase 4** — PATCH Mode (Juno / DX7, mode tabs, patch browser) — (still needs work)
+- [x] **Phase 5** — UI Overhaul (4-column controls, mode tabs, 8-pad grid)
+- [ ] **Phase 6** — Looper `[return later — final hardware, no WiFi/USB/LwIP frees PSRAM]`
+- [ ] **Phase 7** — Touch Threshold Auto-Calibration `[return later — final hardware, no web UI]`
+
+---
+
 ## Goal
 
 Two synthesis modes on 8 touch pads, pentatonic scale, fully controllable from a redesigned web UI.
@@ -250,6 +262,65 @@ Phase 5 is frontend-only — no firmware changes.
 | `synth.glide` | 17 | 10000 | Phase 3 |
 | `synth.mode` | 18 | 1 | Phase 4 |
 | `synth.patch` | 19 | 1 | Phase 4 |
+
+---
+
+## Phase 6 — Looper (final hardware only)
+
+Deferred from prototype because it requires PSRAM that is too constrained on the N8R2 once WiFi is active. On final hardware (no WiFi, no USB audio, no LwIP) the freed heap makes this viable with any PSRAM variant.
+
+### Design (settled)
+
+- **Buffer**: `int16_t[]` in PSRAM via `heap_caps_malloc(MALLOC_CAP_SPIRAM)`, size = all available PSRAM minus 64 KB headroom. At 48 kHz, N8R2 gives ~20 s; N8R8 gives the full 30 s cap.
+- **State machine**: EMPTY → REC → PLAYING → OVERDUB (trigger cycles through; OVERDUB → PLAYING)
+- **Playback**: additive (loop + live AMY output, never replaces)
+- **Overdub decay**: 0.85× per cycle prevents infinite buildup
+- **Trigger**: physical button on final PCB (no WiFi needed); SYNTH_PARAM 20
+- **Clear**: physical button or long-press; SYNTH_PARAM 21
+- **Position display**: LED bar or OLED showing playhead position (replaces web UI progress bar)
+
+### Implementation notes
+
+- `looper_process(buf, n)` inserted in audio callback after `amy_engine_render_mono_16()`, before gain/clip loop — the code is already written and tested logically, just needs PSRAM to be available
+- Protocol version bumps and bridge/UI changes not needed (no WiFi in final hardware)
+- `looper_init()` called after `amy_engine_init()` — on final hardware this should succeed cleanly
+
+---
+
+## Phase 7 — Touch Threshold Auto-Calibration (final hardware)
+
+Current prototype uses manually-set thresholds adjusted via the web UI and stored in NVS. For the final standalone hardware (no WiFi, no web UI), thresholds need to be determined automatically.
+
+### Chosen approach: Startup auto-calibration (Option B)
+
+At boot, sample all 8 pads for ~1 second with no fingers touching. Average the raw readings to get a clean idle baseline per pad. Set each pad's threshold as:
+
+```
+threshold[i] = baseline[i] × K
+```
+
+where `K` is a single percentage constant (e.g. 0.08 = 8%) determined once experimentally on the final rig and stored in NVS. After that first tune, the device adapts forever — `baseline_value` is tracked continuously by the ESP-IDF touch driver and compensates for temperature and humidity drift.
+
+### Why this works
+
+- ESP-IDF touch peripheral already continuously updates `baseline_value` (slow drift compensation built in)
+- Only the `K` multiplier needs one-time empirical tuning during hardware bring-up
+- Adapts to pad-to-pad variation (different sizes, geometries) automatically
+- Zero user interaction required after final rig is built
+
+### Implementation sketch
+
+```c
+// At startup, after touch_telemetry_start():
+// 1. Wait ~1 s for baselines to settle
+// 2. For each pad: threshold[i] = (uint16_t)(baseline[i] * K)
+// 3. Push thresholds into s_thresholds[] and NVS
+// K loaded from NVS (default 0.08), tuneable via a single physical pot or compile-time constant
+```
+
+### Alternative considered and rejected
+
+**Option C (per-pad learning mode)**: touch each pad once at startup to record the touched delta, set threshold at 50% of that delta. More accurate if pads differ wildly in sensitivity, but requires a deliberate calibration ritual every power-on. Unnecessary if pad geometry is uniform (PCB copper pads).
 
 ---
 

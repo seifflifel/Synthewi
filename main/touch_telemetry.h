@@ -32,6 +32,7 @@ typedef void (*touch_param_cb_t)(uint8_t param_id, uint16_t value);
 #define SYNTH_PARAM_GLIDE          17  // 0-10000 → 0-500 ms portamento time
 #define SYNTH_PARAM_MODE           18  // 0=CUSTOM 1=JUNO 2=DX7 (scale=1, raw integer)
 #define SYNTH_PARAM_PATCH          19  // 0-127 patch within current bank (scale=1, raw integer)
+#define SYNTH_PARAM_OCTAVE         20  // 0=neutral 1=+1 oct 2=-1 oct (momentary, released → 0)
 
 // Called continuously (30 Hz) while a pad is held.
 // pressure_norm: 0.0 = just triggered at threshold, 1.0 = full press (ceiling reached).
