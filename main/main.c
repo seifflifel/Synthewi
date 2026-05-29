@@ -1,291 +1,95 @@
 #include <stdint.h>
-#include <stdbool.h>
-#include <math.h>
 #include <inttypes.h>
-#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/i2s_std.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
-#include "usb_device_uac.h"
 #include "amy_engine.h"
-#include "wifi_manager.h"
-#include "touch_telemetry.h"
 
 static const char *TAG = "Synthewi";
 
-// Set to 1 to stream the embedded WAV instead of live synthesis.
-// Useful for validating USB audio transport quality without the synth.
-#define TEST_WAV_PLAYBACK 0
+#define OUTPUT_GAIN_BOOST 1
+#define AUDIO_BLOCK_SAMPLES 256
 
-#define OUTPUT_GAIN_BOOST 2
+#define I2S_BCLK_GPIO  GPIO_NUM_38
+#define I2S_LRCLK_GPIO GPIO_NUM_39
+#define I2S_DOUT_GPIO  GPIO_NUM_40
 
-static bool     is_muted     = false;
-static uint32_t volume_factor = 100;
-static volatile uint32_t s_usb_in_cb_count = 0;
+static i2s_chan_handle_t s_i2s_tx = NULL;
 
-// C pentatonic scale across two octaves: C4 D4 E4 G4 A4 C5 D5 E5
-static const uint8_t s_pad_notes[8] = { 60, 62, 64, 67, 69, 72, 74, 76 };
-static volatile int8_t s_octave_shift = 0; // -1 / 0 / +1, set by SYNTH_PARAM_OCTAVE
-
-// ---------------------------------------------------------------------------
-// Touch → synth bridge (called from touch_telemetry task on state edges)
-// ---------------------------------------------------------------------------
-static void on_touch_event(uint8_t pad, bool is_touching)
+static void i2s_audio_init(void)
 {
-    if (pad >= 8) return;
-    if (is_touching) {
-        uint8_t note = (uint8_t)((int)s_pad_notes[pad] + s_octave_shift * 12);
-        amy_engine_note_on(pad, note);
-    } else {
-        amy_engine_note_off(pad);
-    }
-}
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL));
 
-// ---------------------------------------------------------------------------
-// Pressure → filter (called from touch_telemetry task at 30 Hz while pad held)
-// ---------------------------------------------------------------------------
-static void on_pressure(uint8_t pad, float pressure_norm)
-{
-    amy_engine_update_pressure(pad, pressure_norm);
-}
-
-// ---------------------------------------------------------------------------
-// Synth param commands from bridge (called from touch_cmd task)
-// ---------------------------------------------------------------------------
-static void on_synth_param(uint8_t param_id, uint16_t value)
-{
-    switch (param_id) {
-    case SYNTH_PARAM_WAVE:
-        amy_engine_set_wave((uint8_t)value);
-        break;
-    case SYNTH_PARAM_REVERB_AMOUNT:
-    case SYNTH_PARAM_REVERB_DECAY: {
-        // We need both values; fetch current state for the one not changing.
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        uint16_t amt = (param_id == SYNTH_PARAM_REVERB_AMOUNT) ? value : st.reverb_amount;
-        uint16_t dec = (param_id == SYNTH_PARAM_REVERB_DECAY)  ? value : st.reverb_decay;
-        amy_engine_set_reverb(amt, dec);
-        break;
-    }
-    case SYNTH_PARAM_ECHO_AMOUNT:
-    case SYNTH_PARAM_ECHO_FEEDBACK: {
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        uint16_t amt = (param_id == SYNTH_PARAM_ECHO_AMOUNT)   ? value : st.echo_amount;
-        uint16_t fb  = (param_id == SYNTH_PARAM_ECHO_FEEDBACK) ? value : st.echo_feedback;
-        amy_engine_set_echo(amt, fb);
-        break;
-    }
-    case SYNTH_PARAM_FILTER_CUTOFF:
-    case SYNTH_PARAM_FILTER_RES: {
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        uint16_t cut = (param_id == SYNTH_PARAM_FILTER_CUTOFF) ? value : st.filter_cutoff;
-        uint16_t res = (param_id == SYNTH_PARAM_FILTER_RES)    ? value : st.filter_resonance;
-        amy_engine_set_filter(cut, res);
-        break;
-    }
-    case SYNTH_PARAM_ENV_ATTACK:
-    case SYNTH_PARAM_ENV_RELEASE: {
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        uint16_t atk = (param_id == SYNTH_PARAM_ENV_ATTACK)  ? value : st.env_attack;
-        uint16_t rel = (param_id == SYNTH_PARAM_ENV_RELEASE) ? value : st.env_release;
-        amy_engine_set_envelope(atk, rel);
-        break;
-    }
-    case SYNTH_PARAM_FILTER_TYPE:
-        amy_engine_set_filter_type((uint8_t)value);
-        break;
-    case SYNTH_PARAM_FENV_DEPTH:
-    case SYNTH_PARAM_FENV_DECAY: {
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        uint16_t dep = (param_id == SYNTH_PARAM_FENV_DEPTH) ? value : st.filter_env_depth;
-        uint16_t dec = (param_id == SYNTH_PARAM_FENV_DECAY) ? value : st.filter_env_decay;
-        amy_engine_set_filter_env(dep, dec);
-        break;
-    }
-    case SYNTH_PARAM_LFO_RATE:
-    case SYNTH_PARAM_LFO_DEPTH: {
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        uint16_t rt = (param_id == SYNTH_PARAM_LFO_RATE)  ? value : st.lfo_rate;
-        uint16_t dp = (param_id == SYNTH_PARAM_LFO_DEPTH) ? value : st.lfo_depth;
-        amy_engine_set_lfo(rt, dp);
-        break;
-    }
-    case SYNTH_PARAM_CHORUS:
-        amy_engine_set_chorus(value);
-        break;
-    case SYNTH_PARAM_PRESSURE_DEPTH:
-        amy_engine_set_pressure_depth(value);
-        break;
-    case SYNTH_PARAM_PRESSURE_RANGE:
-        touch_telemetry_set_pressure_range(value);
-        break;
-    case SYNTH_PARAM_GLIDE:
-        amy_engine_set_glide(value);
-        break;
-    case SYNTH_PARAM_MODE:
-        amy_engine_set_mode((uint8_t)value);
-        break;
-    case SYNTH_PARAM_PATCH:
-        amy_engine_set_patch((uint8_t)value);
-        break;
-    case SYNTH_PARAM_OCTAVE:
-        s_octave_shift = (value == 1) ? 1 : (value == 2) ? -1 : 0;
-        break;
-    default:
-        ESP_LOGW(TAG, "unknown synth param %u", param_id);
-        break;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// USB Audio Class callbacks
-// ---------------------------------------------------------------------------
-static esp_err_t usb_uac_device_output_cb(uint8_t *buf, size_t len, void *arg)
-{
-    (void)buf; (void)len; (void)arg;
-    return ESP_OK;
-}
-
-static esp_err_t usb_uac_device_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void *arg)
-{
-    (void)arg;
-    size_t   samples = len / sizeof(int16_t);
-    int16_t *out     = (int16_t *)buf;
-    static uint32_t   cb_count = 0;
-    static TickType_t last_stats_tick = 0;
-    int32_t peak = 0;
-
-#if TEST_WAV_PLAYBACK
-    amy_engine_render_wav_mono_16(out, samples);
-#else
-    amy_engine_render_mono_16(out, samples);
-#endif
-
-    for (size_t i = 0; i < samples; i++) {
-        int32_t s = is_muted ? 0 : out[i];
-        s = (s * (int32_t)volume_factor) / 100;
-        s = s * OUTPUT_GAIN_BOOST;
-        if (s >  32767) s =  32767;
-        if (s < -32768) s = -32768;
-        int32_t a = s < 0 ? -s : s;
-        if (a > peak) peak = a;
-        out[i] = (int16_t)s;
-    }
-
-    *bytes_read = samples * sizeof(int16_t);
-
-    cb_count++;
-    s_usb_in_cb_count = cb_count;
-    TickType_t now = xTaskGetTickCount();
-    if ((now - last_stats_tick) >= pdMS_TO_TICKS(1000)) {
-        ESP_LOGI(TAG, "USB IN cb=%" PRIu32 " samples=%u peak=%ld mute=%d vol=%" PRIu32,
-                 cb_count, (unsigned)samples, (long)peak, (int)is_muted, volume_factor);
-        last_stats_tick = now;
-    }
-    return ESP_OK;
-}
-
-static void usb_uac_device_set_mute_cb(uint32_t mute, void *arg)
-{
-    (void)arg;
-    is_muted = (mute != 0);
-    ESP_LOGI(TAG, "mute → %u", (unsigned)mute);
-}
-
-static void usb_uac_device_set_volume_cb(uint32_t _volume, void *arg)
-{
-    (void)arg;
-    int db = (int)(_volume > 100 ? 100 : _volume) / 2 - 50;
-    if (db >= 0) {
-        volume_factor = 100;
-    } else {
-        float lin = powf(10.0f, (float)db / 20.0f);
-        uint32_t f = (uint32_t)(lin * 100.0f);
-        if (!is_muted && f < 8U) f = 8U;
-        volume_factor = f;
-    }
-    ESP_LOGI(TAG, "volume raw=%u db=%d factor=%" PRIu32, (unsigned)_volume, db, volume_factor);
-}
-
-static void usb_uac_device_init(void)
-{
-    uac_device_config_t cfg = {
-        .output_cb    = usb_uac_device_output_cb,
-        .input_cb     = usb_uac_device_input_cb,
-        .set_mute_cb  = usb_uac_device_set_mute_cb,
-        .set_volume_cb = usb_uac_device_set_volume_cb,
-        .cb_ctx       = NULL,
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(48000),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_BCLK_GPIO,
+            .ws   = I2S_LRCLK_GPIO,
+            .dout = I2S_DOUT_GPIO,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
     };
-    ESP_ERROR_CHECK(uac_device_init(&cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_tx, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_tx));
+    ESP_LOGI(TAG, "I2S ready — BCLK=%d LRCLK=%d DOUT=%d", I2S_BCLK_GPIO, I2S_LRCLK_GPIO, I2S_DOUT_GPIO);
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+static void audio_task(void *arg)
+{
+    (void)arg;
+    static int16_t mono[AUDIO_BLOCK_SAMPLES];
+    static int32_t out32[AUDIO_BLOCK_SAMPLES * 2];
+    int32_t peak = 0;
+    uint32_t block_count = 0;
+    TickType_t last_stats_tick = xTaskGetTickCount();
+
+    for (;;) {
+        amy_engine_render_wav_mono_16(mono, AUDIO_BLOCK_SAMPLES);
+
+        for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+            int32_t s = (int32_t)mono[i] * OUTPUT_GAIN_BOOST;
+            if (s >  32767) s =  32767;
+            if (s < -32768) s = -32768;
+            int32_t a = s < 0 ? -s : s;
+            if (a > peak) peak = a;
+            int32_t s32 = s << 16;
+            out32[i * 2]     = s32; // L
+            out32[i * 2 + 1] = s32; // R
+        }
+
+        size_t written = 0;
+        i2s_channel_write(s_i2s_tx, out32, sizeof(out32), &written, portMAX_DELAY);
+
+        block_count++;
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_stats_tick) >= pdMS_TO_TICKS(3000)) {
+            ESP_LOGI(TAG, "blocks=%" PRIu32 " peak=%ld written=%u", block_count, (long)peak, (unsigned)written);
+            peak = 0;
+            last_stats_tick = now;
+        }
+    }
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("AMY_ENGINE", ESP_LOG_INFO);
 
-    ESP_LOGI(TAG, "Synthewi starting — build %s %s", __DATE__, __TIME__);
-#if TEST_WAV_PLAYBACK
-    ESP_LOGW(TAG, "TEST MODE: streaming embedded WAV (synth disabled)");
-#endif
-
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
-    } else {
-        ESP_ERROR_CHECK(err);
-    }
-
-    err = wifi_manager_start();
-    if (err != ESP_OK)
-        ESP_LOGW(TAG, "WiFi init failed (0x%x) — continuing without network", err);
-
-    // Register callbacks before starting telemetry so no edge is missed
-    touch_telemetry_set_event_cb(on_touch_event);
-    touch_telemetry_set_param_cb(on_synth_param);
-    touch_telemetry_set_pressure_cb(on_pressure);
-
-    err = touch_telemetry_start();
-    if (err != ESP_OK)
-        ESP_LOGW(TAG, "touch telemetry init failed (0x%x)", err);
+    ESP_LOGI(TAG, "WAV I2S test — build %s %s", __DATE__, __TIME__);
 
     amy_engine_init();
-    usb_uac_device_init();
+    i2s_audio_init();
 
-    ESP_LOGI(TAG, "running");
+    xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 10, NULL, 0);
 
-    uint32_t  last_cb_count  = 0;
-    TickType_t last_cb_tick  = xTaskGetTickCount();
-    TickType_t last_warn_tick = xTaskGetTickCount();
-
-    while (1) {
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_cb_tick) >= pdMS_TO_TICKS(1000)) {
-            uint32_t cur = s_usb_in_cb_count;
-            if (cur == last_cb_count) {
-                if ((now - last_warn_tick) >= pdMS_TO_TICKS(5000)) {
-                    ESP_LOGW(TAG, "USB mic stream inactive — open Synthewi USB Audio on host");
-                    last_warn_tick = now;
-                }
-            } else {
-                last_warn_tick = now;
-            }
-            last_cb_count = cur;
-            last_cb_tick  = now;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    ESP_LOGI(TAG, "playing WAV loop through I2S");
+    vTaskDelay(portMAX_DELAY);
 }
