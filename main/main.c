@@ -50,7 +50,7 @@ static void IRAM_ATTR enc_sw_isr(void *arg)
 {
     static int64_t last = 0;
     int64_t now = esp_timer_get_time();
-    if (now - last < 50000) return; // 50 ms debounce
+    if (now - last < 200000) return; // 200 ms debounce — blocks release-bounce double-fire
     last = now;
     s_btn_press_us = now;
     s_btn_flag = 1;
