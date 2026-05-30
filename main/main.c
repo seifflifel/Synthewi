@@ -11,17 +11,39 @@
 static const char *TAG = "Synthewi";
 
 // C pentatonic: C4 D4 E4 G4 A4 C5 D5 E5
-static const uint8_t s_notes[8] = {60, 62, 64, 67, 69, 72, 74, 76};
+static const uint8_t s_base_notes[8] = {60, 62, 64, 67, 69, 72, 74, 76};
+static uint8_t       s_notes[8]      = {60, 62, 64, 67, 69, 72, 74, 76};
+
+static void apply_octave(void)
+{
+    for (int i = 0; i < 8; i++) {
+        int n = (int)s_base_notes[i] + s_octave_shift * 12;
+        s_notes[i] = (uint8_t)(n < 0 ? 0 : n > 127 ? 127 : n);
+    }
+}
 
 static void on_touch(uint8_t pad, bool on)
 {
-    if (pad >= 8) return;
-    if (on) {
-        ESP_LOGI(TAG, "pad %u ON  note %u", pad + 1, s_notes[pad]);
-        amy_engine_note_on(pad, s_notes[pad]);
-    } else {
-        ESP_LOGI(TAG, "pad %u OFF", pad + 1);
-        amy_engine_note_off(pad);
+    if (pad < 8) {
+        if (on) {
+            ESP_LOGI(TAG, "pad %u ON  note %u", pad + 1, s_notes[pad]);
+            amy_engine_note_on(pad, s_notes[pad]);
+        } else {
+            ESP_LOGI(TAG, "pad %u OFF", pad + 1);
+            amy_engine_note_off(pad);
+        }
+    } else if (on) {
+        static int64_t oct_last_us = 0;
+        int64_t now = esp_timer_get_time();
+        if (now - oct_last_us < 500000) return; // 500ms cooldown — prevents accidental double-trigger
+        oct_last_us = now;
+        int shift = s_octave_shift + (pad == 9 ? 1 : -1);
+        if (shift >= -2 && shift <= 2) {
+            s_octave_shift = shift;
+            apply_octave();
+            ui_set_octave(s_octave_shift);
+            ESP_LOGI(TAG, "octave %+d", s_octave_shift);
+        }
     }
 }
 
@@ -29,6 +51,13 @@ static void on_touch(uint8_t pad, bool on)
 #define ENC_CLK  GPIO_NUM_15
 #define ENC_DT   GPIO_NUM_16
 #define ENC_SW   GPIO_NUM_17
+
+// ── Waveform lever (3-position) ──────────────────────────────
+#define WAVE_GPIO0  GPIO_NUM_41   // LEFT=LOW,  CENTER/RIGHT=HIGH
+#define WAVE_GPIO1  GPIO_NUM_42   // RIGHT=LOW, CENTER/LEFT=HIGH
+// Position 1 (left):   b0=LOW,  b1=HIGH → SQUARE
+// Position 2 (center): b0=HIGH, b1=HIGH → SAW
+// Position 3 (right):  b0=HIGH, b1=LOW  → TRIANGLE
 
 static volatile int32_t s_enc_steps    = 0;
 static volatile int     s_btn_flag     = 0;
@@ -91,41 +120,74 @@ void app_main(void)
     gpio_isr_handler_add(ENC_DT,  enc_ab_isr, NULL);
     gpio_isr_handler_add(ENC_SW,  enc_sw_isr, NULL);
 
+    gpio_config_t lever_cfg = {
+        .pin_bit_mask = (1ULL<<WAVE_GPIO0)|(1ULL<<WAVE_GPIO1),
+        .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&lever_cfg);
+
     ui_init();
     ESP_LOGI(TAG, "running");
 
-    int32_t last_steps   = 0;
-    bool    btn_pending  = false;
-    bool    long_fired   = false;
-    int64_t btn_start_us = 0;
+    int32_t last_steps        = 0;
+    bool    btn_pending       = false;
+    bool    long_fired        = false;
+    int64_t btn_start_us      = 0;
+    int64_t btn_dispatch_us   = 0; // time of last dispatched press (short or long)
+    uint8_t lever_wave        = 0xFF; // sentinel: force apply on first tick
 
     for (;;) {
         amy_engine_park_idle_oscs();
 
-        // Encoder rotation
+        // Lever waveform selector
+        {
+            uint8_t b0 = (uint8_t)gpio_get_level(WAVE_GPIO0);
+            uint8_t b1 = (uint8_t)gpio_get_level(WAVE_GPIO1);
+            uint8_t wid = (!b0 &&  b1) ? AMY_ENGINE_WAVE_SQUARE   :
+                          ( b0 && !b1) ? AMY_ENGINE_WAVE_TRIANGLE  :
+                                         AMY_ENGINE_WAVE_SAW_DOWN;
+            if (wid != lever_wave) {
+                lever_wave = wid;
+                amy_engine_set_wave(wid);
+                ui_notify_lever();
+            }
+        }
+
+        // Gather encoder delta
         int32_t steps = s_enc_steps;
         int delta = (int)(steps - last_steps);
-        if (delta) { last_steps = steps; ui_tick(delta, false, false); }
+        if (delta) last_steps = steps;
 
-        // Non-blocking long/short press detection
+        // Gather button events as flags (one ui_tick call at end of loop)
+        bool short_press = false, long_press = false;
         if (s_btn_flag && !btn_pending) {
-            s_btn_flag   = 0;
-            btn_pending  = true;
-            long_fired   = false;
-            btn_start_us = s_btn_press_us;
+            s_btn_flag = 0;
+            if (esp_timer_get_time() - btn_dispatch_us >= 400000) {
+                btn_pending  = true;
+                long_fired   = false;
+                btn_start_us = s_btn_press_us;
+            }
         }
         if (btn_pending) {
             int64_t held = esp_timer_get_time() - btn_start_us;
             if (!long_fired && held >= 800000) {
-                long_fired = true;
-                ui_tick(0, false, true);  // long press fires at 800ms, no release needed
+                long_fired      = true;
+                btn_dispatch_us = esp_timer_get_time();
+                long_press      = true;
             }
-            if (gpio_get_level(ENC_SW) == 1) {  // button released
+            if (gpio_get_level(ENC_SW) == 1) {
                 btn_pending = false;
-                if (!long_fired) ui_tick(0, true, false); // short press
+                if (!long_fired) {
+                    btn_dispatch_us = esp_timer_get_time();
+                    short_press     = true;
+                }
                 long_fired = false;
             }
         }
+
+        // Single ui_tick per loop — always called so dirty flag and timed refresh work
+        ui_tick(delta, short_press, long_press);
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }

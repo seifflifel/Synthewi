@@ -13,8 +13,9 @@ with a rotary-encoder + TFT UI for real-time sound shaping.
 | Feature | Detail |
 |---------|--------|
 | **8-pad polyphonic touch** | C4 D4 E4 G4 A4 C5 D5 E5 (C pentatonic), pressure-sensitive |
+| **Octave shift** | Two touch pads (GPIO 9/10) shift all notes ±1 octave, range −2 to +2, 500ms debounce |
 | **AMY synth engine** | CUSTOM mode (one osc per pad) or JUNO/DX7 PATCH mode |
-| **Waveforms** | Square, Saw, Triangle (all 8 oscs simultaneously) |
+| **Waveforms** | Square, Saw, Triangle — selected by 3-position physical lever (GPIO 41/42), no menu needed |
 | **Filter** | LPF / BPF / HPF — Spark Juno exponential formula, capped at 12 kHz |
 | **Filter envelope** | EG1 sweeps filter cutoff from attack peak to decay floor |
 | **ADSR amplitude** | Attack 2–2000 ms · Decay 5–1000 ms · Sustain 0–100 % · Release 10–5000 ms |
@@ -30,17 +31,17 @@ with a rotary-encoder + TFT UI for real-time sound shaping.
 
 ```
 ┌────────┬────────┐
-│  WAVE  │ CALIB  │   Short press → enter section
-│ SQR    │ PADS   │   Long press  → back to menu
+│  WAVE  │ CALIB  │   Top-left: live status (non-interactive)
+│ ~~~    │ PADS   │   Others: short press → enter, long press → back
 ├────────┼────────┤
 │   FX   │  ADSR  │
 │ LPF    │ EDIT   │
 └────────┴────────┘
 ```
 
-**WAVE** — cycle Square / Saw / Triangle. Short press selects and saves.
+**WAVE cell (top-left, non-interactive)** — live status: pixel-art waveform glyph (SAW/SQR/TRI), wave name, and octave offset (`OCT:+1`). Updates immediately when lever or octave pads change.
 
-**CALIB** — per-pad touch threshold (rotate to choose pad, short press to edit, rotate to adjust).
+**CALIB** — touch threshold editor for all 10 touch inputs: pads 1–8 (notes) + OCT- and OCT+ (octave buttons). Rotate to choose, short press to edit, rotate to adjust.
 
 **FX** — 8 scrollable items:
 
@@ -76,6 +77,10 @@ with a rotary-encoder + TFT UI for real-time sound shaping.
 | Encoder CLK | 15 |
 | Encoder DT | 16 |
 | Encoder SW | 17 |
+| Waveform lever A (SQUARE side) | 41 |
+| Waveform lever B (TRIANGLE side) | 42 |
+| Octave down (touch) | 9 |
+| Octave up (touch) | 10 |
 
 ### Board
 
@@ -106,23 +111,19 @@ so real-time parameter changes are glitch-free.
 
 ## Next steps
 
-### Finalize effects stack
-- Tune echo delay time (expose delay ms as a UI parameter)
-- Evaluate LFO targets beyond filter cutoff (amplitude, pitch)
-- Add filter envelope depth control to FX section
+### UI redesign (Phase 2–3 per HARDWARE_UI_PLAN.md)
+- Ribbon bar (top 20px): 8 pad circles + waveform glyph + octave label
+- 3-card horizontal layout: MAIN / PRESETS / CALIB
+- MAIN card: Spark-style parameter columns (ENV, FLT, LFO, ECH, GLIDE)
+- PRESETS card: 6 NVS-backed slots (3×2 grid, load/save)
+- CALIB card: 8 pad columns + 2 oct columns, 50ms refresh
 
-### Physical waveform selector (3-position)
-- Wire a 3-position hardware switch to 2 GPIOs (or 3 individual GPIOs)
-- Read in `app_main` at startup or poll in main loop
-- Override `s_wave_id` directly, removing the need for the WAVE UI section
+### Looper (after UI)
+- ~1.74 MB PSRAM free after echo (~9.9 s mono at 44100 Hz)
+- Event-based record/playback via FreeRTOS timer task on Core 1
+- States: IDLE → ARM → RECORD → PLAY → OVERDUB → STOP
 
-### Looper
-- ~1.74 MB PSRAM free after echo (~9 seconds mono at 44100 Hz)
-- Record touch input into a circular buffer in PSRAM
-- Play back via AMY note_on/note_off events replayed on a timer
-- UI: dedicated button or long-press shortcut to arm/record/play/overdub/stop
-
-### Octave shift
-- Two hardware buttons (up / down) on free GPIOs
-- Shift all 8 MIDI note values by ±12 at runtime
-- Display current octave offset on TFT menu status row
+### MUX + potentiometers (after hardware purchase)
+- CD4051 8:1 mux → 6 hardware pots for attack, release, cutoff, resonance, glide, echo
+- Deadband filter (±50 counts) to suppress ADC noise
+- Encoder still works; pot touch overrides encoder value

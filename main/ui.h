@@ -69,6 +69,20 @@ static void tft_fill(uint8_t x0,uint8_t y0,uint8_t x1,uint8_t y1, uint16_t c)
     for (int r = y0; r <= y1; r++) tft_pixels(w);
 }
 
+static void tft_line(int x0, int y0, int x1, int y1, uint16_t c)
+{
+    int dx = abs(x1-x0), dy = abs(y1-y0);
+    int sx = (x0<x1) ? 1 : -1, sy = (y0<y1) ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        tft_fill((uint8_t)x0, (uint8_t)y0, (uint8_t)x0, (uint8_t)y0, c);
+        if (x0==x1 && y0==y1) break;
+        int e2 = 2*err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
 static void tft_init(void)
 {
     gpio_set_level(TFT_RST, 0); vTaskDelay(pdMS_TO_TICKS(10));
@@ -152,16 +166,14 @@ static void tft_text(const char *str, int x, int y, uint16_t fg, uint16_t bg, in
 }
 
 // ── UI state ─────────────────────────────────────────────────
-typedef enum { UI_MENU, UI_WAVEFORM, UI_CALIB, UI_EFFECTS, UI_ADSR } ui_section_t;
+typedef enum { UI_MENU, UI_CALIB, UI_EFFECTS, UI_ADSR } ui_section_t;
 
 static ui_section_t s_sec      = UI_MENU;
 static int          s_menu_cur = 0;
 static bool         s_dirty    = true;
 
-// Waveform section
-static int          s_wave_cur = 0;
-static const uint8_t s_wave_ids[3]      = {AMY_ENGINE_WAVE_SQUARE, AMY_ENGINE_WAVE_SAW_DOWN, AMY_ENGINE_WAVE_TRIANGLE};
-static const char * const s_wave_names[3] = {"SQUARE", "SAW", "TRIANGLE"};
+// Octave shift (set by on_touch, displayed in cell 0)
+static int s_octave_shift = 0;
 
 // Calibration section
 static int      s_cal_pad     = 0;
@@ -189,60 +201,78 @@ static uint32_t ui_r_ms(uint16_t v)  { return (uint32_t)(10.0f + (v/10000.0f)*49
 
 // ── Section draw functions ────────────────────────────────────
 
+// Draws a waveform pixel-art glyph inside box (x0,y0)-(x1,y1).
+// Reusable for both the menu cell and the future ribbon bar.
+static void ui_draw_wave_glyph(uint8_t wave_id, int x0, int y0, int x1, int y1, uint16_t fg)
+{
+    int xm = (x0 + x1) / 2;
+    int lw = (x1 - x0) / 4; // left/right flat width for square
+    switch (wave_id) {
+    case AMY_ENGINE_WAVE_SQUARE:
+        tft_line(x0,    y1, x0+lw, y1, fg); // left base
+        tft_line(x0+lw, y0, x0+lw, y1, fg); // rise
+        tft_line(x0+lw, y0, x1-lw, y0, fg); // top
+        tft_line(x1-lw, y0, x1-lw, y1, fg); // fall
+        tft_line(x1-lw, y1, x1,    y1, fg); // right base
+        break;
+    case AMY_ENGINE_WAVE_SAW_DOWN:
+        tft_line(x0,    y1, x1-lw, y0, fg); // rising diagonal
+        tft_line(x1-lw, y0, x1-lw, y1, fg); // instant drop
+        tft_line(x1-lw, y1, x1,    y1, fg); // right base
+        break;
+    case AMY_ENGINE_WAVE_TRIANGLE:
+        tft_line(x0, y1, xm, y0, fg); // rising half
+        tft_line(xm, y0, x1, y1, fg); // falling half
+        break;
+    default:
+        tft_line(x0, (y0+y1)/2, x1, (y0+y1)/2, fg);
+        break;
+    }
+}
+
 // ---- MENU (2×2 grid) ----------------------------------------
-// Grid: two 64×80 cells. Top-left=0 WAVE, top-right=1 CALIB,
-//                         bottom-left=2 FX, bottom-right=3 ADSR
+// Cell 0 (top-left): WAVE status — lever-controlled, non-selectable.
+// Cells 1-3 (top-right, bottom-left, bottom-right): CALIB, FX, ADSR.
+// s_menu_cur 0-2 maps to cells 1-3.
 static void ui_draw_menu(void)
 {
     tft_fill(0, 0, TFT_W-1, TFT_H-1, C_BLACK);
-    // Dividers
-    tft_fill(63, 0, 64, TFT_H-1, C_DKGRAY);   // vertical
-    tft_fill(0, 79, TFT_W-1, 80, C_DKGRAY);   // horizontal
+    tft_fill(63, 0, 64, TFT_H-1, C_DKGRAY);
+    tft_fill(0, 79, TFT_W-1, 80, C_DKGRAY);
 
     amy_engine_state_t st;
     amy_engine_get_state(&st);
     const char *wave_short =
         (st.wave_id == AMY_ENGINE_WAVE_SAW_DOWN) ? "SAW" :
         (st.wave_id == AMY_ENGINE_WAVE_TRIANGLE)  ? "TRI" : "SQR";
-
     const char *fx_flt =
         (st.filter_type == AMY_ENGINE_FILTER_BPF) ? "BPF" :
         (st.filter_type == AMY_ENGINE_FILTER_HPF) ? "HPF" : "LPF";
-    const char *names[4]    = {"WAVE",  "CALIB", "FX",    "ADSR"};
-    const char *statuses[4] = {wave_short, "PADS", fx_flt, "EDIT"};
 
-    for (int i = 0; i < 4; i++) {
-        int cx = (i % 2) * 64;
-        int cy = (i / 2) * 80;
+    // Cell 0: wave status + octave (non-selectable, always dark header)
+    tft_fill(0, 0, 62, 17, C_DKGRAY);
+    tft_text("WAVE", 2, 2, C_WHITE, C_DKGRAY, 2);
+    ui_draw_wave_glyph(st.wave_id, 6, 28, 56, 46, C_GREEN);
+    tft_text(wave_short, 22, 55, C_LTGRAY, C_BLACK, 1);
+    char oct_buf[8];
+    snprintf(oct_buf, sizeof(oct_buf),
+             s_octave_shift > 0 ? "OCT:+%d" : "OCT: %d", s_octave_shift);
+    tft_text(oct_buf, 13, 66, C_CYAN, C_BLACK, 1);
+
+    // Cells 1-3: CALIB (top-right), FX (bottom-left), ADSR (bottom-right)
+    const char *names[3]    = {"CALIB", "FX",   "ADSR"};
+    const char *statuses[3] = {"PADS",  fx_flt, "EDIT"};
+    for (int i = 0; i < 3; i++) {
+        int cell = i + 1;
+        int cx = (cell % 2) * 64;
+        int cy = (cell / 2) * 80;
         bool sel = (i == s_menu_cur);
         uint16_t hbg = sel ? C_YELLOW : C_DKGRAY;
         uint16_t hfg = sel ? C_BLACK  : C_WHITE;
-        // Header row (16px)
         tft_fill(cx, cy, cx+62, cy+17, hbg);
         tft_text(names[i], cx+2, cy+2, hfg, hbg, 2);
-        // Status (lighter, below header)
         tft_text(statuses[i], cx+2, cy+22, C_LTGRAY, C_BLACK, 2);
     }
-}
-
-// ---- WAVEFORM -----------------------------------------------
-static void ui_draw_waveform(void)
-{
-    tft_fill(0, 0, TFT_W-1, TFT_H-1, C_BLACK);
-    tft_text("WAVEFORM", 2, 4, C_YELLOW, C_BLACK, 2);
-    tft_fill(0, 22, TFT_W-1, 23, C_DKGRAY);
-
-    for (int i = 0; i < 3; i++) {
-        bool sel = (i == s_wave_cur);
-        uint16_t fg = sel ? C_CYAN : C_LTGRAY;
-        uint16_t bg = sel ? C_DKGRAY : C_BLACK;
-        if (sel) tft_fill(0, 34 + i*24, TFT_W-1, 34 + i*24 + 19, C_DKGRAY);
-        tft_text(s_wave_names[i], 8, 36 + i*24, fg, bg, 2);
-    }
-
-    tft_fill(0, 110, TFT_W-1, 111, C_DKGRAY);
-    tft_text("BTN:SELECT", 2, 116, C_DKGRAY, C_BLACK, 2);
-    tft_text("HOLD:BACK ", 2, 136, C_DKGRAY, C_BLACK, 2);
 }
 
 // ---- CALIBRATION --------------------------------------------
@@ -251,8 +281,14 @@ static void ui_draw_calib(void)
     tft_fill(0, 0, TFT_W-1, TFT_H-1, C_BLACK);
 
     char hdr[24];
-    snprintf(hdr, sizeof(hdr), "PAD %u %s",
-             (uint8_t)(s_cal_pad + 1), s_cal_editing ? "EDIT" : "    ");
+    if (s_cal_pad < TOUCH_NOTE_PADS) {
+        snprintf(hdr, sizeof(hdr), "PAD %u %s",
+                 (uint8_t)(s_cal_pad + 1), s_cal_editing ? "EDIT" : "    ");
+    } else {
+        snprintf(hdr, sizeof(hdr), "%s %s",
+                 s_cal_pad == TOUCH_NOTE_PADS ? "OCT-" : "OCT+",
+                 s_cal_editing ? "EDIT" : "    ");
+    }
     tft_text(hdr, 2, 4, s_cal_editing ? C_CYAN : C_YELLOW, C_BLACK, 2);
     tft_fill(0, 22, TFT_W-1, 23, C_DKGRAY);
 
@@ -419,11 +455,10 @@ static void ui_draw_adsr(void)
 static void ui_redraw(void)
 {
     switch (s_sec) {
-        case UI_MENU:     ui_draw_menu();     break;
-        case UI_WAVEFORM: ui_draw_waveform(); break;
-        case UI_CALIB:    ui_draw_calib();    break;
-        case UI_EFFECTS:  ui_draw_effects();  break;
-        case UI_ADSR:     ui_draw_adsr();     break;
+        case UI_MENU:    ui_draw_menu();    break;
+        case UI_CALIB:   ui_draw_calib();   break;
+        case UI_EFFECTS: ui_draw_effects(); break;
+        case UI_ADSR:    ui_draw_adsr();    break;
     }
 }
 
@@ -433,13 +468,6 @@ static void ui_enter(ui_section_t sec)
     s_sec = sec;
     s_dirty = true;
 
-    if (sec == UI_WAVEFORM) {
-        amy_engine_state_t st;
-        amy_engine_get_state(&st);
-        s_wave_cur = 0;
-        for (int i = 0; i < 3; i++)
-            if (s_wave_ids[i] == st.wave_id) { s_wave_cur = i; break; }
-    }
     if (sec == UI_ADSR) {
         amy_engine_state_t st;
         amy_engine_get_state(&st);
@@ -484,6 +512,12 @@ static void ui_exit_to_menu(void)
 
 // ── Public API ────────────────────────────────────────────────
 
+// Call from main loop when lever changes — triggers immediate menu redraw.
+void ui_notify_lever(void) { s_dirty = true; }
+
+// Call from on_touch when octave shifts — updates display immediately.
+void ui_set_octave(int shift) { s_octave_shift = shift; s_dirty = true; }
+
 void ui_init(void)
 {
     spi_bus_config_t bus = {
@@ -516,38 +550,22 @@ void ui_tick(int delta, bool short_press, bool long_press)
 
     case UI_MENU:
         if (delta) {
-            s_menu_cur = (s_menu_cur + delta % 4 + 4) % 4;
+            s_menu_cur = (s_menu_cur + delta % 3 + 3) % 3;
             s_dirty = true;
         }
         if (short_press) {
             switch (s_menu_cur) {
-                case 0: ui_enter(UI_WAVEFORM); break;
-                case 1: ui_enter(UI_CALIB);    break;
-                case 2: ui_enter(UI_EFFECTS);  break;
-                case 3: ui_enter(UI_ADSR);     break;
+                case 0: ui_enter(UI_CALIB);   break;
+                case 1: ui_enter(UI_EFFECTS); break;
+                case 2: ui_enter(UI_ADSR);    break;
             }
         }
-        break;
-
-    case UI_WAVEFORM:
-        if (delta) {
-            s_wave_cur += delta;
-            if (s_wave_cur < 0) s_wave_cur = 0;
-            if (s_wave_cur > 2) s_wave_cur = 2;
-            s_dirty = true;
-        }
-        if (short_press) {
-            amy_engine_set_wave(s_wave_ids[s_wave_cur]);
-            amy_engine_save_state();
-            ui_exit_to_menu();
-        }
-        if (long_press) ui_exit_to_menu();
         break;
 
     case UI_CALIB:
         if (!s_cal_editing) {
             if (delta) {
-                s_cal_pad = (s_cal_pad + delta % 8 + 8) % 8;
+                s_cal_pad = (s_cal_pad + delta % TOUCH_TOTAL_PADS + TOUCH_TOTAL_PADS) % TOUCH_TOTAL_PADS;
                 s_dirty = true;
             }
             if (short_press) {

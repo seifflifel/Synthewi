@@ -30,6 +30,9 @@ typedef void (*touch_pressure_cb_t)(uint8_t pad, float pressure_norm);
 #define SYNTH_PARAM_PATCH          19
 #define SYNTH_PARAM_OCTAVE         20
 
+#define TOUCH_NOTE_PADS  8   // pads 0-7: musical note triggers
+#define TOUCH_TOTAL_PADS 10  // pads 8=oct-, 9=oct+
+
 esp_err_t touch_telemetry_start(void);
 void      touch_telemetry_set_event_cb(touch_event_cb_t cb);
 void      touch_telemetry_set_param_cb(touch_param_cb_t cb);
