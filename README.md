@@ -1,84 +1,106 @@
-# Synthewi — Hardware Prototyping Branch
+# Synthewi — Touch Synthesizer (ESP32-S3)
 
-This branch documents the step-by-step hardware bring-up of the final Synthewi instrument.
-Each milestone is tagged so it can be flashed independently as a reference.
-
-For the full working software prototype (USB audio + WiFi web UI), see branch
-`checkpoint/usb-audio` or flash tag `firmware/wifi-usb`.
+Polyphonic touch synthesizer running on ESP32-S3 N8R2 (8 MB Flash + 2 MB Quad PSRAM).
+8 capacitive touch pads play a C pentatonic scale through a software synth engine (AMY),
+with a rotary-encoder + TFT UI for real-time sound shaping.
 
 ---
 
-## Hardware Tags (flash reference points)
+## Current state
 
-| Tag | What it tests | How to flash |
-|-----|--------------|--------------|
-| `hardware/speaker-wav-test` | I²S + MAX98357A + speaker — plays embedded WAV loop | `git checkout hardware/speaker-wav-test && idf.py flash` |
-| `hardware/amy-i2s-notes` | AMY synthesizer → I²S — plays SINE notes C4 E4 G4 C5 in a loop | `git checkout hardware/amy-i2s-notes && idf.py flash` |
+### What works
 
----
+| Feature | Detail |
+|---------|--------|
+| **8-pad polyphonic touch** | C4 D4 E4 G4 A4 C5 D5 E5 (C pentatonic), pressure-sensitive |
+| **AMY synth engine** | CUSTOM mode (one osc per pad) or JUNO/DX7 PATCH mode |
+| **Waveforms** | Square, Saw, Triangle (all 8 oscs simultaneously) |
+| **Filter** | LPF / BPF / HPF with auto-tuned default cutoff per type |
+| **Filter envelope** | EG1 sweeps filter cutoff from attack peak to decay floor |
+| **ADSR amplitude** | Attack 2–2000 ms · Decay 5–1000 ms · Sustain 0–100 % · Release 10–5000 ms |
+| **Reverb** | Stereo hall reverb, level + liveness — delay lines in PSRAM |
+| **Echo** | Stereo echo at 250 ms, level + feedback — delay buffer in PSRAM |
+| **Glide (portamento)** | 0–500 ms, cross-pad: idle oscs pre-parked at last played freq |
+| **LFO** | Rate 0.1–10 Hz, depth 0–5000 Hz — modulates filter cutoff |
+| **TFT display** | ST7735 128×160, scale-2 font, 4-section grid menu |
+| **Rotary encoder** | Navigation, value adjust; short press = select/confirm, long = back |
+| **NVS persistence** | All params saved to flash on section exit |
+| **PSRAM** | 2 MB Quad PSRAM at 80 MHz — reverb + echo delay lines (~364 KB used) |
 
-## Current milestone — AMY synthesizer over I²S
+### UI sections
 
-### What this firmware does
-
-Runs the AMY polyphonic synthesizer engine on ESP32-S3 and outputs audio through
-the MAX98357A Class D amplifier via I²S. `main.c` loops through four SINE wave notes
-(C4 → E4 → G4 → C5) at 500 ms each, confirming the full audio path: CPU → AMY → I²S → speaker.
-
-### Key findings (this milestone)
-
-- AMY's `freq_coefs[COEF_CONST]` (Hz) must be used for direct-osc frequency on direct-osc
-  events (`e.osc = n`). The `e.midi_note` field targets the voice-allocator path (`e.synth`)
-  and is silent on a bare osc — this was the root cause of no audio.
-- Pan defaults to 0 (left channel only) in AMY. Always set `pan_coefs[COEF_CONST] = 0.5f`
-  for center output when using mono speakers.
-- Reverb and echo delay lines exhaust SRAM after WiFi init fragments the heap — both disabled.
-- `features.default_synths = 0` is required; default synths would claim oscs 0–N and
-  conflict with direct-osc events on those indices.
-
-### How a note event works (bleep pattern)
-
-```c
-amy_event e = amy_default_event();
-e.osc                    = pad;           // osc index 0-7, one per touch pad
-e.wave                   = SINE;
-e.freq_coefs[COEF_CONST] = 440.0f * powf(2.0f, (note - 69.0f) / 12.0f);
-e.pan_coefs[COEF_CONST]  = 0.5f;         // center; default is left-only
-e.velocity               = 1.0f;         // triggers note_on
-amy_add_event(&e);
+```
+┌────────┬────────┐
+│  WAVE  │ CALIB  │   Short press → enter section
+│ SQR    │ PADS   │   Long press  → back to menu
+├────────┼────────┤
+│   FX   │  ADSR  │
+│ LPF    │ EDIT   │
+└────────┴────────┘
 ```
 
-### Wiring
+**WAVE** — cycle Square / Saw / Triangle. Short press selects and saves.
 
-| ESP32-S3 GPIO | MAX98357A pin | Notes |
-|---------------|--------------|-------|
-| GPIO38 | BCLK | I²S bit clock |
-| GPIO39 | LRC | I²S left/right clock (word select) |
-| GPIO40 | DIN | I²S data |
-| 5V header pin | VIN | Power |
-| GND | GND | Ground |
-| — | SD | Leave floating (board pull-up enables amp) |
-| — | GAIN | Leave floating = 9 dB gain |
-| OUT+ | Speaker + | Direct wire, no resistors |
-| OUT– | Speaker – | Direct wire, no resistors |
+**CALIB** — per-pad touch threshold (rotate to choose pad, short press to edit, rotate to adjust).
 
----
+**FX** — 10 scrollable items:
 
-## Next milestones (planned)
+| Item | Description | Range |
+|------|-------------|-------|
+| FLT | Filter type | LPF / BPF / HPF (auto-sets cutoff default) |
+| CUT | Cutoff frequency | 200–10 000 Hz |
+| RES | Resonance | 0–90 % |
+| RVB | Reverb level | 0–100 % |
+| RDC | Reverb decay (liveness) | 0–100 % |
+| ECH | Echo level | 0–100 % |
+| EFB | Echo feedback | 0–90 % |
+| GLD | Glide (portamento) | 0–500 ms |
+| LFR | LFO rate | 0.1–10.0 Hz |
+| LFD | LFO depth | 0–5000 Hz |
 
-- [ ] Touch pads → live note_on / note_off (MPR121 or direct capacitive)
-- [ ] Rotary encoder → parameter control
-- [ ] OLED (SSD1306, I²C) — display synthesis state
-- [ ] Full ADSR envelope + filter layered back onto confirmed audio path
-- [ ] UI architecture
+**ADSR** — Attack · Decay · Sustain · Release. Applied live on each encoder tick.
 
 ---
 
-## Build and flash
+## Hardware
+
+### Pinout
+
+| Function | GPIO |
+|----------|------|
+| I²S BCLK (→ MAX98357A) | 38 |
+| I²S LRC | 39 |
+| I²S DOUT | 40 |
+| TFT SCLK (SPI2) | 36 |
+| TFT MOSI | 35 |
+| TFT CS | 37 |
+| TFT DC | 45 |
+| TFT RST | 21 |
+| Encoder CLK | 15 |
+| Encoder DT | 16 |
+| Encoder SW | 17 |
+
+### Board
+
+ESP32-S3-DevKitC-1 N8R2 — 8 MB Flash, 2 MB Quad PSRAM, 240 MHz dual-core.
+
+---
+
+## Build & flash
 
 ```powershell
 idf.py build
 idf.py -p COM5 flash monitor
 ```
 
-No bridge or web UI needed — this branch is standalone firmware only.
+Target: `esp32s3`. PSRAM (Quad, 80 MHz) is enabled in `sdkconfig`.
+
+---
+
+## Architecture
+
+- **Core 0** — AMY render task (audio DMA loop, never blocked)
+- **Core 1** — `app_main`: encoder polling (20 ms), touch telemetry task, UI tick
+
+NVS writes happen only on explicit section exit (long press back), not on every encoder tick,
+so real-time parameter changes are glitch-free.

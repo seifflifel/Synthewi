@@ -179,7 +179,7 @@ esp_err_t touch_telemetry_start(void)
         }
     }
 
-    if (xTaskCreate(touch_telemetry_task, "touch_telem", 6144, NULL, 5, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(touch_telemetry_task, "touch_telem", 6144, NULL, 5, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "failed to create telemetry task");
         return ESP_ERR_NO_MEM;
     }

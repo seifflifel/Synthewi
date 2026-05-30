@@ -40,8 +40,10 @@ typedef struct {
     uint16_t echo_feedback;     // 0-10000 → feedback 0.0-0.9
     uint16_t filter_cutoff;     // 0-10000 → 200-10000 Hz
     uint16_t filter_resonance;  // 0-10000 → Q 0.0-0.9
-    uint16_t env_attack;        // 0-10000 → 5-2000 ms
-    uint16_t env_release;       // 0-10000 → 50-5000 ms
+    uint16_t env_attack;        // 0-10000 → 2-2000 ms
+    uint16_t env_decay;         // 0-10000 → 5-1000 ms
+    uint16_t env_sustain;       // 0-10000 → 0-100 %
+    uint16_t env_release;       // 0-10000 → 10-5000 ms
     uint16_t filter_env_depth;  // 0-10000 → 0-8000 Hz above cutoff
     uint16_t filter_env_decay;  // 0-10000 → 5-2000 ms
     uint16_t lfo_rate;          // 0-10000 → 0.1-10 Hz
@@ -66,7 +68,8 @@ void amy_engine_set_echo(uint16_t amount, uint16_t feedback);
 void amy_engine_set_filter(uint16_t cutoff, uint16_t resonance);
 void amy_engine_set_filter_type(uint8_t type);                        // 0=LPF 1=BPF 2=HPF
 void amy_engine_set_filter_env(uint16_t depth, uint16_t decay);       // EG1 → filter
-void amy_engine_set_envelope(uint16_t attack, uint16_t release);
+void amy_engine_set_envelope(uint16_t attack, uint16_t release); // legacy
+void amy_engine_set_adsr(uint16_t attack, uint16_t decay, uint16_t sustain, uint16_t release);
 void amy_engine_set_lfo(uint16_t rate, uint16_t depth);               // sine LFO → filter
 void amy_engine_set_chorus(uint16_t amount);
 void amy_engine_set_pressure_depth(uint16_t depth); // 0-10000 → Hz range added at max press
@@ -79,5 +82,11 @@ void amy_engine_update_pressure(uint8_t pad, float pressure_norm);
 
 // Returns current state for telemetry broadcast.
 void amy_engine_get_state(amy_engine_state_t *out);
+
+// Persist current state to NVS (call on section exit / confirm, NOT on every encoder tick).
+void amy_engine_save_state(void);
+
+// Call every main loop tick: parks idle oscs at last played freq for cross-pad portamento.
+void amy_engine_park_idle_oscs(void);
 
 #endif // AMY_ENGINE_H

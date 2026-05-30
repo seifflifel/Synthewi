@@ -19,11 +19,11 @@ static const char *TAG = "AMY_ENGINE";
 // ---------------------------------------------------------------------------
 static uint8_t  s_wave_id            = AMY_ENGINE_WAVE_SQUARE;
 static uint8_t  s_filter_type        = AMY_ENGINE_FILTER_LPF;
-// reverb and echo removed — delay lines need large contiguous heap blocks that are
-// unavailable after WiFi init fragments SRAM on ESP32-S3.
 static uint16_t s_filter_cutoff      = 10000; // fully open by default
 static uint16_t s_filter_resonance   = 0;
-static uint16_t s_env_attack         = 50;    // ~15 ms
+static uint16_t s_env_attack         = 50;    // ~12 ms
+static uint16_t s_env_decay          = 2000;  // ~204 ms
+static uint16_t s_env_sustain        = 7000;  // 70 %
 static uint16_t s_env_release        = 5000;  // ~2.5 s
 static uint16_t s_filter_env_depth   = 0;
 static uint16_t s_filter_env_decay   = 1000;  // ~205 ms
@@ -32,9 +32,14 @@ static uint16_t s_lfo_depth          = 0;
 static uint16_t s_chorus_amount      = 0;
 static uint16_t s_pressure_depth     = 0; // 0 = feature off
 static uint16_t    s_portamento         = 0; // 0 = instant (no glide)
+static uint16_t s_reverb_amount      = 0;    // 0 = off
+static uint16_t s_reverb_decay       = 5000; // mid liveness (~0.72)
+static uint16_t s_echo_amount        = 0;    // 0 = off
+static uint16_t s_echo_feedback      = 3000; // ~27% feedback
 static synth_mode_t s_mode             = SYNTH_MODE_CUSTOM;
 static uint8_t      s_patch_num        = 0;  // 0-127 within current bank
 
+static float   s_last_freq_hz                   = 0.0f;  // last note freq for cross-pad portamento
 static bool    s_pad_active[SYNTH_PAD_COUNT]    = {false};
 static uint8_t s_pad_midi_note[SYNTH_PAD_COUNT] = {0}; // last midi note played per pad
 
@@ -53,8 +58,10 @@ static bool s_initialized = false;
 // ---------------------------------------------------------------------------
 static float    sc_filter_hz(uint16_t v)     { return 200.0f + (v / 10000.0f) * 9800.0f; }
 static float    sc_filter_res(uint16_t v)    { return (v / 10000.0f) * 0.9f; }
-static uint32_t sc_attack_ms(uint16_t v)     { return (uint32_t)(5.0f  + (v / 10000.0f) * 1995.0f); }
-static uint32_t sc_release_ms(uint16_t v)    { return (uint32_t)(50.0f + (v / 10000.0f) * 4950.0f); }
+static uint32_t sc_attack_ms(uint16_t v)     { return (uint32_t)(2.0f  + (v / 10000.0f) * 1998.0f); }
+static uint32_t sc_decay_ms(uint16_t v)      { return (uint32_t)(5.0f  + (v / 10000.0f) *  995.0f); }
+static float    sc_sustain_f(uint16_t v)     { return v / 10000.0f; }
+static uint32_t sc_release_ms(uint16_t v)    { return (uint32_t)(10.0f + (v / 10000.0f) * 4990.0f); }
 static float    sc_lfo_depth_hz(uint16_t v)  { return (v / 10000.0f) * 5000.0f; }
 static float    sc_fenv_depth_hz(uint16_t v) { return (v / 10000.0f) * 8000.0f; }
 static uint32_t sc_fenv_decay_ms(uint16_t v) { return (uint32_t)(5.0f  + (v / 10000.0f) * 1995.0f); }
@@ -81,14 +88,20 @@ static void nvs_save_all(void)
     nvs_set_u16(h, "flt_cut",  s_filter_cutoff);
     nvs_set_u16(h, "flt_res",  s_filter_resonance);
     nvs_set_u16(h, "env_atk",  s_env_attack);
+    nvs_set_u16(h, "env_dec",  s_env_decay);
+    nvs_set_u16(h, "env_sus",  s_env_sustain);
     nvs_set_u16(h, "env_rel",  s_env_release);
     nvs_set_u16(h, "flt_envd", s_filter_env_depth);
     nvs_set_u16(h, "flt_envc", s_filter_env_decay);
     nvs_set_u16(h, "lfo_rt",   s_lfo_rate);
     nvs_set_u16(h, "lfo_dp",   s_lfo_depth);
     nvs_set_u16(h, "chorus",   s_chorus_amount);
-    nvs_set_u16(h, "pres_dep", s_pressure_depth);
-    nvs_set_u16(h, "portamento", s_portamento);
+    nvs_set_u16(h, "pres_dep",  s_pressure_depth);
+    nvs_set_u16(h, "portamento",s_portamento);
+    nvs_set_u16(h, "rev_amt",   s_reverb_amount);
+    nvs_set_u16(h, "rev_dec",   s_reverb_decay);
+    nvs_set_u16(h, "echo_amt",  s_echo_amount);
+    nvs_set_u16(h, "echo_fb",   s_echo_feedback);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -104,15 +117,41 @@ static void nvs_load_all(void)
     if (nvs_get_u16(h, "flt_cut",  &u16) == ESP_OK) s_filter_cutoff      = u16;
     if (nvs_get_u16(h, "flt_res",  &u16) == ESP_OK) s_filter_resonance   = u16;
     if (nvs_get_u16(h, "env_atk",  &u16) == ESP_OK) s_env_attack         = u16;
+    if (nvs_get_u16(h, "env_dec",  &u16) == ESP_OK) s_env_decay          = u16;
+    if (nvs_get_u16(h, "env_sus",  &u16) == ESP_OK) s_env_sustain        = u16;
     if (nvs_get_u16(h, "env_rel",  &u16) == ESP_OK) s_env_release        = u16;
     if (nvs_get_u16(h, "flt_envd", &u16) == ESP_OK) s_filter_env_depth   = u16;
     if (nvs_get_u16(h, "flt_envc", &u16) == ESP_OK) s_filter_env_decay   = u16;
     if (nvs_get_u16(h, "lfo_rt",   &u16) == ESP_OK) s_lfo_rate           = u16;
     if (nvs_get_u16(h, "lfo_dp",   &u16) == ESP_OK) s_lfo_depth          = u16;
     if (nvs_get_u16(h, "chorus",   &u16) == ESP_OK) s_chorus_amount      = u16;
-    if (nvs_get_u16(h, "pres_dep",  &u16) == ESP_OK) s_pressure_depth    = u16;
-    if (nvs_get_u16(h, "portamento",&u16) == ESP_OK) s_portamento        = u16;
+    if (nvs_get_u16(h, "pres_dep",  &u16) == ESP_OK) s_pressure_depth  = u16;
+    if (nvs_get_u16(h, "portamento",&u16) == ESP_OK) s_portamento      = u16;
+    if (nvs_get_u16(h, "rev_amt",   &u16) == ESP_OK) s_reverb_amount   = u16;
+    if (nvs_get_u16(h, "rev_dec",   &u16) == ESP_OK) s_reverb_decay    = u16;
+    if (nvs_get_u16(h, "echo_amt",  &u16) == ESP_OK) s_echo_amount     = u16;
+    if (nvs_get_u16(h, "echo_fb",   &u16) == ESP_OK) s_echo_feedback   = u16;
     nvs_close(h);
+}
+
+// Lightweight filter update — only sends filter-related fields to all oscs.
+// Use instead of setup_custom_synth() for filter/LFO/fenv changes.
+static void apply_filter_to_all_oscs(void)
+{
+    float base_hz = sc_filter_hz(s_filter_cutoff);
+    for (uint8_t pad = 0; pad < SYNTH_PAD_COUNT; pad++) {
+        amy_event e = amy_default_event();
+        e.osc                           = pad;
+        e.filter_type                   = s_filter_type_map[s_filter_type];
+        e.filter_freq_coefs[COEF_CONST] = base_hz;
+        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
+        e.filter_freq_coefs[COEF_MOD]   = safe_lfo_depth_hz(s_lfo_depth, base_hz);
+        e.resonance                     = sc_filter_res(s_filter_resonance);
+        e.eg1_times[0] = 5;                                    e.eg1_values[0] = 1.0f;
+        e.eg1_times[1] = sc_fenv_decay_ms(s_filter_env_decay); e.eg1_values[1] = 0.0f;
+        e.eg1_times[2] = 0;                                    e.eg1_values[2] = 0.0f;
+        amy_add_event(&e);
+    }
 }
 
 // Configure pads as raw oscillators — one osc per pad (osc index = pad index).
@@ -205,9 +244,10 @@ void amy_engine_init(void)
     cfg.midi                    = AMY_MIDI_IS_NONE;
     cfg.features.startup_bleep  = 1; // boot beep confirms audio path works
     cfg.features.default_synths = 0;
-    cfg.features.reverb         = 0;
-    cfg.features.echo           = 0;
+    cfg.features.reverb         = 1; // delay lines allocated in PSRAM via ram_caps_delay
+    cfg.features.echo           = 1;
     cfg.features.chorus         = 0;
+    cfg.ram_caps_delay          = MALLOC_CAP_SPIRAM; // route all delay lines to 2MB PSRAM
     cfg.features.partials       = 0;
     cfg.features.custom         = 0;
     cfg.platform.multicore      = 1;
@@ -223,8 +263,28 @@ void amy_engine_init(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     amy_event vol_e = amy_default_event();
-    vol_e.volume = 10.0f;
+    vol_e.volume = 1.0f; // headroom for up to 8 simultaneous oscs at full amplitude
     amy_add_event(&vol_e);
+
+    // Always init reverb and echo at boot so PSRAM buffers are allocated once.
+    // Setting level=0 when amount=0 keeps them silent until enabled by the user.
+    {
+        amy_event e = amy_default_event();
+        e.reverb_level    = (s_reverb_amount / 10000.0f) * 2.0f;
+        e.reverb_liveness = 0.5f + (s_reverb_decay / 10000.0f) * 0.45f;
+        e.reverb_damping  = 0.5f;
+        e.reverb_xover_hz = 3000.0f;
+        amy_add_event(&e);
+    }
+    {
+        amy_event e = amy_default_event();
+        e.echo_level        = s_echo_amount / 10000.0f;
+        e.echo_delay_ms     = 250.0f;
+        e.echo_max_delay_ms = 500.0f;  // pre-allocates PSRAM buffer; set only at boot
+        e.echo_feedback     = (s_echo_feedback / 10000.0f) * 0.9f;
+        e.echo_filter_coef  = 0.5f;
+        amy_add_event(&e);
+    }
 
     s_initialized = true;
     ESP_LOGI(TAG, "init OK — I2S on GPIO 38/39/40, wave=%u atk=%u rel=%u",
@@ -239,15 +299,45 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
     amy_event e = amy_default_event();
 
     if (s_mode == SYNTH_MODE_CUSTOM) {
-        // Exact bleep pattern: SINE + freq_coefs + pan + velocity.
-        // Using freq_coefs instead of midi_note and no EG/filter to match
-        // the one confirmed-working path (startup bleep on osc 15).
         float freq = 440.0f * powf(2.0f, ((float)midi_note - 69.0f) / 12.0f);
+
+        // Cross-pad portamento: prime the idle osc at the last played frequency so AMY's
+        // portamento glides from there rather than from logfreq=0.
+        // The prep event sets the freq target; after one render block the osc's last_logfreq
+        // is updated, so the following note_on glides correctly.
+        if (s_portamento > 0 && s_last_freq_hz > 0.0f && !s_pad_active[pad]) {
+            amy_event prep = amy_default_event();
+            prep.osc = pad;
+            prep.freq_coefs[COEF_CONST] = s_last_freq_hz;
+            amy_add_event(&prep);
+        }
+
         e.osc                    = pad;
-        e.wave                   = SINE;
         e.freq_coefs[COEF_CONST] = freq;
         e.pan_coefs[COEF_CONST]  = 0.5f;
-        e.velocity               = 1.0f;
+        e.amp_coefs[COEF_CONST]  = 1.0f;
+        e.amp_coefs[COEF_EG0]    = 1.0f;
+        e.eg0_times[0]  = sc_attack_ms(s_env_attack);   e.eg0_values[0] = 1.0f;
+        e.eg0_times[1]  = sc_decay_ms(s_env_decay);     e.eg0_values[1] = sc_sustain_f(s_env_sustain);
+        e.eg0_times[2]  = sc_release_ms(s_env_release); e.eg0_values[2] = 0.0f;
+        if (s_wave_id == AMY_ENGINE_WAVE_SQUARE) {
+            e.wave = PULSE; e.duty_coefs[COEF_CONST] = 0.5f;
+        } else {
+            e.wave = s_wave_id;
+        }
+        // Filter applied on every note so it stays current even after wave/type changes.
+        float base_hz = sc_filter_hz(s_filter_cutoff);
+        e.filter_type                   = s_filter_type_map[s_filter_type];
+        e.filter_freq_coefs[COEF_CONST] = base_hz;
+        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
+        e.filter_freq_coefs[COEF_MOD]   = safe_lfo_depth_hz(s_lfo_depth, base_hz);
+        e.resonance                     = sc_filter_res(s_filter_resonance);
+        e.eg1_times[0] = 5;                                    e.eg1_values[0] = 1.0f;
+        e.eg1_times[1] = sc_fenv_decay_ms(s_filter_env_decay); e.eg1_values[1] = 0.0f;
+        e.eg1_times[2] = 0;                                    e.eg1_values[2] = 0.0f;
+        e.portamento_ms = sc_portamento_ms(s_portamento);
+        e.velocity = 1.0f;
+        s_last_freq_hz = freq;
     } else {
         e.synth     = SYNTH_CH_PATCH;
         e.midi_note = (float)midi_note;
@@ -280,27 +370,41 @@ void amy_engine_set_wave(uint8_t wave_id)
 {
     if (wave_id >= AMY_ENGINE_WAVE_COUNT) return;
     s_wave_id = wave_id;
-    if (s_mode == SYNTH_MODE_CUSTOM) setup_custom_synth();
-    nvs_save_all();
     ESP_LOGI(TAG, "wave → %u", wave_id);
 }
 
 void amy_engine_set_reverb(uint16_t amount, uint16_t decay)
 {
-    (void)amount; (void)decay; // reverb disabled — delay lines exhaust heap after WiFi init
+    s_reverb_amount = amount;
+    s_reverb_decay  = decay;
+    amy_event e = amy_default_event();
+    e.reverb_level    = (amount / 10000.0f) * 2.0f;
+    e.reverb_liveness = 0.5f + (decay / 10000.0f) * 0.45f;
+    e.reverb_damping  = 0.5f;
+    e.reverb_xover_hz = 3000.0f;
+    amy_add_event(&e);
+    ESP_LOGI(TAG, "reverb amt=%u dec=%u", amount, decay);
 }
 
 void amy_engine_set_echo(uint16_t amount, uint16_t feedback)
 {
-    (void)amount; (void)feedback; // echo disabled — delay lines exhaust heap after WiFi init
+    s_echo_amount   = amount;
+    s_echo_feedback = feedback;
+    amy_event e = amy_default_event();
+    e.echo_level       = amount / 10000.0f;
+    e.echo_delay_ms    = 250.0f;
+    // echo_max_delay_ms intentionally omitted — buffer already allocated in init
+    e.echo_feedback    = (feedback / 10000.0f) * 0.9f;
+    e.echo_filter_coef = 0.5f;
+    amy_add_event(&e);
+    ESP_LOGI(TAG, "echo amt=%u fb=%u", amount, feedback);
 }
 
 void amy_engine_set_filter(uint16_t cutoff, uint16_t resonance)
 {
     s_filter_cutoff    = cutoff;
     s_filter_resonance = resonance;
-    if (s_mode == SYNTH_MODE_CUSTOM) setup_custom_synth();
-    nvs_save_all();
+    if (s_mode == SYNTH_MODE_CUSTOM) apply_filter_to_all_oscs();
     ESP_LOGI(TAG, "filter cut=%u res=%u", cutoff, resonance);
 }
 
@@ -308,8 +412,7 @@ void amy_engine_set_filter_type(uint8_t type)
 {
     if (type > AMY_ENGINE_FILTER_HPF) return;
     s_filter_type = type;
-    if (s_mode == SYNTH_MODE_CUSTOM) setup_custom_synth();
-    nvs_save_all();
+    if (s_mode == SYNTH_MODE_CUSTOM) apply_filter_to_all_oscs();
     ESP_LOGI(TAG, "filter_type → %u", type);
 }
 
@@ -317,8 +420,7 @@ void amy_engine_set_filter_env(uint16_t depth, uint16_t decay)
 {
     s_filter_env_depth = depth;
     s_filter_env_decay = decay;
-    if (s_mode == SYNTH_MODE_CUSTOM) setup_custom_synth();
-    nvs_save_all();
+    if (s_mode == SYNTH_MODE_CUSTOM) apply_filter_to_all_oscs();
     ESP_LOGI(TAG, "filter_env depth=%u decay=%u", depth, decay);
 }
 
@@ -326,8 +428,7 @@ void amy_engine_set_lfo(uint16_t rate, uint16_t depth)
 {
     s_lfo_rate  = rate;
     s_lfo_depth = depth;
-    if (s_mode == SYNTH_MODE_CUSTOM) setup_custom_synth();
-    nvs_save_all();
+    if (s_mode == SYNTH_MODE_CUSTOM) apply_filter_to_all_oscs();
     ESP_LOGI(TAG, "lfo rate=%u depth=%u", rate, depth);
 }
 
@@ -346,7 +447,6 @@ void amy_engine_set_pressure_depth(uint16_t depth)
 void amy_engine_set_glide(uint16_t glide)
 {
     s_portamento = glide;
-    nvs_save_all();
     ESP_LOGI(TAG, "glide → %u (%u ms)", glide, sc_portamento_ms(glide));
 }
 
@@ -384,11 +484,16 @@ void amy_engine_update_pressure(uint8_t pad, float pressure_norm)
 
 void amy_engine_set_envelope(uint16_t attack, uint16_t release)
 {
+    amy_engine_set_adsr(attack, s_env_decay, s_env_sustain, release);
+}
+
+void amy_engine_set_adsr(uint16_t attack, uint16_t decay, uint16_t sustain, uint16_t release)
+{
     s_env_attack  = attack;
+    s_env_decay   = decay;
+    s_env_sustain = sustain;
     s_env_release = release;
-    if (s_mode == SYNTH_MODE_CUSTOM) setup_custom_synth();
-    nvs_save_all();
-    ESP_LOGI(TAG, "envelope atk=%u rel=%u", attack, release);
+    ESP_LOGI(TAG, "adsr atk=%u dec=%u sus=%u rel=%u", attack, decay, sustain, release);
 }
 
 void amy_engine_get_state(amy_engine_state_t *out)
@@ -396,13 +501,15 @@ void amy_engine_get_state(amy_engine_state_t *out)
     if (!out) return;
     out->wave_id          = s_wave_id;
     out->filter_type      = s_filter_type;
-    out->reverb_amount    = 0;
-    out->reverb_decay     = 0;
-    out->echo_amount      = 0;
-    out->echo_feedback    = 0;
+    out->reverb_amount    = s_reverb_amount;
+    out->reverb_decay     = s_reverb_decay;
+    out->echo_amount      = s_echo_amount;
+    out->echo_feedback    = s_echo_feedback;
     out->filter_cutoff    = s_filter_cutoff;
     out->filter_resonance = s_filter_resonance;
     out->env_attack       = s_env_attack;
+    out->env_decay        = s_env_decay;
+    out->env_sustain      = s_env_sustain;
     out->env_release      = s_env_release;
     out->filter_env_depth = s_filter_env_depth;
     out->filter_env_decay = s_filter_env_decay;
@@ -415,4 +522,20 @@ void amy_engine_get_state(amy_engine_state_t *out)
     out->patch_num        = s_patch_num;
 }
 
+void amy_engine_save_state(void)
+{
+    nvs_save_all();
+}
 
+void amy_engine_park_idle_oscs(void)
+{
+    if (!s_initialized || s_portamento == 0 || s_last_freq_hz <= 0.0f) return;
+    if (s_mode != SYNTH_MODE_CUSTOM) return;
+    for (uint8_t pad = 0; pad < SYNTH_PAD_COUNT; pad++) {
+        if (s_pad_active[pad]) continue;
+        amy_event e = amy_default_event();
+        e.osc = pad;
+        e.freq_coefs[COEF_CONST] = s_last_freq_hz;
+        amy_add_event(&e);
+    }
+}
