@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -168,12 +169,12 @@ static bool     s_cal_editing = false;
 static uint16_t s_cal_thr     = 100;
 
 // Effects section
-// items 0-9: FltType CUT RES RVB RDC ECH EFB GLD LFRT LFDP
+// items 0-7: FltType CUT RES ECH EFB GLD LFRT LFDP
 static int      s_fx_cur      = 0;
 static int      s_fx_scroll   = 0;
 static bool     s_fx_editing  = false;
 static uint8_t  s_fx_flt_type = 0;       // 0=LPF 1=BPF 2=HPF
-static uint16_t s_fx_vals[9];            // [0]=cut [1]=res [2]=rvb [3]=rdc [4]=ech [5]=efb [6]=gld [7]=lfr [8]=lfd
+static uint16_t s_fx_vals[7];            // [0]=cut [1]=res [2]=ech [3]=efb [4]=gld [5]=lfr [6]=lfd
 
 // ADSR section (0-10000 internal scale)
 static int      s_adsr_cur     = 0;  // 0=A 1=D 2=S 3=R
@@ -303,7 +304,7 @@ static void ui_draw_effects(void)
 
     for (int vi = 0; vi < 4; vi++) {
         int item = s_fx_scroll + vi;
-        if (item >= 10) break;
+        if (item >= 8) break;
 
         bool is_cur = (item == s_fx_cur);
         bool editing = is_cur && s_fx_editing;
@@ -315,40 +316,36 @@ static void ui_draw_effects(void)
                 snprintf(row, sizeof(row), "%cFLT %s", cur, s_flt_names[s_fx_flt_type]);
                 break;
             case 1: {
-                uint32_t hz = (uint32_t)(200.0f + (s_fx_vals[0] / 10000.0f) * 9800.0f);
+                float t = s_fx_vals[0] / 10000.0f;
+                uint32_t hz = (uint32_t)fminf(13.0f * powf(2.0f, 0.0938f * (t * 127.0f)), 12000.0f);
                 snprintf(row, sizeof(row), "%cCUT%5u", cur, (unsigned)hz);
                 break;
             }
             case 2: {
-                uint32_t pct = (uint32_t)((s_fx_vals[1] / 10000.0f) * 90.0f);
-                snprintf(row, sizeof(row), "%cRES %3u%%", cur, (unsigned)pct);
+                float q = 0.7f * powf(2.0f, 4.0f * (s_fx_vals[1] / 10000.0f));
+                uint32_t qi = (uint32_t)(q * 10.0f);
+                snprintf(row, sizeof(row), "%cQ %2u.%u ", cur, (unsigned)(qi/10), (unsigned)(qi%10));
                 break;
             }
             case 3:
-                snprintf(row, sizeof(row), "%cRVB %3u%%", cur, (unsigned)(s_fx_vals[2] / 100));
+                snprintf(row, sizeof(row), "%cECH %3u%%", cur, (unsigned)(s_fx_vals[2] / 100));
                 break;
             case 4:
-                snprintf(row, sizeof(row), "%cRDC %3u%%", cur, (unsigned)(s_fx_vals[3] / 100));
+                snprintf(row, sizeof(row), "%cEFB %3u%%", cur, (unsigned)(s_fx_vals[3] / 100));
                 break;
-            case 5:
-                snprintf(row, sizeof(row), "%cECH %3u%%", cur, (unsigned)(s_fx_vals[4] / 100));
-                break;
-            case 6:
-                snprintf(row, sizeof(row), "%cEFB %3u%%", cur, (unsigned)(s_fx_vals[5] / 100));
-                break;
-            case 7: {
-                uint32_t ms = ((uint32_t)s_fx_vals[6] * 500) / 10000;
+            case 5: {
+                uint32_t ms = ((uint32_t)s_fx_vals[4] * 500) / 10000;
                 snprintf(row, sizeof(row), "%cGLD %3uMS", cur, (unsigned)ms);
                 break;
             }
-            case 8: {
-                uint32_t x10 = 1 + ((uint32_t)s_fx_vals[7] * 99) / 10000; // 1-100 (tenths of Hz)
+            case 6: {
+                uint32_t x10 = 1 + ((uint32_t)s_fx_vals[5] * 99) / 10000;
                 snprintf(row, sizeof(row), "%cLFR%u.%uHZ", cur,
                          (unsigned)(x10 / 10), (unsigned)(x10 % 10));
                 break;
             }
-            case 9: {
-                uint32_t hz = ((uint32_t)s_fx_vals[8] * 5000) / 10000;
+            case 7: {
+                uint32_t hz = ((uint32_t)s_fx_vals[6] * 5000) / 10000;
                 snprintf(row, sizeof(row), "%cLFD%4uHZ", cur, (unsigned)hz);
                 break;
             }
@@ -462,13 +459,11 @@ static void ui_enter(ui_section_t sec)
         s_fx_flt_type = st.filter_type;
         s_fx_vals[0]  = st.filter_cutoff;
         s_fx_vals[1]  = st.filter_resonance;
-        s_fx_vals[2]  = st.reverb_amount;
-        s_fx_vals[3]  = st.reverb_decay;
-        s_fx_vals[4]  = st.echo_amount;
-        s_fx_vals[5]  = st.echo_feedback;
-        s_fx_vals[6]  = st.glide;
-        s_fx_vals[7]  = st.lfo_rate;
-        s_fx_vals[8]  = st.lfo_depth;
+        s_fx_vals[2]  = st.echo_amount;
+        s_fx_vals[3]  = st.echo_feedback;
+        s_fx_vals[4]  = st.glide;
+        s_fx_vals[5]  = st.lfo_rate;
+        s_fx_vals[6]  = st.lfo_depth;
         s_fx_cur      = 0;
         s_fx_scroll   = 0;
         s_fx_editing  = false;
@@ -585,7 +580,7 @@ void ui_tick(int delta, bool short_press, bool long_press)
             if (delta) {
                 s_fx_cur += delta;
                 if (s_fx_cur < 0) s_fx_cur = 0;
-                if (s_fx_cur > 9) s_fx_cur = 9;
+                if (s_fx_cur > 7) s_fx_cur = 7;
                 if (s_fx_cur < s_fx_scroll)       s_fx_scroll = s_fx_cur;
                 if (s_fx_cur >= s_fx_scroll + 4)  s_fx_scroll = s_fx_cur - 3;
                 s_dirty = true;
@@ -593,8 +588,9 @@ void ui_tick(int delta, bool short_press, bool long_press)
             if (short_press) {
                 if (s_fx_cur == 0) {
                     s_fx_flt_type = (s_fx_flt_type + 1) % 3;
-                    // Per-type cutoff defaults tuned for C4-E5 playing range (262-659 Hz).
-                    static const uint16_t s_flt_cutoff_dflt[3] = {7959, 1122, 51};
+                    // Per-type defaults recalculated for Spark exponential formula.
+                    // LPF≈8kHz, BPF≈1.3kHz, HPF≈250Hz
+                    static const uint16_t s_flt_cutoff_dflt[3] = {7778, 5579, 3581};
                     s_fx_vals[0] = s_flt_cutoff_dflt[s_fx_flt_type];
                     amy_engine_set_filter_type(s_fx_flt_type);
                     amy_engine_set_filter(s_fx_vals[0], s_fx_vals[1]);
@@ -614,13 +610,11 @@ void ui_tick(int delta, bool short_press, bool long_press)
                     case 1: case 2:
                         amy_engine_set_filter(s_fx_vals[0], s_fx_vals[1]); break;
                     case 3: case 4:
-                        amy_engine_set_reverb(s_fx_vals[2], s_fx_vals[3]); break;
-                    case 5: case 6:
-                        amy_engine_set_echo(s_fx_vals[4], s_fx_vals[5]);   break;
-                    case 7:
-                        amy_engine_set_glide(s_fx_vals[6]); break;
-                    case 8: case 9:
-                        amy_engine_set_lfo(s_fx_vals[7], s_fx_vals[8]); break;
+                        amy_engine_set_echo(s_fx_vals[2], s_fx_vals[3]);   break;
+                    case 5:
+                        amy_engine_set_glide(s_fx_vals[4]); break;
+                    case 6: case 7:
+                        amy_engine_set_lfo(s_fx_vals[5], s_fx_vals[6]); break;
                 }
                 s_dirty = true;
             }
