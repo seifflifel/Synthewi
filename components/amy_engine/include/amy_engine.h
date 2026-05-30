@@ -80,10 +80,4 @@ void amy_engine_update_pressure(uint8_t pad, float pressure_norm);
 // Returns current state for telemetry broadcast.
 void amy_engine_get_state(amy_engine_state_t *out);
 
-// Audio render — called from USB audio callback (must not block long).
-void amy_engine_render_mono_16(int16_t *out, size_t samples);
-
-// WAV transport test — keep for USB audio quality validation.
-void amy_engine_render_wav_mono_16(int16_t *out, size_t samples);
-
 #endif // AMY_ENGINE_H

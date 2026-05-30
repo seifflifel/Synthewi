@@ -27,8 +27,6 @@ idf_component_register(
     SRCS
         "amy_engine.c"
         ${AMY_CORE_SRCS}
-    EMBED_FILES
-        "../../sounds/sleepwalk.wav"
     INCLUDE_DIRS
         "include"
         "${AMY_SRC_DIR}"

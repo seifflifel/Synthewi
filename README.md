@@ -13,16 +13,40 @@ For the full working software prototype (USB audio + WiFi web UI), see branch
 | Tag | What it tests | How to flash |
 |-----|--------------|--------------|
 | `hardware/speaker-wav-test` | I²S + MAX98357A + speaker — plays embedded WAV loop | `git checkout hardware/speaker-wav-test && idf.py flash` |
+| `hardware/amy-i2s-notes` | AMY synthesizer → I²S — plays SINE notes C4 E4 G4 C5 in a loop | `git checkout hardware/amy-i2s-notes && idf.py flash` |
 
 ---
 
-## Current milestone — Speaker / I²S output
+## Current milestone — AMY synthesizer over I²S
 
 ### What this firmware does
 
-Plays the embedded `sleepwalk.wav` (44100 Hz mono) in a continuous loop through the
-MAX98357A Class D amplifier via I²S. No WiFi, no touch, no synthesis — pure audio
-transport test.
+Runs the AMY polyphonic synthesizer engine on ESP32-S3 and outputs audio through
+the MAX98357A Class D amplifier via I²S. `main.c` loops through four SINE wave notes
+(C4 → E4 → G4 → C5) at 500 ms each, confirming the full audio path: CPU → AMY → I²S → speaker.
+
+### Key findings (this milestone)
+
+- AMY's `freq_coefs[COEF_CONST]` (Hz) must be used for direct-osc frequency on direct-osc
+  events (`e.osc = n`). The `e.midi_note` field targets the voice-allocator path (`e.synth`)
+  and is silent on a bare osc — this was the root cause of no audio.
+- Pan defaults to 0 (left channel only) in AMY. Always set `pan_coefs[COEF_CONST] = 0.5f`
+  for center output when using mono speakers.
+- Reverb and echo delay lines exhaust SRAM after WiFi init fragments the heap — both disabled.
+- `features.default_synths = 0` is required; default synths would claim oscs 0–N and
+  conflict with direct-osc events on those indices.
+
+### How a note event works (bleep pattern)
+
+```c
+amy_event e = amy_default_event();
+e.osc                    = pad;           // osc index 0-7, one per touch pad
+e.wave                   = SINE;
+e.freq_coefs[COEF_CONST] = 440.0f * powf(2.0f, (note - 69.0f) / 12.0f);
+e.pan_coefs[COEF_CONST]  = 0.5f;         // center; default is left-only
+e.velocity               = 1.0f;         // triggers note_on
+amy_add_event(&e);
+```
 
 ### Wiring
 
@@ -38,29 +62,15 @@ transport test.
 | OUT+ | Speaker + | Direct wire, no resistors |
 | OUT– | Speaker – | Direct wire, no resistors |
 
-### I²S format
-
-32-bit MSB-justified stereo at 48 kHz. Each int16 audio sample is left-shifted 16 bits
-into an int32 word and duplicated to both L and R channels. This matches AMY's proven
-ESP32-S3 I²S format and is correctly decoded by the MAX98357A.
-
-### Key findings
-
-- `I2S_SLOT_MODE_MONO` breaks the LRCLK framing the MAX98357A expects — must use stereo.
-- MSB 32-bit format (`I2S_STD_MSB_SLOT_DEFAULT_CONFIG`) works; Philips 16-bit also
-  accepted by the MAX98357A but not tested on this rig.
-- GAIN pin to GND = 3 dB (very quiet on laptop speakers). Leave floating for 9 dB.
-- `OUTPUT_GAIN_BOOST 1` (no software boost) is the right setting with GAIN floating.
-- GPIO38/39/40 are clean on ESP32-S3-DevKitC-1 N8R2 — no conflicts with JTAG or PSRAM.
-
 ---
 
 ## Next milestones (planned)
 
-- [ ] OLED (SSD1306, I²C) — display test
-- [ ] Potentiometer (ADC read → parameter) — single pot on GPIO3
-- [ ] Full synthesis via I²S (port WiFi firmware audio engine to this transport)
-- [ ] Physical controls (encoder, toggle switch, buttons)
+- [ ] Touch pads → live note_on / note_off (MPR121 or direct capacitive)
+- [ ] Rotary encoder → parameter control
+- [ ] OLED (SSD1306, I²C) — display synthesis state
+- [ ] Full ADSR envelope + filter layered back onto confirmed audio path
+- [ ] UI architecture
 
 ---
 

@@ -1,5 +1,12 @@
 # Default sdkconfig for Synthewi project
 
+# app_main calls amy_engine_init which uses large amy_event structs (~800 bytes each)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# AMY creates tasks with ESP_TASK_PRIO_MAX which equals configMAX_PRIORITIES.
+# FreeRTOS requires priority < configMAX_PRIORITIES, so bump max by 1.
+CONFIG_FREERTOS_MAX_PRIORITIES=26
+
 # Target settings (ESP32-S3)
 CONFIG_IDF_TARGET="esp32s3"
 

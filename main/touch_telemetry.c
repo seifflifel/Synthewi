@@ -24,6 +24,8 @@ static const uint8_t s_touch_channels[TOUCH_CHANNEL_COUNT] = {4, 5, 6, 7, 8, 12,
 static touch_sensor_t    s_touch_pads[TOUCH_CHANNEL_COUNT];
 static volatile uint16_t s_thresholds[TOUCH_CHANNEL_COUNT] = {100,100,100,100,100,100,100,100};
 static bool              s_prev_touching[TOUCH_CHANNEL_COUNT] = {false};
+static uint8_t           s_off_count[TOUCH_CHANNEL_COUNT]    = {0};
+#define TOUCH_OFF_DEBOUNCE  2   // samples below threshold before firing note_off (~66 ms at 30 Hz)
 static bool              s_started = false;
 
 static volatile touch_event_cb_t    s_event_cb    = NULL;
@@ -123,10 +125,23 @@ static void touch_telemetry_task(void *arg)
             uint16_t thresh   = s_thresholds[i];
             bool     touching = (delta >= thresh);
 
-            if (touching != s_prev_touching[i]) {
-                s_prev_touching[i] = touching;
-                touch_event_cb_t cb = s_event_cb;
-                if (cb) cb((uint8_t)i, touching);
+            if (touching) {
+                s_off_count[i] = 0;
+                if (!s_prev_touching[i]) {
+                    s_prev_touching[i] = true;
+                    touch_event_cb_t cb = s_event_cb;
+                    if (cb) cb((uint8_t)i, true);
+                }
+            } else {
+                if (s_prev_touching[i]) {
+                    s_off_count[i]++;
+                    if (s_off_count[i] >= TOUCH_OFF_DEBOUNCE) {
+                        s_off_count[i] = 0;
+                        s_prev_touching[i] = false;
+                        touch_event_cb_t cb = s_event_cb;
+                        if (cb) cb((uint8_t)i, false);
+                    }
+                }
             }
 
             if (touching) {
