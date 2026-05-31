@@ -64,53 +64,83 @@ TRIANGLE: /\  /\  (rise, fall, rise)
 
 ---
 
-### 1C. Potentiometers via MUX (planned — do not implement until MUX is purchased)
-**before you start go check how spark synth handle potentiometers and their states and then plan how to do it base on the notes under**
+### 1C. Potentiometers via MUX (wired — implement when ready)
 
 **Rationale:** 6 hardware pots for the most-touched params. Encoder + UI remain for filter type and presets.
 
-**MUX chip:** CD4051 (8:1 analog multiplexer) — 1 output pin, 3 address select pins, works at 3.3V.
+**MUX chip:** CD4067BE (16-channel analog multiplexer, DIP-24). Only channels 0–5 are used; select line D is hardwired to GND so the upper 8 channels are never addressed, saving one GPIO.
 
-**Wiring:**
+---
+
+#### CD4067BE wiring (DIP-24)
 
 ```
-MUX output (pin 3) → ESP32-S3 ADC1 channel (e.g. GPIO 4)
-MUX select A (pin 11) → GPIO_MUX_A (e.g. GPIO 5)
-MUX select B (pin 10) → GPIO_MUX_B (e.g. GPIO 6)
-MUX select C (pin 9)  → GPIO_MUX_C (e.g. GPIO 7)
-MUX VCC (pin 16) → 3.3V
-MUX GND (pin 8, 7) → GND
-MUX INH (pin 6) → GND (always enabled)
+CD4067BE pin 24 (VDD)       → 3.3V
+CD4067BE pin 12 (VSS)       → GND
+CD4067BE pin 19 (E, enable) → GND  ← always enabled, active LOW
+CD4067BE pin 23 (D, bit 3)  → GND  ← tie low; channels 0-5 never need D=1
+CD4067BE pin 20 (A, bit 0)  → GPIO 12
+CD4067BE pin 21 (B, bit 1)  → GPIO 13
+CD4067BE pin 22 (C, bit 2)  → GPIO 14
+CD4067BE pin 18 (Z, common) → GPIO 11  ← ADC2 CH0, analog read
 ```
 
-**Channel assignment:**
+Bypass cap: 100 nF ceramic between VDD (pin 24) and GND (pin 12), placed close to chip.
 
-| MUX CH | Select (CBA) | Parameter | Range |
-|--------|--------------|-----------|-------|
-| 0 | 000 | Attack | 0–10000 |
-| 1 | 001 | Release | 0–10000 |
-| 2 | 010 | Filter Cutoff | 0–10000 |
-| 3 | 011 | Filter Q / Resonance | 0–10000 |
-| 4 | 100 | Glide | 0–10000 |
-| 5 | 101 | Echo (amt + fb linked) | 0–10000 → both `echo_amount` and `echo_feedback` |
-| 6 | 110 | spare | — |
-| 7 | 111 | spare | — |
+---
 
-**Important** keep the same range of the parameters that we have now and jast map the 10k pots to those ranges
+#### Potentiometer channel assignment
 
-**Echo dual-control:** `echo_amount = val`, `echo_feedback = val `
+| CH | Addr C,B,A | Pin (DIP-24) | Parameter | Internal range |
+|----|-----------|--------------|-----------|---------------|
+| C0 | 0,0,0 | Pin 7 | Attack | 0–10000 → 2–2000 ms |
+| C1 | 0,0,1 | Pin 6 | Release | 0–10000 → 10–5000 ms |
+| C2 | 0,1,0 | Pin 5 | Filter Cutoff | 0–10000 → 13–12000 Hz (Spark exp.) |
+| C3 | 0,1,1 | Pin 4 | Resonance (Q) | 0–10000 → Q 0.7–11 (Spark exp.) |
+| C4 | 1,0,0 | Pin 3 | Glide | 0–10000 → 0–500 ms |
+| C5 | 1,0,1 | Pin 2 | Echo | 0–10000 → both `echo_amount` and `echo_feedback` linked |
+| C6–C15 | — | Pins 1, 8–17 | Not used | Leave unconnected |
 
-**ADC scanning strategy:**
-- Read one channel per main loop tick (20 ms) — full scan every 160 ms (6 channels × 20 ms + MUX settle time)
-- Apply a deadband (±50 raw counts) to avoid noise-driven updates — only call `amy_engine_set_*` when value moves outside deadband
-- No NVS save from pot changes (pots are live, NVS only from section exit as today)
+---
 
-**Code changes needed when implementing:**
-- `main.c`: `adc1_config`, MUX select GPIO config, round-robin channel scan, deadband filter, route readings to `amy_engine_set_*`
-- `ui.h` MAIN screen: show pot values live (override encoder-set values visually)
-- Params controlled by pots migrate out of FX section (FX section keeps only filter TYPE selection)
+#### Each potentiometer (10 kΩ linear)
 
-we will keep the encoder changing the params but when you touch the potentiometer it goes back to the potentiometer value so we have to be smart about it
+```
+Pot end 1 (CCW) → GND
+Pot wiper       → MUX channel pin (C0..C5)
+Pot end 2 (CW)  → 3.3V
+```
+
+Full CCW = 0 (GND), full CW = 4095 ADC (3.3V) → maps to 0–10000 internal scale.
+
+---
+
+#### New GPIO allocations
+
+| GPIO | Function |
+|------|----------|
+| 11 | MUX Z (ADC2 CH0 — analog in) |
+| 12 | MUX select A (bit 0) |
+| 13 | MUX select B (bit 1) |
+| 14 | MUX select C (bit 2) |
+
+---
+
+#### Scanning strategy (for implementation)
+
+- Read one channel per main loop tick (20 ms) — full 6-channel scan every 120 ms
+- Allow ~10 µs after asserting select pins before triggering ADC read (MUX settle time)
+- Deadband ±50 raw counts to suppress ADC noise — only call `amy_engine_set_*` on change outside deadband
+- Encoder still works; when pot moves outside deadband it takes over; encoder adjusts from the new pot position
+- No NVS save from pot changes — pots are live; NVS save only on explicit long-press exit as today
+
+---
+
+#### Code changes needed (when implementing)
+
+- `main.c`: ADC2 CH0 config, select GPIO config (digital out), round-robin channel scan, deadband filter, `amy_engine_set_*` calls
+- `ui.h` MAIN screen: pot-driven params show a `●` dot next to value instead of `>` cursor
+- Params controlled by pots migrate out of encoder-edit path (encoder stays as fine-tune override)
 ---
 
 ## Spark Synth UI — Key Patterns to Reuse
@@ -279,18 +309,10 @@ Each bar: A small horizontal line marks the threshold level.
 
 1. [x] 3-position lever + code (remove WAVE UI section, waveform glyph in menu cell 0)
 2. [x] Octave touch buttons (GPIO 9/10) + OCT display in menu cell 0
-3. [ ] New UI layout: ribbon bar + 3-card grid shell (navigation only, no inner content)
-4. [ ] MAIN screen content (Spark-style columns)
-5. [ ] PRESETS card (NVS save/load)
-6. [ ] CALIB card redesign (8 columns + high refresh)
-7. [ ] **Future — encoder-selectable octave mode (low priority, implement after Phase 3):**
-
-Two modes selectable via encoder in a settings menu or long-press shortcut:
-- **Latching** (current): press oct+/oct- → shift stays until pressed again
-- **Momentary**: press and hold oct+ → shift up while held, release → return to original octave
-
-Add a toggle in the UI so the user can choose which behavior they prefer. This adds flexibility for performance use (momentary) vs. composition use (latching).
-
-8. [ ] Looper
-9. [ ] MUX + pots (after hardware purchase)
+3. [x] New UI layout: ribbon bar + 3-card grid (landscape 160×128, ribbon y=0..21, cards y=22..127)
+4. [x] MAIN screen content (Spark-style 5 columns: ENV / FLT / LFO / ECH / GLD)
+5. [x] PRESETS card (6 NVS slots, 2×3 grid, LOAD / SAVE / CLR actions)
+6. [ ] CALIB card redesign (8 pad columns + 2 oct columns, 50 ms refresh)
+7. [ ] Looper (PSRAM event-based record/playback)
+8. [ ] MUX + pots (CD4067BE wired — see section 1C)
 

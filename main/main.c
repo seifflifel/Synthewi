@@ -25,6 +25,7 @@ static void apply_octave(void)
 static void on_touch(uint8_t pad, bool on)
 {
     if (pad < 8) {
+        ui_set_pad_active(pad, on);
         if (on) {
             ESP_LOGI(TAG, "pad %u ON  note %u", pad + 1, s_notes[pad]);
             amy_engine_note_on(pad, s_notes[pad]);
