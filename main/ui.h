@@ -12,6 +12,7 @@
 #include "nvs.h"
 #include "touch_telemetry.h"
 #include "amy_engine.h"
+#include "looper.h"
 
 // ── TFT hardware pins ────────────────────────────────────────
 #define TFT_SCLK  GPIO_NUM_36
@@ -22,13 +23,16 @@
 #define TFT_W     160
 #define TFT_H     128
 
-// RGB565 palette
-#define C_BLACK   0x0000u
-#define C_WHITE   0xFFFFu
-#define C_GREEN   0x07E0u
-#define C_RED     0xF800u
-#define C_YELLOW  0xFFE0u
-#define C_CYAN    0x07FFu
+// RGB565 palette — panel is BGR (MADCTL bit3=1), so R and B channels are physically swapped.
+// All values below are corrected for BGR: what we call C_RED sends B=31 on the wire so
+// the panel displays it as red.  Green (middle channel) is unaffected.
+#define C_BLACK   0xFFFFu  // light mode: C_BLACK renders WHITE on screen
+#define C_WHITE   0x0000u  // light mode: C_WHITE renders BLACK on screen
+#define C_GREEN   0x07E0u  // G channel symmetric — unchanged
+#define C_RED     0x001Fu  // BGR-corrected (was 0xF800, appeared blue)
+#define C_YELLOW  0x07FFu  // BGR-corrected (was 0xFFE0, appeared cyan)
+#define C_CYAN    0xFFE0u  // BGR-corrected (was 0x07FFu, appeared yellow)
+#define C_ORANGE  0x029Fu  // warm amber — TE accent (R=255,G=160,B=0 as seen on panel)
 #define C_DKGRAY  0x2104u
 #define C_LTGRAY  0x8410u
 
@@ -189,6 +193,35 @@ static void tft_text(const char *str, int x, int y, uint16_t fg, uint16_t bg, in
             }
         }
         tft_pixels(w);
+    }
+}
+
+// Bold text: draw twice with 1px x-offset for a heavier stroke.
+static void tft_text_bold(const char *str, int x, int y, uint16_t fg, uint16_t bg, int sc)
+{
+    tft_text(str, x,   y, fg, bg, sc);
+    tft_text(str, x+1, y, fg, bg, sc);
+}
+
+// Outline rounded rectangle (corner radius ≈ 2 px).
+static void tft_rrect(int x0, int y0, int x1, int y1, uint16_t c)
+{
+    tft_fill(x0+2, y0,   x1-2, y0,   c);
+    tft_fill(x0+2, y1,   x1-2, y1,   c);
+    tft_fill(x0,   y0+2, x0,   y1-2, c);
+    tft_fill(x1,   y0+2, x1,   y1-2, c);
+    tft_fill(x0+1, y0+1, x0+1, y0+1, c);
+    tft_fill(x1-1, y0+1, x1-1, y0+1, c);
+    tft_fill(x0+1, y1-1, x0+1, y1-1, c);
+    tft_fill(x1-1, y1-1, x1-1, y1-1, c);
+}
+
+// Filled rounded rectangle (corner radius ≈ 2 px).
+static void tft_rrect_fill(int x0, int y0, int x1, int y1, uint16_t c)
+{
+    for (int y = y0; y <= y1; y++) {
+        int ins = (y == y0 || y == y1) ? 2 : (y == y0+1 || y == y1-1) ? 1 : 0;
+        tft_fill(x0+ins, y, x1-ins, y, c);
     }
 }
 
@@ -387,7 +420,7 @@ static void ui_draw_wave_glyph(uint8_t wave_id, int x0, int y0, int x1, int y1, 
 }
 
 // ---- RIBBON BAR (y=0..21, always drawn last) ----------------
-// 8 pad circles + waveform glyph + octave label + separator.
+// 8 pad circles + waveform glyph + octave label + looper dot + separator.
 static void ui_draw_ribbon(void)
 {
     tft_fill(0, 0, TFT_W-1, 19, C_BLACK);
@@ -396,68 +429,130 @@ static void ui_draw_ribbon(void)
     for (int i = 0; i < TOUCH_NOTE_PADS; i++)
         tft_pad_circle(6 + i * 10, 10, s_pad_active[i]);
 
-    // Waveform glyph (x=90..110, y=3..17)
+    // Waveform glyph (x=90..110, y=3..17) — orange accent
     amy_engine_state_t st;
     amy_engine_get_state(&st);
-    ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_CYAN);
+    ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_ORANGE);
 
-    // Octave label (x=116, y=6, scale 1)
+    // Octave label — yellow when shifted, dim gray at zero
     char oct_buf[8];
     if (s_octave_shift == 0)
         snprintf(oct_buf, sizeof(oct_buf), "OCT 0");
     else
         snprintf(oct_buf, sizeof(oct_buf), "OCT%+d", s_octave_shift);
-    tft_text(oct_buf, 116, 6, C_YELLOW, C_BLACK, 1);
+    tft_text(oct_buf, 116, 6, s_octave_shift ? C_YELLOW : C_DKGRAY, C_BLACK, 1);
+
+    // Looper dot (5×5, top-right) — colors now correct with BGR fix
+    looper_state_t ls = looper_get_state();
+    uint16_t lc = (ls == LOOPER_RECORDING) ? C_RED    :
+                  (ls == LOOPER_PLAYING)   ? C_GREEN  :
+                  (ls == LOOPER_OVERDUB)   ? C_YELLOW : C_BLACK;
+    tft_fill(154, 5, 158, 9, lc);
 
     // Separator
     tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY);
 }
 
 // ---- CARDS (top-level navigation) ---------------------------
-// 3 horizontal cards: MAIN (x=0..41) | PRST (x=43..84) | CAL (x=86..127)
+// 3 rounded cards with gap borders, TE-style amber accent for selected.
 static void ui_draw_cards(void)
 {
     tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
 
-    // Vertical card dividers (3 cards × 53px + 2 gaps = 160px)
-    tft_fill(53, 22, 53, TFT_H-1, C_DKGRAY);
-    tft_fill(107, 22, 107, TFT_H-1, C_DKGRAY);
-
     static const char * const names[3] = {"MAIN", "PRST", "CAL"};
-    static const char * const subs[3]  = {"PARAMS", "SAVE", "PADS"};
-    static const int          xs[3]    = {0, 54, 108};
-    static const int          ws[3]    = {53, 53, 52};
+    // Card x ranges with 1px gaps between them
+    static const int cxs[3] = {1,  54, 108};
+    static const int cxe[3] = {52, 105, 158};
 
     for (int i = 0; i < 3; i++) {
-        bool     sel = (i == s_card_cur);
-        uint16_t hbg = sel ? C_YELLOW : C_DKGRAY;
-        uint16_t hfg = sel ? C_BLACK  : C_WHITE;
-        int cx = xs[i], cw = ws[i];
-        int nlen = (int)strlen(names[i]);
-        int tx   = cx + (cw - nlen * 6) / 2;
+        bool sel = (i == s_card_cur);
+        int x0 = cxs[i], x1 = cxe[i];
+        int cw = x1 - x0 + 1;
 
-        // Header (y=22..35)
-        tft_fill(cx, 22, cx + cw - 1, 35, hbg);
-        tft_text(names[i], tx, 26, hfg, hbg, 1);
+        // Rounded card outline — orange if selected, dark gray if not
+        tft_rrect(x0, 23, x1, 126, sel ? C_ORANGE : C_DKGRAY);
 
-        // Sub-label (center of body)
-        int slen = (int)strlen(subs[i]);
-        int stx  = cx + (cw - slen * 6) / 2;
-        tft_text(subs[i], stx, 60, sel ? C_WHITE : C_LTGRAY, C_BLACK, 1);
+        // Header/body divider line at y=41
+        tft_fill(x0+2, 41, x1-2, 41, sel ? C_ORANGE : C_DKGRAY);
+
+        // Header text: scale-2 bold orange for selected, scale-1 dim for unselected
+        int nchars = (int)strlen(names[i]);
+        if (sel) {
+            int tx = x0 + (cw - nchars * 12) / 2 - 1; // -1 compensates bold +1 offset
+            tft_text_bold(names[i], tx, 25, C_ORANGE, C_BLACK, 2);
+        } else {
+            int tx = x0 + (cw - nchars * 6) / 2;
+            tft_text(names[i], tx, 29, C_DKGRAY, C_BLACK, 1);
+        }
+    }
+
+    // ── MAIN body: mini ADSR envelope preview (card 0, x=1..52) ──
+    {
+        amy_engine_state_t st;
+        amy_engine_get_state(&st);
+        int ex0=4, ex1=50, ey_bot=116, ey_top=54, eh=ey_bot-ey_top;
+        int Aw=(int)((long)st.env_attack  * (ex1-ex0) / 30000); if(Aw<1)Aw=1;
+        int Dw=(int)((long)st.env_decay   * (ex1-ex0) / 30000); if(Dw<1)Dw=1;
+        int Sw=5;
+        int Rw=(int)((long)st.env_release * (ex1-ex0) / 30000); if(Rw<1)Rw=1;
+        int tot=Aw+Dw+Sw+Rw, avail=ex1-ex0-2;
+        if (tot > avail) { Aw=Aw*avail/tot; Dw=Dw*avail/tot; Rw=Rw*avail/tot; Sw=3; }
+        int sy=ey_bot-(int)((long)st.env_sustain*eh/10000);
+        if (sy < ey_top+2) sy = ey_top+2;
+        int xa=ex0+Aw, xd=xa+Dw, xs=xd+Sw, xr=xs+Rw;
+        uint16_t ec = (s_card_cur == 0) ? C_ORANGE : C_DKGRAY;
+        tft_line(ex0, ey_bot, xa, ey_top, ec);
+        tft_line(xa, ey_top, xd, sy, ec);
+        tft_line(xd, sy, xs, sy, ec);
+        tft_line(xs, sy, xr, ey_bot, ec);
+    }
+
+    // ── PRST body: 6 small preset squares 3×2 (card 1, x=54..105) ──
+    {
+        // squares 13×13, col gap 4, row gap 15
+        // col x: 57, 74, 91 — row y: 56, 84
+        for (int j = 0; j < PRESET_COUNT; j++) {
+            int col = j % 3, row = j / 3;
+            int sx = 57 + col * 17;  // 13px square + 4px gap
+            int sy = 56 + row * 29;  // 13px square + 16px gap (centers in 85px body)
+            bool occ = s_preset_valid[j];
+            if (occ)
+                tft_rrect_fill(sx, sy, sx+12, sy+12, (s_card_cur==1) ? C_ORANGE : C_LTGRAY);
+            else
+                tft_rrect(sx, sy, sx+12, sy+12, C_DKGRAY);
+            char n[2] = {(char)('1'+j), 0};
+            uint16_t nc = occ ? C_BLACK  : C_DKGRAY;
+            uint16_t nb = occ ? ((s_card_cur==1) ? C_ORANGE : C_LTGRAY) : C_BLACK;
+            tft_text(n, sx+4, sy+3, nc, nb, 1);
+        }
+    }
+
+    // ── CAL body: decorative bar + threshold marker (card 2, x=108..158) ──
+    {
+        uint16_t mc = (s_card_cur == 2) ? C_ORANGE : C_DKGRAY;
+        // 8 tiny vertical bars representing pads
+        for (int p = 0; p < 8; p++) {
+            int bx = 111 + p * 6;
+            int by_bot = 114, by_top = 54;
+            int bh = by_bot - by_top;
+            // static height pattern: alternating heights, decorative only
+            int fh = bh * (3 + (p % 3)) / 6;
+            tft_fill(bx, by_bot-fh, bx+3, by_bot, (p % 3 == 0) ? mc : C_DKGRAY);
+        }
+        // Threshold line across all bars
+        tft_fill(110, 54+28, 157, 54+29, mc);
     }
 }
 
 // ---- PRESETS — 2×3 slot grid --------------------------------
-// Columns: same as cards (x=0..52, 54..106, 108..159).
-// Rows: y=22..73 (row 0), y=75..127 (row 1), divider y=74.
-// Each cell: 10px header + 42/43px body.
+// Columns: x=0..52, 54..106, 108..159.  Rows: y=22..73 / y=75..127.
 static void ui_draw_presets(void)
 {
     tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
 
-    tft_fill(53,  22, 53,  TFT_H-1, C_DKGRAY); // vertical dividers
+    tft_fill(53,  22, 53,  TFT_H-1, C_DKGRAY);
     tft_fill(107, 22, 107, TFT_H-1, C_DKGRAY);
-    tft_fill(0,   74, TFT_W-1, 74,  C_DKGRAY); // horizontal divider
+    tft_fill(0,   74, TFT_W-1, 74,  C_DKGRAY);
 
     static const int cxs[3] = {0, 54, 108};
     static const int cws[3] = {53, 53, 52};
@@ -471,16 +566,15 @@ static void ui_draw_presets(void)
         int ry = rys[row];
         bool sel = (i == s_prst_cur);
 
-        // Header strip (10px)
-        uint16_t hbg = sel ? C_YELLOW : C_DKGRAY;
-        uint16_t hfg = sel ? C_BLACK  : C_WHITE;
+        // Header strip (10px) — orange for selected, dark gray for others
+        uint16_t hbg = sel ? C_ORANGE : C_DKGRAY;
+        uint16_t hfg = sel ? C_BLACK  : C_LTGRAY;
         tft_fill(cx, ry, cx + cw - 1, ry + 9, hbg);
         char hdr[4]; snprintf(hdr, sizeof(hdr), "P%d", i + 1);
         tft_text(hdr, cx + 2, ry + 1, hfg, hbg, 1);
-        // Dot in header if slot has data
         if (s_preset_valid[i]) {
             int dx = cx + cw - 5;
-            tft_fill((uint8_t)dx, (uint8_t)(ry + 3), (uint8_t)(dx + 2), (uint8_t)(ry + 5), hfg);
+            tft_fill((uint8_t)dx, (uint8_t)(ry+3), (uint8_t)(dx+2), (uint8_t)(ry+5), hfg);
         }
 
         // Body
@@ -491,64 +585,65 @@ static void ui_draw_presets(void)
         if (s_prst_action && sel) {
             // Action overlay: LOAD / SAVE / CLR
             for (int a = 0; a < 3; a++) {
-                bool avail = (a == 1) || s_preset_valid[i]; // SAVE always available
+                bool avail = (a == 1) || s_preset_valid[i];
                 bool asel  = (a == s_prst_act);
+                uint16_t fg = !avail ? C_DKGRAY : (asel ? C_ORANGE : C_LTGRAY);
                 uint16_t bg = (asel && avail) ? C_DKGRAY : C_BLACK;
-                uint16_t fg = !avail ? C_DKGRAY : (asel ? C_YELLOW : C_LTGRAY);
                 int ay = body_top + 4 + a * 12;
                 if (asel && avail)
-                    tft_fill(cx, (uint8_t)ay, cx + cw - 1, (uint8_t)(ay + 8), C_DKGRAY);
+                    tft_fill(cx, (uint8_t)ay, cx+cw-1, (uint8_t)(ay+8), C_DKGRAY);
                 int llen = (int)strlen(act_lbl[a]);
-                tft_text(act_lbl[a], cx + (cw - llen * 6) / 2, ay, fg, bg, 1);
+                tft_text(act_lbl[a], cx + (cw - llen*6)/2, ay, fg, bg, 1);
             }
         } else if (s_preset_valid[i]) {
             preset_t *p = &s_presets[i];
-            uint16_t fc = sel ? C_CYAN : C_LTGRAY;
+            uint16_t fc = sel ? C_ORANGE : C_LTGRAY;
 
             // Mini wave glyph (20×12, centered)
             int gx0 = cx + (cw - 20) / 2;
-            ui_draw_wave_glyph(p->wave_id, gx0, body_top + 2, gx0 + 19, body_top + 13, fc);
+            ui_draw_wave_glyph(p->wave_id, gx0, body_top+2, gx0+19, body_top+13, fc);
 
             // Wave name (2 chars)
             const char *wname = (p->wave_id < 7) ? wn[p->wave_id] : "??";
-            tft_text(wname, cx + 2, body_top + 16, fc, C_BLACK, 1);
+            tft_text(wname, cx+2, body_top+16, fc, C_BLACK, 1);
 
             // Filter cutoff summary
-            float fc_hz = fminf(13.0f * powf(2.0f, 0.0938f * ((p->flt_cut / 10000.0f) * 127.0f)), 12000.0f);
+            float fc_hz = fminf(13.0f*powf(2.0f,0.0938f*((p->flt_cut/10000.0f)*127.0f)),12000.0f);
             char fstr[6];
             snprintf(fstr, sizeof(fstr), fc_hz >= 1000.0f ? "F%uK" : "F%u",
-                     fc_hz >= 1000.0f ? (unsigned)(fc_hz / 1000.0f + 0.5f) : (unsigned)fc_hz);
-            tft_text(fstr, cx + 2, body_top + 26, fc, C_BLACK, 1);
+                     fc_hz >= 1000.0f ? (unsigned)(fc_hz/1000.0f+0.5f) : (unsigned)fc_hz);
+            tft_text(fstr, cx+2, body_top+26, fc, C_BLACK, 1);
 
             // Attack summary
-            uint32_t atk = (uint32_t)(2.0f + (p->env_atk / 10000.0f) * 1998.0f);
+            uint32_t atk = (uint32_t)(2.0f + (p->env_atk/10000.0f)*1998.0f);
             char astr[6];
             snprintf(astr, sizeof(astr), atk >= 1000 ? "A%uK" : "A%u",
-                     (unsigned)(atk >= 1000 ? atk / 1000 : atk));
-            tft_text(astr, cx + 26, body_top + 26, fc, C_BLACK, 1);
+                     (unsigned)(atk >= 1000 ? atk/1000 : atk));
+            tft_text(astr, cx+26, body_top+26, fc, C_BLACK, 1);
         } else {
-            // Empty slot
-            tft_text("----", cx + (cw - 4 * 6) / 2, body_top + 16, C_DKGRAY, C_BLACK, 1);
+            tft_text("----", cx+(cw-4*6)/2, body_top+16, C_DKGRAY, C_BLACK, 1);
         }
     }
 }
 
 // ---- MAIN card — 5 Spark-style columns ----------------------
 
-// Filled vertical bar: x0..x1 wide, y_top..y_bot tall, filled from bottom by val (0..10000).
+// Thin vertical bar (3px): left/right edges drawn as 1px track lines, fill from bottom.
 static void ui_vbar(int x0, int x1, int y_top, int y_bot, uint16_t val, uint16_t col)
 {
-    int h   = y_bot - y_top;
-    int fh  = (int)((long)val * h / 10000);
-    int fy  = y_bot - fh;
-    tft_fill((uint8_t)x0, (uint8_t)y_top, (uint8_t)x1, (uint8_t)(fy > y_top ? fy-1 : y_top), C_DKGRAY);
+    int h  = y_bot - y_top;
+    int fh = (int)((long)val * h / 10000);
+    int fy = y_bot - fh;
+    // Clear column, draw 1px track lines
+    tft_fill((uint8_t)x0, (uint8_t)y_top, (uint8_t)x1, (uint8_t)y_bot, C_BLACK);
+    tft_fill((uint8_t)x0, (uint8_t)y_top, (uint8_t)x0, (uint8_t)y_bot, C_DKGRAY);
+    tft_fill((uint8_t)x1, (uint8_t)y_top, (uint8_t)x1, (uint8_t)y_bot, C_DKGRAY);
     if (fh > 0)
         tft_fill((uint8_t)x0, (uint8_t)fy, (uint8_t)x1, (uint8_t)y_bot, col);
 }
 
 // ENV column: ADSR envelope shape + value text.
-// col_x=0..30.  bar_top/bot = drawing area vertical bounds.
-static void ui_draw_col_env(int cx, bool editing)
+static void ui_draw_col_env(int cx, bool is_col, bool editing)
 {
     int x0 = cx + 2, bot = 100, top = 36;
     int h = bot - top;
@@ -560,8 +655,8 @@ static void ui_draw_col_env(int cx, bool editing)
     int sust_y = bot - (int)((long)s_main_adsr[2] * h / 10000);
     if (sust_y < top + 2) sust_y = top + 2;
 
-    // Each segment: CYAN if selected-and-editing, dim if editing-but-other, else green
-    #define ECOL(sub) (editing ? (s_main_sub == (sub) ? C_CYAN : C_DKGRAY) : C_GREEN)
+    // Each segment: yellow if editing-active, orange if selected, dim if not selected
+    #define ECOL(sub) (editing ? (s_main_sub==(sub) ? C_YELLOW : C_DKGRAY) : (is_col ? C_ORANGE : C_DKGRAY))
     int xa = x0 + A_w, xd = xa + D_w, xs = xd + S_w, xr = xs + R_w;
     tft_line(x0, bot, xa,  top,   ECOL(0));
     tft_line(xa, top, xd,  sust_y, ECOL(1));
@@ -581,37 +676,37 @@ static void ui_draw_col_env(int cx, bool editing)
     }
     char buf[8];
     snprintf(buf, sizeof(buf), "%s:%-4" PRIu32, lbl[vi], val);
-    tft_text(buf, cx + 1, 104, editing ? C_CYAN : C_LTGRAY, C_BLACK, 1);
+    tft_text(buf, cx + 1, 104, editing ? C_YELLOW : (is_col ? C_ORANGE : C_DKGRAY), C_BLACK, 1);
 }
 
 // Two-bar column (for FLT, LFO, ECH).
 static void ui_draw_two_bars(int cx, int cw,
                               uint16_t v0, uint16_t v1,
                               const char *l0, const char *l1,
-                              int sub0, int sub1, bool editing, int cur_sub)
+                              int sub0, int sub1, bool is_col, bool editing, int cur_sub)
 {
     int bar_top = 44, bar_bot = 116;
-    int bw = 8, gap = 3;
+    int bw = 4, gap = 6;  // thinner bars
     int bx0 = cx + (cw - (bw + gap + bw)) / 2;
     int bx1 = bx0 + bw + gap;
 
-    uint16_t c0 = editing ? (cur_sub == sub0 ? C_CYAN : C_DKGRAY) : C_GREEN;
-    uint16_t c1 = editing ? (cur_sub == sub1 ? C_CYAN : C_DKGRAY) : C_GREEN;
-    ui_vbar(bx0, bx0 + bw - 1, bar_top, bar_bot, v0, c0);
-    ui_vbar(bx1, bx1 + bw - 1, bar_top, bar_bot, v1, c1);
-    tft_text(l0, bx0 + 1, bar_bot + 2, c0, C_BLACK, 1);
-    tft_text(l1, bx1 + 1, bar_bot + 2, c1, C_BLACK, 1);
+    uint16_t c0 = editing ? (cur_sub==sub0 ? C_YELLOW : C_DKGRAY) : (is_col ? C_ORANGE : C_DKGRAY);
+    uint16_t c1 = editing ? (cur_sub==sub1 ? C_YELLOW : C_DKGRAY) : (is_col ? C_ORANGE : C_DKGRAY);
+    ui_vbar(bx0, bx0+bw-1, bar_top, bar_bot, v0, c0);
+    ui_vbar(bx1, bx1+bw-1, bar_top, bar_bot, v1, c1);
+    tft_text(l0, bx0+1, bar_bot+2, c0, C_BLACK, 1);
+    tft_text(l1, bx1+1, bar_bot+2, c1, C_BLACK, 1);
 }
 
 // Single-bar column (for GLD).
-static void ui_draw_one_bar(int cx, int cw, uint16_t val, const char *lbl, bool editing)
+static void ui_draw_one_bar(int cx, int cw, uint16_t val, const char *lbl, bool is_col, bool editing)
 {
     int bar_top = 44, bar_bot = 116;
-    int bw = 8;
+    int bw = 4;  // thinner bar
     int bx = cx + (cw - bw) / 2;
-    uint16_t col = editing ? C_CYAN : C_GREEN;
-    ui_vbar(bx, bx + bw - 1, bar_top, bar_bot, val, col);
-    tft_text(lbl, bx + 1, bar_bot + 2, col, C_BLACK, 1);
+    uint16_t col = editing ? C_YELLOW : (is_col ? C_ORANGE : C_DKGRAY);
+    ui_vbar(bx, bx+bw-1, bar_top, bar_bot, val, col);
+    tft_text(lbl, bx+1, bar_bot+2, col, C_BLACK, 1);
 }
 
 static void ui_draw_main(void)
@@ -633,82 +728,134 @@ static void ui_draw_main(void)
     for (int c = 0; c < 5; c++) {
         bool is_col = (c == s_main_col);
         bool editing = is_col && s_main_editing;
-        uint16_t hbg = is_col ? C_YELLOW : C_DKGRAY;
-        uint16_t hfg = is_col ? C_BLACK  : C_WHITE;
         int cx = cxs[c], cw = cws[c];
 
-        // Column header y=22..31
-        tft_fill(cx, 22, cx + cw - 1, 31, hbg);
-        int tx = cx + (cw - 3 * 6) / 2;
-        tft_text(hdr[c], tx, 23, hfg, hbg, 1);
+        // Column header y=22..31 — no fill, orange text + 2px underline for selected
+        tft_fill(cx, 22, cx+cw-1, 33, C_BLACK);
+        int tx = cx + (cw - 3*6) / 2;
+        tft_text(hdr[c], tx, 23, is_col ? C_ORANGE : C_DKGRAY, C_BLACK, 1);
+        if (is_col)
+            tft_fill(cx, 31, cx+cw-1, 32, C_ORANGE);
 
-        // Column body y=32..127
+        // Column body y=33..127
         switch (c) {
         case 0: // ENV
-            ui_draw_col_env(cx, editing);
+            ui_draw_col_env(cx, is_col, editing);
             break;
         case 1: { // FLT
-            // Filter type label (sub=2 = TYPE)
             bool type_sel = editing && s_main_sub == 2;
-            uint16_t tc = type_sel ? C_CYAN : (editing ? C_DKGRAY : C_LTGRAY);
-            tft_text(flt_type_lbl[s_main_flt_type], cx + 2, 33, tc, C_BLACK, 1);
-            ui_draw_two_bars(cx, cw, s_main_flt_cut, s_main_flt_res, "F", "Q", 0, 1, editing, s_main_sub);
+            uint16_t tc = type_sel ? C_YELLOW : (editing ? C_DKGRAY : (is_col ? C_ORANGE : C_DKGRAY));
+            tft_text(flt_type_lbl[s_main_flt_type], cx+2, 34, tc, C_BLACK, 1);
+            ui_draw_two_bars(cx, cw, s_main_flt_cut, s_main_flt_res, "F", "Q", 0, 1, is_col, editing, s_main_sub);
             break;
         }
         case 2: // LFO
-            ui_draw_two_bars(cx, cw, s_main_lfo_rate, s_main_lfo_depth, "R", "D", 0, 1, editing, s_main_sub);
+            ui_draw_two_bars(cx, cw, s_main_lfo_rate, s_main_lfo_depth, "R", "D", 0, 1, is_col, editing, s_main_sub);
             break;
         case 3: // ECH
-            ui_draw_two_bars(cx, cw, s_main_ech_amt, s_main_ech_fb, "A", "F", 0, 1, editing, s_main_sub);
+            ui_draw_two_bars(cx, cw, s_main_ech_amt, s_main_ech_fb, "A", "F", 0, 1, is_col, editing, s_main_sub);
             break;
         case 4: // GLD
-            ui_draw_one_bar(cx, cw, s_main_gld, "G", editing);
+            ui_draw_one_bar(cx, cw, s_main_gld, "G", is_col, editing);
             break;
         }
     }
 }
 
 // ---- CALIBRATION --------------------------------------------
+// Overview: 10 live bar columns (50 ms refresh), encoder selects pad, short press → edit.
+// Edit:     full-screen single-pad with RAW/BASE/THR and horizontal bar (preserved).
 static void ui_draw_calib(void)
 {
     tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
 
-    // Pad label (in ribbon-adjacent area, y=24)
-    char hdr[12];
-    if (s_cal_pad < TOUCH_NOTE_PADS)
-        snprintf(hdr, sizeof(hdr), "PAD %u", (uint8_t)(s_cal_pad + 1));
-    else
-        snprintf(hdr, sizeof(hdr), s_cal_pad == TOUCH_NOTE_PADS ? "OCT-" : "OCT+");
-    tft_text(hdr, 4, 24, s_cal_editing ? C_CYAN : C_YELLOW, C_BLACK, 2);
+    if (s_cal_editing) {
+        // ── Single-pad edit ─────────────────────────────────────
+        char phdr[12];
+        if (s_cal_pad < TOUCH_NOTE_PADS)
+            snprintf(phdr, sizeof(phdr), "PAD %u", (uint8_t)(s_cal_pad+1));
+        else
+            snprintf(phdr, sizeof(phdr), s_cal_pad == TOUCH_NOTE_PADS ? "OCT-" : "OCT+");
+        tft_text_bold(phdr, 4, 24, C_ORANGE, C_BLACK, 2);
+        tft_fill(0, 42, TFT_W-1, 43, C_LTGRAY);
 
-    uint16_t raw  = touch_telemetry_get_raw((uint8_t)s_cal_pad);
-    uint16_t base = touch_telemetry_get_baseline((uint8_t)s_cal_pad);
-    uint16_t thr  = s_cal_editing ? s_cal_thr : touch_telemetry_get_threshold((uint8_t)s_cal_pad);
+        uint16_t raw  = touch_telemetry_get_raw((uint8_t)s_cal_pad);
+        uint16_t base = touch_telemetry_get_baseline((uint8_t)s_cal_pad);
+        uint16_t thr  = s_cal_thr;
 
-    char buf[16];
-    snprintf(buf, sizeof(buf), "RAW  %5u", (unsigned)raw);
-    tft_text(buf, 4, 44, C_WHITE, C_BLACK, 2);
-    snprintf(buf, sizeof(buf), "BASE %5u", (unsigned)base);
-    tft_text(buf, 4, 60, C_LTGRAY, C_BLACK, 2);
-    snprintf(buf, sizeof(buf), "THR  %5u", (unsigned)thr);
-    tft_text(buf, 4, 76, s_cal_editing ? C_YELLOW : C_GREEN, C_BLACK, 2);
+        // Large horizontal bar (x=4..155, y=54..88, 34px tall)
+        int bx0=4, bx1=TFT_W-5, by0=54, by1=88, blen=bx1-bx0;
+        // Use delta from baseline (not absolute raw) — absolute values are ~60000+
+        uint32_t dv = (raw >= base) ? (uint32_t)(raw - base) : (uint32_t)(base - raw);
+        // Fixed scale = base/8 so threshold marker position reflects actual thr value
+        uint32_t scale = (uint32_t)base / 8;
+        if (scale < 2000) scale = 2000;
+        int raw_x = (int)(dv  * blen / scale); if (raw_x > blen) raw_x = blen;
+        int thr_x = (int)((uint32_t)thr * blen / scale); if (thr_x > blen) thr_x = blen;
+        // Bar track (light gray)
+        tft_fill(bx0, by0, bx1, by1, C_LTGRAY);
+        // Delta fill — green when touching, dark gray otherwise
+        bool active_touch = (thr > 0 && dv > (uint32_t)thr);
+        if (raw_x > 0)
+            tft_fill(bx0, by0, bx0+raw_x, by1, active_touch ? C_GREEN : C_DKGRAY);
+        // Threshold marker: orange 2px vertical line at thr position (moves with encoder)
+        int tx = bx0 + thr_x;
+        tft_fill(tx, by0-4, tx+1, by1+4, C_ORANGE);
 
-    // Bar: raw progress toward threshold
-    uint32_t ceil_val = (uint32_t)thr * 4;
-    int bar_w = (ceil_val > 0 && raw < ceil_val)
-                ? (int)(((uint32_t)raw * (TFT_W-8)) / ceil_val)
-                : (TFT_W-8);
-    tft_fill(4, 94, 4+bar_w, 104, C_GREEN);
-    if (4+bar_w < TFT_W-4)
-        tft_fill(4+bar_w, 94, TFT_W-5, 104, C_DKGRAY);
-    int mx = 4 + (TFT_W-8)/4;
-    if (mx < TFT_W-2) tft_fill(mx, 89, mx+1, 109, C_RED);
+        // Values (scale-1 for clean compact layout)
+        char buf[20];
+        snprintf(buf, sizeof(buf), "RAW  %5u", (unsigned)raw);
+        tft_text(buf, 4, 96, C_WHITE, C_BLACK, 1);
+        snprintf(buf, sizeof(buf), "BASE %5u", (unsigned)base);
+        tft_text(buf, 4, 106, C_LTGRAY, C_BLACK, 1);
+        snprintf(buf, sizeof(buf), "THR  %5u", (unsigned)thr);
+        tft_text(buf, 86, 96, C_ORANGE, C_BLACK, 1);
 
-    tft_fill(0, 112, TFT_W-1, 113, C_DKGRAY);
-    if (s_cal_editing)
-        tft_text("BTN:SAVE  HOLD:BACK", 2, 116, C_DKGRAY, C_BLACK, 1);
-    else
-        tft_text("ROT:PADS  BTN:EDIT ", 2, 116, C_DKGRAY, C_BLACK, 1);
+        tft_fill(0, 117, TFT_W-1, 118, C_LTGRAY);
+        tft_text("ROT:THR  BTN:SAVE  HLD:BACK", 2, 121, C_LTGRAY, C_BLACK, 1);
+        return;
+    }
+
+    // ── Overview: 10 static bars showing stored threshold level ──
+    // 10 cols × (12px bar + 2px gap) − 1 gap = 138px → x_start = 11
+    const int bar_w = 12, bar_gap = 2;
+    const int x_start = (TFT_W - (TOUCH_TOTAL_PADS*(bar_w+bar_gap) - bar_gap)) / 2;
+    const int y_top = 28, y_bot = 108, bar_h = y_bot - y_top;
+
+    // Normalize bars to the largest threshold set across all pads
+    uint16_t max_thr = 1;
+    for (int p = 0; p < TOUCH_TOTAL_PADS; p++) {
+        uint16_t t = touch_telemetry_get_threshold((uint8_t)p);
+        if (t > max_thr) max_thr = t;
+    }
+
+    for (int p = 0; p < TOUCH_TOTAL_PADS; p++) {
+        int bx = x_start + p*(bar_w+bar_gap);
+        bool sel = (p == s_cal_pad);
+        uint16_t thr = touch_telemetry_get_threshold((uint8_t)p);
+
+        // Track line on black background
+        tft_fill(bx, y_top, bx+bar_w-1, y_bot, C_BLACK);
+        tft_fill(bx+bar_w/2, y_top, bx+bar_w/2, y_bot, C_DKGRAY);
+
+        // Static bar: height = threshold / max_threshold
+        int fh = (int)((uint32_t)thr * bar_h / max_thr);
+        if (fh > 0)
+            tft_fill(bx, y_bot-fh, bx+bar_w-1, y_bot, sel ? C_ORANGE : C_LTGRAY);
+
+        // Selected: orange rounded outline
+        if (sel)
+            tft_rrect(bx-1, y_top-1, bx+bar_w, y_bot+1, C_ORANGE);
+
+        // Label below bar (1..8 for note pads, - / + for OCT)
+        char lbl[2]; lbl[1] = 0;
+        lbl[0] = (p < TOUCH_NOTE_PADS) ? (char)('1'+p)
+                                        : (p == TOUCH_NOTE_PADS ? '-' : '+');
+        tft_text(lbl, bx+(bar_w-6)/2, y_bot+2, sel ? C_ORANGE : C_DKGRAY, C_BLACK, 1);
+    }
+
+    tft_fill(0, 119, TFT_W-1, 120, C_DKGRAY);
+    tft_text("ROT:SEL  BTN:EDIT  HLD:BACK", 2, 122, C_DKGRAY, C_BLACK, 1);
 }
 
 // ---- EFFECTS (legacy — now superseded by UI_MAIN columns) ---
@@ -936,15 +1083,19 @@ void ui_init(void)
     };
     gpio_config(&pins);
     tft_init();
+    // Pre-load preset validity so the PRST squares in the cards view are correct on first draw
+    for (int i = 0; i < PRESET_COUNT; i++)
+        preset_nvs_load(i);
     ui_redraw();
 }
 
 // Called from main loop every ~20 ms.
 // delta: encoder steps since last call (signed).
-// short_press / long_press: button event flags (at most one true per call).
-void ui_tick(int delta, bool short_press, bool long_press)
+// short_press / long_press / vlong_press: button event flags (at most one true per call).
+// vlong_press (3.5 s hold): cycles looper state when in UI_CARDS.
+void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
 {
-    bool changed = (delta != 0) || short_press || long_press;
+    bool changed = (delta != 0) || short_press || long_press || vlong_press;
 
     switch (s_sec) {
 
@@ -959,6 +1110,14 @@ void ui_tick(int delta, bool short_press, bool long_press)
                 case 1: ui_enter(UI_PRESETS); break;
                 case 2: ui_enter(UI_CALIB);   break;
             }
+        }
+        if (long_press) {
+            looper_cycle(); // IDLE→REC→PLAY→OD→PLAY→...
+            s_dirty = true;
+        }
+        if (vlong_press) {
+            looper_clear(); // 3.5 s hold — stop and clear loop
+            s_dirty = true;
         }
         break;
 
@@ -1163,7 +1322,7 @@ void ui_tick(int delta, bool short_press, bool long_press)
     // Timed refresh only for CALIB — RAW/BASE update from hardware without user input
     static TickType_t last_refresh = 0;
     TickType_t now = xTaskGetTickCount();
-    if (s_sec == UI_CALIB && !changed && (now - last_refresh) >= pdMS_TO_TICKS(50)) {
+    if (s_sec == UI_CALIB && s_cal_editing && !changed && (now - last_refresh) >= pdMS_TO_TICKS(50)) {
         s_dirty      = true;
         last_refresh = now;
     }

@@ -6,6 +6,7 @@
 #include "nvs_flash.h"
 #include "amy_engine.h"
 #include "touch_telemetry.h"
+#include "looper.h"
 #include "ui.h"
 
 static const char *TAG = "Synthewi";
@@ -98,6 +99,7 @@ void app_main(void)
     }
 
     amy_engine_init();
+    looper_init(); // allocates remaining PSRAM after AMY echo buffer
 
     touch_telemetry_set_event_cb(on_touch);
     err = touch_telemetry_start();
@@ -134,6 +136,7 @@ void app_main(void)
     int32_t last_steps        = 0;
     bool    btn_pending       = false;
     bool    long_fired        = false;
+    bool    vlong_fired       = false;
     int64_t btn_start_us      = 0;
     int64_t btn_dispatch_us   = 0; // time of last dispatched press (short or long)
     uint8_t lever_wave        = 0xFF; // sentinel: force apply on first tick
@@ -161,12 +164,13 @@ void app_main(void)
         if (delta) last_steps = steps;
 
         // Gather button events as flags (one ui_tick call at end of loop)
-        bool short_press = false, long_press = false;
+        bool short_press = false, long_press = false, vlong_press = false;
         if (s_btn_flag && !btn_pending) {
             s_btn_flag = 0;
             if (esp_timer_get_time() - btn_dispatch_us >= 400000) {
                 btn_pending  = true;
                 long_fired   = false;
+                vlong_fired  = false;
                 btn_start_us = s_btn_press_us;
             }
         }
@@ -177,18 +181,24 @@ void app_main(void)
                 btn_dispatch_us = esp_timer_get_time();
                 long_press      = true;
             }
+            if (!vlong_fired && held >= 3500000) {
+                vlong_fired     = true;
+                btn_dispatch_us = esp_timer_get_time();
+                vlong_press     = true;
+            }
             if (gpio_get_level(ENC_SW) == 1) {
                 btn_pending = false;
-                if (!long_fired) {
+                if (!long_fired && !vlong_fired) {
                     btn_dispatch_us = esp_timer_get_time();
                     short_press     = true;
                 }
-                long_fired = false;
+                long_fired  = false;
+                vlong_fired = false;
             }
         }
 
         // Single ui_tick per loop — always called so dirty flag and timed refresh work
-        ui_tick(delta, short_press, long_press);
+        ui_tick(delta, short_press, long_press, vlong_press);
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }

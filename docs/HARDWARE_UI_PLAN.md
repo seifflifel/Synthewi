@@ -84,6 +84,21 @@ CD4067BE pin 21 (B, bit 1)  → GPIO 13
 CD4067BE pin 22 (C, bit 2)  → GPIO 14
 CD4067BE pin 18 (Z, common) → GPIO 11  ← ADC2 CH0, analog read
 ```
+        ┌──── notch ────┐
+Pin 1  →│               │← Pin 24  (VDD → 3.3V)
+Pin 2  →│               │← Pin 23  (D   → GND)
+Pin 3  →│               │← Pin 22  (C   → GPIO 14)
+Pin 4  →│               │← Pin 21  (B   → GPIO 13)
+Pin 5  →│               │← Pin 20  (A   → GPIO 12)
+Pin 6  →│               │← Pin 19  (INH → GND)
+Pin 7  →│               │← Pin 18  (COM → GPIO 11)
+Pin 8  →│               │← Pin 17
+Pin 9  →│               │← Pin 16
+Pin 10 →│               │← Pin 15
+Pin 11 →│               │← Pin 14
+Pin 12 →│               │← Pin 13
+        └───────────────┘
+          (VEE → GND)
 
 Bypass cap: 100 nF ceramic between VDD (pin 24) and GND (pin 12), placed close to chip.
 
@@ -293,15 +308,27 @@ Each bar: A small horizontal line marks the threshold level.
 
 ---
 
-## Looper (after hardware phase)
+## Looper ✓ implemented
 
-- ~1.74 MB PSRAM free (~9.9 s mono at 44100 Hz)
-- Buffer: `float* loop_buf` allocated via `heap_caps_malloc(MALLOC_CAP_SPIRAM)`
-- States: IDLE → ARM → RECORD → PLAY → OVERDUB → STOP
-- Trigger: dedicated button (long-press on OCT DOWN for now, migrate to hardware button later)
-- Record: intercept `amy_engine_note_on/off` calls, timestamp them into an event list
-- Playback: replay event list via a FreeRTOS timer task on Core 1
-- Display: loop status shown in ribbon bar right side when active (`LOOP REC`, `LOOP PLAY`)
+**Approach:** PCM audio buffer in PSRAM (Option A — raw samples, not event list). Intercepts AMY's audio block between `amy_fill_buffer()` and `i2s_channel_write()` via a weak-symbol hook `amy_audio_block_hook()` in `third_party/amy/src/i2s.c`. No changes to AMY core.
+
+**Component:** `components/looper/` — `looper.h` / `looper.c` / `CMakeLists.txt`
+
+**Buffer:** mono int16, allocated from PSRAM at boot via `heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)` minus 64 KB headroom. At 48 kHz: ~19 s typical.
+
+**State machine:** IDLE → RECORDING → PLAYING → OVERDUB → PLAYING → ...
+
+**Controls (from UI_CARDS view only):**
+- Long press (0.8 s): cycle state forward (IDLE→REC, REC→PLAY, PLAY→OD, OD→PLAY)
+- Very long press (3.5 s): `looper_clear()` → back to IDLE regardless of state
+
+**Display:** 5×5 coloured dot in ribbon bar top-right corner — red=REC, green=PLAY, yellow=OD, invisible=IDLE.
+
+**Audio processing (Core 0, in AMY fill-buffer task):**
+- RECORDING: store mono mix of live stereo into `s_buf[s_pos++]`
+- PLAYING: add `s_buf[pos]` to both output channels (clamp16)
+- OVERDUB: bake live mono into loop buffer (additive, clamp16), then add to output
+- Auto-stops recording and switches to PLAYING when buffer is full
 
 ---
 
@@ -313,6 +340,6 @@ Each bar: A small horizontal line marks the threshold level.
 4. [x] MAIN screen content (Spark-style 5 columns: ENV / FLT / LFO / ECH / GLD)
 5. [x] PRESETS card (6 NVS slots, 2×3 grid, LOAD / SAVE / CLR actions)
 6. [ ] CALIB card redesign (8 pad columns + 2 oct columns, 50 ms refresh)
-7. [ ] Looper (PSRAM event-based record/playback)
+7. [x] Looper (PCM PSRAM buffer, weak hook in i2s.c, ribbon dot indicator)
 8. [ ] MUX + pots (CD4067BE wired — see section 1C)
 
