@@ -31,3 +31,17 @@ env/
 /web/
 AMY_SPARK_SYNTH_ANALYSIS.md
 ESP32S3_SYNTH_ARCHITECTURE_AND_CLAUDE_PROMPTS.md
+
+# 3D model assets and project report (local only)
+3d Model/
+Rapport/
+Synthewi_Report.tex
+Synthewi_Report.log
+Synthewi_Report.pdf
+*.aux
+*.bcf
+*.out
+*.run.xml
+*.synctex.gz
+*.tdo
+*.toc
