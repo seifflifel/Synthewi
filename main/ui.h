@@ -13,6 +13,7 @@
 #include "touch_telemetry.h"
 #include "amy_engine.h"
 #include "looper.h"
+#include "mux_pots.h"
 
 // ── TFT hardware pins ────────────────────────────────────────
 #define TFT_SCLK  GPIO_NUM_36
@@ -236,22 +237,27 @@ static bool         s_dirty    = true;
 static int  s_octave_shift = 0;
 static bool s_pad_active[TOUCH_NOTE_PADS] = {false};
 
-// MAIN card columns: ENV FLT LFO ECH GLD
-static int      s_main_col     = 0;
-static bool     s_main_editing = false;
-static int      s_main_sub     = 0;   // sub-param within column
-static uint16_t s_main_adsr[4];       // 0=A 1=D 2=S 3=R  (0..10000)
+// MAIN 6-card overview + per-card edit
+static int      s_main_card    = 0;    // 0-5: selected card in overview
+static bool     s_main_in_card = false; // false=overview, true=card edit
+static int      s_main_param   = 0;    // param index within card edit
+// Param counts per card: ENV FLT EG1 LFO ECH GLD
+static const int s_card_param_max[6] = {4, 3, 2, 2, 3, 1};
+// Mirror of engine state for display (loaded on enter, pot-synced in overview)
+static uint16_t s_main_adsr[4];        // 0=A 1=D 2=S 3=R
 static uint16_t s_main_flt_cut;
 static uint16_t s_main_flt_res;
-static uint8_t  s_main_flt_type;      // 0=LPF 1=BPF 2=HPF
+static uint8_t  s_main_flt_type;       // 0=LPF 1=BPF 2=HPF
 static uint16_t s_main_lfo_rate;
 static uint16_t s_main_lfo_depth;
 static uint16_t s_main_ech_amt;
 static uint16_t s_main_ech_fb;
+static uint16_t s_main_ech_dly;
+static uint16_t s_main_eg1_depth;
+static uint16_t s_main_eg1_decay;
 static uint16_t s_main_gld;
-
-// sub-param counts per column
-static const int s_main_sub_max[5] = {4, 3, 2, 2, 1};
+// Echo delay snap values (0-10000 → 1/16, 1/8, 1/6, 1/4, 1/3, 1/2 second)
+static const uint16_t s_echo_delay_snaps[6] = {277, 1667, 2593, 4444, 6296, 10000};
 
 static inline uint16_t u16clamp(int v) { return (uint16_t)(v < 0 ? 0 : v > 10000 ? 10000 : v); }
 
@@ -276,6 +282,9 @@ typedef struct __attribute__((packed)) {
     uint16_t ech_amt;
     uint16_t ech_fb;
     uint16_t gld;
+    uint16_t eg1_depth;
+    uint16_t eg1_decay;
+    uint16_t ech_dly;
 } preset_t;
 
 static preset_t s_presets[PRESET_COUNT];
@@ -304,10 +313,35 @@ static bool     s_adsr_editing = false;
 static uint16_t s_adsr[4];           // loaded from engine on enter
 
 // ── ADSR display conversion ───────────────────────────────────
-static uint32_t ui_a_ms(uint16_t v)  { return (uint32_t)(2.0f  + (v/10000.0f)*1998.0f); }
-static uint32_t ui_d_ms(uint16_t v)  { return (uint32_t)(5.0f  + (v/10000.0f)*995.0f);  }
-static uint32_t ui_s_pct(uint16_t v) { return v / 100u; }
-static uint32_t ui_r_ms(uint16_t v)  { return (uint32_t)(10.0f + (v/10000.0f)*4990.0f); }
+static uint32_t ui_a_ms(uint16_t v)      { return (uint32_t)(2.0f   + (v/10000.0f)*1998.0f); }
+static uint32_t ui_d_ms(uint16_t v)      { return (uint32_t)(5.0f   + (v/10000.0f)*995.0f);  }
+static uint32_t ui_s_pct(uint16_t v)     { return v / 100u; }
+static uint32_t ui_r_ms(uint16_t v)      { return (uint32_t)(10.0f  + (v/10000.0f)*4990.0f); }
+static float    ui_filter_hz(uint16_t v) { return fminf(200.0f * powf(2.0f, 5.9f * (v/10000.0f)), 12000.0f); }
+static float    ui_filter_q(uint16_t v)  { return 0.7f  * powf(2.0f, 4.0f * (v/10000.0f)); }
+static float    ui_lfo_hz(uint16_t v)    { return fmaxf(0.6f*powf(2.0f,0.04f*((v/10000.0f)*127.0f))-0.1f,0.001f); }
+static uint32_t ui_eg1_decay_ms(uint16_t v) { return (uint32_t)(5.0f + (v/10000.0f)*1995.0f); }
+static uint32_t ui_glide_ms(uint16_t v)  { return (uint32_t)((v/10000.0f)*500.0f); }
+
+// Returns fraction string for echo delay (0-10000 scale, snapped to nearest 1/x of a second).
+static const char* ui_echo_frac(uint16_t v) {
+    if (v <  978) return "1/16";
+    if (v < 2133) return "1/8";
+    if (v < 3511) return "1/6";
+    if (v < 5378) return "1/4";
+    if (v < 8156) return "1/3";
+    return "1/2";
+}
+
+// Nearest echo delay snap index (for encoder step-through).
+static int echo_snap_idx(uint16_t v) {
+    int best = 0, best_d = abs((int)v - (int)s_echo_delay_snaps[0]);
+    for (int i = 1; i < 6; i++) {
+        int d = abs((int)v - (int)s_echo_delay_snaps[i]);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
 
 // ── Preset helpers ────────────────────────────────────────────
 
@@ -368,9 +402,12 @@ static void preset_capture(int slot)
     p->env_rel  = st.env_release;
     p->lfo_rt   = st.lfo_rate;
     p->lfo_dp   = st.lfo_depth;
-    p->ech_amt  = st.echo_amount;
-    p->ech_fb   = st.echo_feedback;
-    p->gld      = st.glide;
+    p->ech_amt   = st.echo_amount;
+    p->ech_fb    = st.echo_feedback;
+    p->gld       = st.glide;
+    p->eg1_depth = st.filter_env_depth;
+    p->eg1_decay = st.filter_env_decay;
+    p->ech_dly   = st.echo_delay;
     s_preset_valid[slot] = true;
 }
 
@@ -384,8 +421,11 @@ static void preset_apply(int slot)
     amy_engine_set_adsr(p->env_atk, p->env_dec, p->env_sus, p->env_rel);
     amy_engine_set_lfo(p->lfo_rt, p->lfo_dp);
     amy_engine_set_echo(p->ech_amt, p->ech_fb);
+    amy_engine_set_echo_delay(p->ech_dly);
+    amy_engine_set_filter_env(p->eg1_depth, p->eg1_decay);
     amy_engine_set_glide(p->gld);
     amy_engine_save_state();
+    mux_pots_on_preset_load();  // Lock all pots to prevent jumps when pot is at different position
 }
 
 // ── Section draw functions ────────────────────────────────────
@@ -429,10 +469,13 @@ static void ui_draw_ribbon(void)
     for (int i = 0; i < TOUCH_NOTE_PADS; i++)
         tft_pad_circle(6 + i * 10, 10, s_pad_active[i]);
 
-    // Waveform glyph (x=90..110, y=3..17) — orange accent
+    // Waveform glyph (x=90..110, y=3..17) — orange; KS easter egg shows "P" for pluck
     amy_engine_state_t st;
     amy_engine_get_state(&st);
-    ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_ORANGE);
+    if (st.wave_id == AMY_ENGINE_WAVE_KS)
+        tft_text_bold("P", 95, 4, C_ORANGE, C_BLACK, 2);
+    else
+        ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_ORANGE);
 
     // Octave label — yellow when shifted, dim gray at zero
     char oct_buf[8];
@@ -499,9 +542,10 @@ static void ui_draw_cards(void)
         if (tot > avail) { Aw=Aw*avail/tot; Dw=Dw*avail/tot; Rw=Rw*avail/tot; Sw=3; }
         int sy=ey_bot-(int)((long)st.env_sustain*eh/10000);
         if (sy < ey_top+2) sy = ey_top+2;
-        int xa=ex0+Aw, xd=xa+Dw, xs=xd+Sw, xr=xs+Rw;
+        int xe=ex0+(avail-(Aw+Dw+Sw+Rw))/2;
+        int xa=xe+Aw, xd=xa+Dw, xs=xd+Sw, xr=xs+Rw;
         uint16_t ec = (s_card_cur == 0) ? C_ORANGE : C_DKGRAY;
-        tft_line(ex0, ey_bot, xa, ey_top, ec);
+        tft_line(xe, ey_bot, xa, ey_top, ec);
         tft_line(xa, ey_top, xd, sy, ec);
         tft_line(xd, sy, xs, sy, ec);
         tft_line(xs, sy, xr, ey_bot, ec);
@@ -608,7 +652,7 @@ static void ui_draw_presets(void)
             tft_text(wname, cx+2, body_top+16, fc, C_BLACK, 1);
 
             // Filter cutoff summary
-            float fc_hz = fminf(13.0f*powf(2.0f,0.0938f*((p->flt_cut/10000.0f)*127.0f)),12000.0f);
+            float fc_hz = ui_filter_hz(p->flt_cut);
             char fstr[6];
             snprintf(fstr, sizeof(fstr), fc_hz >= 1000.0f ? "F%uK" : "F%u",
                      fc_hz >= 1000.0f ? (unsigned)(fc_hz/1000.0f+0.5f) : (unsigned)fc_hz);
@@ -626,140 +670,260 @@ static void ui_draw_presets(void)
     }
 }
 
-// ---- MAIN card — 5 Spark-style columns ----------------------
+// ---- MAIN card — 6-card overview + per-card edit ----------------
 
-// Thin vertical bar (3px): left/right edges drawn as 1px track lines, fill from bottom.
+// Thin vertical bar: 1px track edges, fill from bottom.
 static void ui_vbar(int x0, int x1, int y_top, int y_bot, uint16_t val, uint16_t col)
 {
-    int h  = y_bot - y_top;
-    int fh = (int)((long)val * h / 10000);
-    int fy = y_bot - fh;
-    // Clear column, draw 1px track lines
+    int fh = (int)((long)val * (y_bot - y_top) / 10000);
     tft_fill((uint8_t)x0, (uint8_t)y_top, (uint8_t)x1, (uint8_t)y_bot, C_BLACK);
     tft_fill((uint8_t)x0, (uint8_t)y_top, (uint8_t)x0, (uint8_t)y_bot, C_DKGRAY);
     tft_fill((uint8_t)x1, (uint8_t)y_top, (uint8_t)x1, (uint8_t)y_bot, C_DKGRAY);
-    if (fh > 0)
-        tft_fill((uint8_t)x0, (uint8_t)fy, (uint8_t)x1, (uint8_t)y_bot, col);
+    if (fh > 0) tft_fill((uint8_t)x0, (uint8_t)(y_bot-fh), (uint8_t)x1, (uint8_t)y_bot, col);
 }
 
-// ENV column: ADSR envelope shape + value text.
-static void ui_draw_col_env(int cx, bool is_col, bool editing)
+// ---- 6-card overview ----------------------------------------
+static void ui_draw_main_overview(void)
 {
-    int x0 = cx + 2, bot = 100, top = 36;
-    int h = bot - top;
+    tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
 
-    int A_w = s_main_adsr[0] * 7 / 10000; if (A_w < 1) A_w = 1;
-    int D_w = s_main_adsr[1] * 7 / 10000; if (D_w < 1) D_w = 1;
-    int S_w = 4;
-    int R_w = s_main_adsr[3] * 7 / 10000; if (R_w < 1) R_w = 1;
-    int sust_y = bot - (int)((long)s_main_adsr[2] * h / 10000);
-    if (sust_y < top + 2) sust_y = top + 2;
+    // 1px dividers between cols and rows
+    tft_fill(52,  22, 52,  TFT_H-1, C_DKGRAY);
+    tft_fill(105, 22, 105, TFT_H-1, C_DKGRAY);
+    tft_fill(0,   74, TFT_W-1, 74,  C_DKGRAY);
 
-    // Each segment: yellow if editing-active, orange if selected, dim if not selected
-    #define ECOL(sub) (editing ? (s_main_sub==(sub) ? C_YELLOW : C_DKGRAY) : (is_col ? C_ORANGE : C_DKGRAY))
-    int xa = x0 + A_w, xd = xa + D_w, xs = xd + S_w, xr = xs + R_w;
-    tft_line(x0, bot, xa,  top,   ECOL(0));
-    tft_line(xa, top, xd,  sust_y, ECOL(1));
-    tft_line(xd, sust_y, xs, sust_y, ECOL(2));
-    tft_line(xs, sust_y, xr, bot,  ECOL(3));
-    #undef ECOL
+    static const int    cxs[3]  = {0, 53, 106};
+    static const int    cws[3]  = {52, 52, 53};
+    static const int    rys[2]  = {22, 75};
+    static const int    rhs[2]  = {52, 53};
+    static const char * const nm[6] = {"ENV","FLT","EG1","LFO","ECH","GLD"};
+    static const char * const flt_nm[3] = {"LPF","BPF","HPF"};
 
-    // Value label under shape
-    static const char * const lbl[4] = {"A", "D", "S", "R"};
-    int vi = editing ? s_main_sub : 0;
-    uint32_t val;
-    switch (vi) {
-        case 0: val = ui_a_ms(s_main_adsr[0]); break;
-        case 1: val = ui_d_ms(s_main_adsr[1]); break;
-        case 2: val = ui_s_pct(s_main_adsr[2]); break;
-        default: val = ui_r_ms(s_main_adsr[3]); break;
+    amy_engine_state_t st;
+    amy_engine_get_state(&st);
+
+    for (int ci = 0; ci < 6; ci++) {
+        int col = ci % 3, row = ci / 3;
+        int cx = cxs[col], cw = cws[col];
+        int ry = rys[row], rh = rhs[row];
+        bool sel = (ci == s_main_card);
+        uint16_t oc = sel ? C_ORANGE : C_DKGRAY;
+
+        tft_rrect(cx, ry, cx+cw-1, ry+rh-1, oc);
+        // Header (10px): filled orange when selected
+        tft_fill(cx+1, ry+1, cx+cw-2, ry+9, sel ? C_ORANGE : C_BLACK);
+        int tx = cx + (cw - 3*6) / 2;
+        tft_text(nm[ci], tx, ry+1, sel ? C_BLACK : C_DKGRAY, sel ? C_ORANGE : C_BLACK, 1);
+        tft_fill(cx+1, ry+10, cx+cw-2, ry+10, oc);
+
+        int bx = cx + 3;
+        int by = ry + 13;  // body start y
+
+        switch (ci) {
+        case 0: { // ENV — mini ADSR shape
+            int ex0=cx+3, ex1=cx+cw-4;
+            int ey_t=ry+15, ey_b=ry+rh-5, eh=ey_b-ey_t;
+            int Aw=(int)((long)st.env_attack *(ex1-ex0)/30000); if(Aw<1)Aw=1;
+            int Dw=(int)((long)st.env_decay  *(ex1-ex0)/30000); if(Dw<1)Dw=1;
+            int Sw=3;
+            int Rw=(int)((long)st.env_release*(ex1-ex0)/30000); if(Rw<1)Rw=1;
+            int tot=Aw+Dw+Sw+Rw, av=ex1-ex0-2;
+            if(tot>av){Aw=Aw*av/tot;Dw=Dw*av/tot;Rw=Rw*av/tot;Sw=2;}
+            int sy=ey_b-(int)((long)st.env_sustain*eh/10000);
+            if(sy<ey_t+1)sy=ey_t+1;
+            int xe=ex0+(av-(Aw+Dw+Sw+Rw))/2;
+            int xa=xe+Aw,xd=xa+Dw,xs=xd+Sw,xr=xs+Rw;
+            tft_line(xe,ey_b,xa,ey_t,oc); tft_line(xa,ey_t,xd,sy,oc);
+            tft_line(xd,sy,xs,sy,oc);     tft_line(xs,sy,xr,ey_b,oc);
+            break;
+        }
+        case 1: { // FLT — type + F + Q
+            tft_text(flt_nm[st.filter_type], bx, by, oc, C_BLACK, 1);
+            float fhz = ui_filter_hz(st.filter_cutoff);
+            char buf[16];
+            if(fhz>=1000.0f) snprintf(buf,sizeof(buf),"F%3uK",(unsigned)(fhz/1000.0f+0.5f));
+            else              snprintf(buf,sizeof(buf),"F%4u",(unsigned)fhz);
+            tft_text(buf, bx, by+9,  oc, C_BLACK, 1);
+            float fq=ui_filter_q(st.filter_resonance);
+            uint32_t qi=(uint32_t)(fq*10.0f);
+            snprintf(buf,sizeof(buf),"Q%u.%u",(unsigned)(qi/10),(unsigned)(qi%10));
+            tft_text(buf, bx, by+18, oc, C_BLACK, 1);
+            break;
+        }
+        case 2: { // EG1 — depth + decay
+            char buf[16];
+            snprintf(buf,sizeof(buf),"F%4u",(unsigned)((st.filter_env_depth/10000.0f)*8000.0f));
+            tft_text(buf, bx, by,   oc, C_BLACK, 1);
+            snprintf(buf,sizeof(buf),"D%4u",(unsigned)ui_eg1_decay_ms(st.filter_env_decay));
+            tft_text(buf, bx, by+9, oc, C_BLACK, 1);
+            break;
+        }
+        case 3: { // LFO — rate + depth
+            float rh2=ui_lfo_hz(st.lfo_rate);
+            uint32_t rh10=(uint32_t)(rh2*10.0f);
+            char buf[16];
+            snprintf(buf,sizeof(buf),"R%u.%uHZ",(unsigned)(rh10/10),(unsigned)(rh10%10));
+            tft_text(buf, bx, by,   oc, C_BLACK, 1);
+            snprintf(buf,sizeof(buf),"D%4u",(unsigned)((st.lfo_depth/10000.0f)*5000.0f));
+            tft_text(buf, bx, by+9, oc, C_BLACK, 1);
+            break;
+        }
+        case 4: { // ECHO — amount% + delay fraction
+            char buf[16];
+            snprintf(buf,sizeof(buf),"%3u%%",(unsigned)(st.echo_amount/100));
+            tft_text(buf, bx, by,   oc, C_BLACK, 1);
+            tft_text(ui_echo_frac(st.echo_delay), bx, by+9, oc, C_BLACK, 1);
+            break;
+        }
+        case 5: { // GLD — ms value
+            uint32_t ms=ui_glide_ms(st.glide);
+            char buf[16];
+            if(ms==0) snprintf(buf,sizeof(buf),"OFF");
+            else      snprintf(buf,sizeof(buf),"%3ums",(unsigned)ms);
+            int tw=(int)strlen(buf)*6;
+            tft_text(buf, cx+(cw-tw)/2, by+9, oc, C_BLACK, 1);
+            break;
+        }
+        }
     }
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%s:%-4" PRIu32, lbl[vi], val);
-    tft_text(buf, cx + 1, 104, editing ? C_YELLOW : (is_col ? C_ORANGE : C_DKGRAY), C_BLACK, 1);
 }
 
-// Two-bar column (for FLT, LFO, ECH).
-static void ui_draw_two_bars(int cx, int cw,
-                              uint16_t v0, uint16_t v1,
-                              const char *l0, const char *l1,
-                              int sub0, int sub1, bool is_col, bool editing, int cur_sub)
+// ---- Single-card edit ----------------------------------------
+static void ui_draw_main_card_edit(void)
 {
-    int bar_top = 44, bar_bot = 116;
-    int bw = 4, gap = 6;  // thinner bars
-    int bx0 = cx + (cw - (bw + gap + bw)) / 2;
-    int bx1 = bx0 + bw + gap;
+    tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
 
-    uint16_t c0 = editing ? (cur_sub==sub0 ? C_YELLOW : C_DKGRAY) : (is_col ? C_ORANGE : C_DKGRAY);
-    uint16_t c1 = editing ? (cur_sub==sub1 ? C_YELLOW : C_DKGRAY) : (is_col ? C_ORANGE : C_DKGRAY);
-    ui_vbar(bx0, bx0+bw-1, bar_top, bar_bot, v0, c0);
-    ui_vbar(bx1, bx1+bw-1, bar_top, bar_bot, v1, c1);
-    tft_text(l0, bx0+1, bar_bot+2, c0, C_BLACK, 1);
-    tft_text(l1, bx1+1, bar_bot+2, c1, C_BLACK, 1);
-}
+    static const char * const nm[6]       = {"ENV","FLT","EG1","LFO","ECH","GLD"};
+    static const char * const flt_nm[3]   = {"LPF","BPF","HPF"};
 
-// Single-bar column (for GLD).
-static void ui_draw_one_bar(int cx, int cw, uint16_t val, const char *lbl, bool is_col, bool editing)
-{
-    int bar_top = 44, bar_bot = 116;
-    int bw = 4;  // thinner bar
-    int bx = cx + (cw - bw) / 2;
-    uint16_t col = editing ? C_YELLOW : (is_col ? C_ORANGE : C_DKGRAY);
-    ui_vbar(bx, bx+bw-1, bar_top, bar_bot, val, col);
-    tft_text(lbl, bx+1, bar_bot+2, col, C_BLACK, 1);
+    tft_text_bold(nm[s_main_card], 4, 24, C_ORANGE, C_BLACK, 2);
+    tft_fill(0, 42, TFT_W-1, 43, C_LTGRAY);
+
+    int p  = s_main_param;
+    // ENV needs 4 param lines so visual is shorter; others get more visual space.
+    int vt = 46;
+    int vb = (s_main_card == 0) ? 80 : 88;
+    int py = (s_main_card == 0) ? 83 : 91;
+
+    // pc(i): yellow if current param, orange otherwise
+    #define PC(i) ((p==(i)) ? C_YELLOW : C_ORANGE)
+
+    switch (s_main_card) {
+    case 0: { // ENV — ADSR envelope shape + 4 param lines
+        int ex0=8, ex1=TFT_W-9, eh=vb-vt;
+        int Aw=(int)((long)s_main_adsr[0]*(ex1-ex0)/30000); if(Aw<1)Aw=1;
+        int Dw=(int)((long)s_main_adsr[1]*(ex1-ex0)/30000); if(Dw<1)Dw=1;
+        int Sw=5;
+        int Rw=(int)((long)s_main_adsr[3]*(ex1-ex0)/30000); if(Rw<1)Rw=1;
+        int tot=Aw+Dw+Sw+Rw, av=ex1-ex0-2;
+        if(tot>av){Aw=Aw*av/tot;Dw=Dw*av/tot;Rw=Rw*av/tot;Sw=4;}
+        int sy=vb-(int)((long)s_main_adsr[2]*eh/10000);
+        if(sy<vt+2)sy=vt+2;
+        int xa=ex0+Aw,xd=xa+Dw,xs=xd+Sw,xr=xs+Rw;
+        tft_line(ex0,vb,xa,vt,PC(0)); tft_line(xa,vt,xd,sy,PC(1));
+        tft_line(xd,sy,xs,sy,PC(2)); tft_line(xs,sy,xr,vb,PC(3));
+        char buf[16];
+        snprintf(buf,sizeof(buf),"A  %4ums",(unsigned)ui_a_ms(s_main_adsr[0]));
+        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"D  %4ums",(unsigned)ui_d_ms(s_main_adsr[1]));
+        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"S    %3u%%",(unsigned)ui_s_pct(s_main_adsr[2]));
+        tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"R  %4ums",(unsigned)ui_r_ms(s_main_adsr[3]));
+        tft_text(buf,4,py+24,PC(3),C_BLACK,1);
+        break;
+    }
+    case 1: { // FLT — type label + two bars + 3 param lines
+        tft_text(flt_nm[s_main_flt_type], 4, vt, PC(2), C_BLACK, 1);
+        int bw=5,gap=12;
+        int bx0=(TFT_W-(bw+gap+bw))/2, bx1=bx0+bw+gap;
+        ui_vbar(bx0,bx0+bw-1,vt+12,vb,s_main_flt_cut,PC(0));
+        ui_vbar(bx1,bx1+bw-1,vt+12,vb,s_main_flt_res,PC(1));
+        tft_text("F",bx0+1,vb+2,PC(0),C_BLACK,1);
+        tft_text("Q",bx1+1,vb+2,PC(1),C_BLACK,1);
+        char buf[16];
+        float fhz=ui_filter_hz(s_main_flt_cut);
+        if(fhz>=1000.0f) snprintf(buf,sizeof(buf),"F  %3uKHZ",(unsigned)(fhz/1000.0f+0.5f));
+        else              snprintf(buf,sizeof(buf),"F  %4uHZ", (unsigned)fhz);
+        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        float fq=ui_filter_q(s_main_flt_res);
+        uint32_t qi=(uint32_t)(fq*10.0f);
+        snprintf(buf,sizeof(buf),"Q  %u.%u",(unsigned)(qi/10),(unsigned)(qi%10));
+        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"TYPE  %s",flt_nm[s_main_flt_type]);
+        tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        break;
+    }
+    case 2: { // EG1 — two bars + 2 param lines
+        int bw=5,gap=14;
+        int bx0=(TFT_W-(bw+gap+bw))/2, bx1=bx0+bw+gap;
+        ui_vbar(bx0,bx0+bw-1,vt,vb,s_main_eg1_depth,PC(0));
+        ui_vbar(bx1,bx1+bw-1,vt,vb,s_main_eg1_decay, PC(1));
+        tft_text("F",bx0+1,vb+2,PC(0),C_BLACK,1);
+        tft_text("D",bx1+1,vb+2,PC(1),C_BLACK,1);
+        char buf[16];
+        snprintf(buf,sizeof(buf),"F  %4uHZ",(unsigned)((s_main_eg1_depth/10000.0f)*8000.0f));
+        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"D  %4ums",(unsigned)ui_eg1_decay_ms(s_main_eg1_decay));
+        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        break;
+    }
+    case 3: { // LFO — two bars + 2 param lines
+        int bw=5,gap=14;
+        int bx0=(TFT_W-(bw+gap+bw))/2, bx1=bx0+bw+gap;
+        ui_vbar(bx0,bx0+bw-1,vt,vb,s_main_lfo_rate, PC(0));
+        ui_vbar(bx1,bx1+bw-1,vt,vb,s_main_lfo_depth,PC(1));
+        tft_text("R",bx0+1,vb+2,PC(0),C_BLACK,1);
+        tft_text("D",bx1+1,vb+2,PC(1),C_BLACK,1);
+        char buf[16];
+        float rh=ui_lfo_hz(s_main_lfo_rate);
+        uint8_t rh_i=(uint8_t)(rh>99.0f?99.0f:rh);
+        uint8_t rh_f=(uint8_t)((unsigned)(rh*10.0f)%10);
+        snprintf(buf,sizeof(buf),"R  %u.%uHZ",rh_i,rh_f);
+        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"D  %4uHZ",(unsigned)((s_main_lfo_depth/10000.0f)*5000.0f));
+        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        break;
+    }
+    case 4: { // ECHO — two bars + fraction text + 3 param lines
+        int bw=5,gap=12;
+        int bx0=(TFT_W/2-(bw+gap/2))-4, bx1=bx0+bw+gap;
+        ui_vbar(bx0,bx0+bw-1,vt,vb,s_main_ech_amt,PC(0));
+        ui_vbar(bx1,bx1+bw-1,vt,vb,s_main_ech_fb, PC(1));
+        tft_text("A",bx0+1,vb+2,PC(0),C_BLACK,1);
+        tft_text("F",bx1+1,vb+2,PC(1),C_BLACK,1);
+        tft_text(ui_echo_frac(s_main_ech_dly), bx1+14, vt+16, PC(2), C_BLACK, 1);
+        char buf[16];
+        snprintf(buf,sizeof(buf),"AMT  %3u%%",(unsigned)(s_main_ech_amt/100));
+        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"FB   %3u%%",(unsigned)(s_main_ech_fb/100));
+        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"DLY  %s",ui_echo_frac(s_main_ech_dly));
+        tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        break;
+    }
+    case 5: { // GLD — single bar + 1 param line
+        int bx=TFT_W/2-3;
+        ui_vbar(bx,bx+5,vt,vb,s_main_gld,PC(0));
+        tft_text("G",bx+1,vb+2,PC(0),C_BLACK,1);
+        uint16_t ms=(uint16_t)ui_glide_ms(s_main_gld);
+        char buf[16];
+        if(ms==0) snprintf(buf,sizeof(buf),"GLD  OFF");
+        else      snprintf(buf,sizeof(buf),"GLD  %3ums",ms);
+        tft_text(buf,4,py,PC(0),C_BLACK,1);
+        break;
+    }
+    }
+    #undef PC
+
+    tft_fill(0, 119, TFT_W-1, 120, C_DKGRAY);
+    tft_text("ROT:ADJ  BTN:NEXT  HLD:BACK", 2, 122, C_DKGRAY, C_BLACK, 1);
 }
 
 static void ui_draw_main(void)
 {
-    tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
-
-    // Column positions: 5 cols each 31px + 1px dividers
-    static const int cxs[5] = {0, 32, 64, 96, 128};
-    static const int cws[5] = {31, 31, 31, 31, 32};
-    static const char * const hdr[5] = {"ENV", "FLT", "LFO", "ECH", "GLD"};
-    static const char * const flt_type_lbl[3] = {"LPF", "BPF", "HPF"};
-
-    // Dividers
-    tft_fill(31, 22, 31, TFT_H-1, C_DKGRAY);
-    tft_fill(63, 22, 63, TFT_H-1, C_DKGRAY);
-    tft_fill(95, 22, 95, TFT_H-1, C_DKGRAY);
-    tft_fill(127, 22, 127, TFT_H-1, C_DKGRAY);
-
-    for (int c = 0; c < 5; c++) {
-        bool is_col = (c == s_main_col);
-        bool editing = is_col && s_main_editing;
-        int cx = cxs[c], cw = cws[c];
-
-        // Column header y=22..31 — no fill, orange text + 2px underline for selected
-        tft_fill(cx, 22, cx+cw-1, 33, C_BLACK);
-        int tx = cx + (cw - 3*6) / 2;
-        tft_text(hdr[c], tx, 23, is_col ? C_ORANGE : C_DKGRAY, C_BLACK, 1);
-        if (is_col)
-            tft_fill(cx, 31, cx+cw-1, 32, C_ORANGE);
-
-        // Column body y=33..127
-        switch (c) {
-        case 0: // ENV
-            ui_draw_col_env(cx, is_col, editing);
-            break;
-        case 1: { // FLT
-            bool type_sel = editing && s_main_sub == 2;
-            uint16_t tc = type_sel ? C_YELLOW : (editing ? C_DKGRAY : (is_col ? C_ORANGE : C_DKGRAY));
-            tft_text(flt_type_lbl[s_main_flt_type], cx+2, 34, tc, C_BLACK, 1);
-            ui_draw_two_bars(cx, cw, s_main_flt_cut, s_main_flt_res, "F", "Q", 0, 1, is_col, editing, s_main_sub);
-            break;
-        }
-        case 2: // LFO
-            ui_draw_two_bars(cx, cw, s_main_lfo_rate, s_main_lfo_depth, "R", "D", 0, 1, is_col, editing, s_main_sub);
-            break;
-        case 3: // ECH
-            ui_draw_two_bars(cx, cw, s_main_ech_amt, s_main_ech_fb, "A", "F", 0, 1, is_col, editing, s_main_sub);
-            break;
-        case 4: // GLD
-            ui_draw_one_bar(cx, cw, s_main_gld, "G", is_col, editing);
-            break;
-        }
-    }
+    if (s_main_in_card) ui_draw_main_card_edit();
+    else                ui_draw_main_overview();
 }
 
 // ---- CALIBRATION --------------------------------------------
@@ -878,8 +1042,7 @@ static void ui_draw_effects(void)
                 snprintf(row, sizeof(row), "%cFLT %s", cur, s_flt_names[s_fx_flt_type]);
                 break;
             case 1: {
-                float t = s_fx_vals[0] / 10000.0f;
-                uint32_t hz = (uint32_t)fminf(13.0f * powf(2.0f, 0.0938f * (t * 127.0f)), 12000.0f);
+                uint32_t hz = (uint32_t)ui_filter_hz(s_fx_vals[0]);
                 snprintf(row, sizeof(row), "%cCUT%5u", cur, (unsigned)hz);
                 break;
             }
@@ -1008,10 +1171,13 @@ static void ui_enter(ui_section_t sec)
         s_main_lfo_depth = st.lfo_depth;
         s_main_ech_amt   = st.echo_amount;
         s_main_ech_fb    = st.echo_feedback;
+        s_main_ech_dly   = st.echo_delay;
+        s_main_eg1_depth = st.filter_env_depth;
+        s_main_eg1_decay = st.filter_env_decay;
         s_main_gld       = st.glide;
-        s_main_col       = 0;
-        s_main_editing   = false;
-        s_main_sub       = 0;
+        s_main_card      = 0;
+        s_main_in_card   = false;
+        s_main_param     = 0;
     }
     if (sec == UI_CALIB) {
         s_cal_editing = false;
@@ -1086,6 +1252,30 @@ void ui_init(void)
     // Pre-load preset validity so the PRST squares in the cards view are correct on first draw
     for (int i = 0; i < PRESET_COUNT; i++)
         preset_nvs_load(i);
+    // Factory preset: slot 6 (index 5) = KS pluck easter egg; written once to NVS if empty
+    if (!s_preset_valid[5]) {
+        preset_t *p = &s_presets[5];
+        p->magic     = PRESET_MAGIC;
+        p->wave_id   = AMY_ENGINE_WAVE_KS;
+        p->flt_type  = AMY_ENGINE_FILTER_LPF;
+        p->_pad      = 0;
+        p->flt_cut   = 8000;
+        p->flt_res   = 0;
+        p->env_atk   = 100;
+        p->env_dec   = 100;
+        p->env_sus   = 0;
+        p->env_rel   = 6000;
+        p->lfo_rt    = 2000;
+        p->lfo_dp    = 0;
+        p->ech_amt   = 2500;
+        p->ech_fb    = 2500;
+        p->gld       = 0;
+        p->eg1_depth = 0;
+        p->eg1_decay = 1000;
+        p->ech_dly   = 4444;
+        s_preset_valid[5] = true;
+        preset_nvs_save(5);
+    }
     ui_redraw();
 }
 
@@ -1122,56 +1312,108 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
         break;
 
     case UI_MAIN:
-        if (!s_main_editing) {
+        // Pot display sync — 10 Hz, overview only; triggers redraw on pot-controlled changes
+        if (!s_main_in_card) {
+            static int64_t s_pot_sync_us = 0;
+            int64_t t_now = esp_timer_get_time();
+            if (t_now - s_pot_sync_us >= 100000LL) {
+                s_pot_sync_us = t_now;
+                amy_engine_state_t st;
+                amy_engine_get_state(&st);
+                bool ch = s_main_adsr[0] != st.env_attack       ||
+                          s_main_adsr[1] != st.env_decay         ||
+                          s_main_adsr[2] != st.env_sustain       ||
+                          s_main_adsr[3] != st.env_release       ||
+                          s_main_flt_cut  != st.filter_cutoff    ||
+                          s_main_flt_res  != st.filter_resonance ||
+                          s_main_ech_amt  != st.echo_amount      ||
+                          s_main_ech_fb   != st.echo_feedback    ||
+                          s_main_gld      != st.glide;
+                s_main_adsr[0]   = st.env_attack;
+                s_main_adsr[1]   = st.env_decay;
+                s_main_adsr[2]   = st.env_sustain;
+                s_main_adsr[3]   = st.env_release;
+                s_main_flt_cut   = st.filter_cutoff;
+                s_main_flt_res   = st.filter_resonance;
+                s_main_flt_type  = st.filter_type;
+                s_main_lfo_rate  = st.lfo_rate;
+                s_main_lfo_depth = st.lfo_depth;
+                s_main_ech_amt   = st.echo_amount;
+                s_main_ech_fb    = st.echo_feedback;
+                s_main_ech_dly   = st.echo_delay;
+                s_main_eg1_depth = st.filter_env_depth;
+                s_main_eg1_decay = st.filter_env_decay;
+                s_main_gld       = st.glide;
+                if (ch) s_dirty = true;
+            }
+        }
+
+        if (!s_main_in_card) {
+            // Overview: encoder scrolls cards, short press enters card, long press → CARDS
             if (delta) {
-                s_main_col = (s_main_col + delta % 5 + 5) % 5;
-                s_main_sub = 0;
+                s_main_card = (s_main_card + delta % 6 + 6) % 6;
                 s_dirty = true;
             }
-            if (short_press) { s_main_editing = true; s_main_sub = 0; s_dirty = true; }
+            if (short_press) { s_main_in_card = true; s_main_param = 0; s_dirty = true; }
             if (long_press)  { amy_engine_save_state(); ui_enter(UI_CARDS); }
         } else {
+            // Card edit: encoder adjusts current param, short press advances (last → save+overview)
+            int p = s_main_param;
             if (delta) {
-                switch (s_main_col) {
+                switch (s_main_card) {
                 case 0: // ENV
-                    s_main_adsr[s_main_sub] = u16clamp((int)s_main_adsr[s_main_sub] + delta * 500);
-                    amy_engine_set_adsr(s_main_adsr[0], s_main_adsr[1], s_main_adsr[2], s_main_adsr[3]);
+                    s_main_adsr[p] = u16clamp((int)s_main_adsr[p] + delta * 500);
+                    amy_engine_set_adsr(s_main_adsr[0],s_main_adsr[1],s_main_adsr[2],s_main_adsr[3]);
                     break;
                 case 1: // FLT
-                    if (s_main_sub == 0) {
-                        s_main_flt_cut = u16clamp((int)s_main_flt_cut + delta * 500);
-                        amy_engine_set_filter(s_main_flt_cut, s_main_flt_res);
-                    } else if (s_main_sub == 1) {
-                        s_main_flt_res = u16clamp((int)s_main_flt_res + delta * 500);
-                        amy_engine_set_filter(s_main_flt_cut, s_main_flt_res);
-                    } else { // TYPE (sub=2): encoder cycles
-                        if (delta > 0) s_main_flt_type = (s_main_flt_type + 1) % 3;
-                        else           s_main_flt_type = (s_main_flt_type + 2) % 3;
-                        amy_engine_set_filter_type(s_main_flt_type);
-                    }
+                    if (p == 0)      { s_main_flt_cut = u16clamp((int)s_main_flt_cut + delta*500); amy_engine_set_filter(s_main_flt_cut,s_main_flt_res); }
+                    else if (p == 1) { s_main_flt_res = u16clamp((int)s_main_flt_res + delta*500); amy_engine_set_filter(s_main_flt_cut,s_main_flt_res); }
+                    else             { s_main_flt_type = (uint8_t)((s_main_flt_type + (delta>0?1:2)) % 3); amy_engine_set_filter_type(s_main_flt_type); }
                     break;
-                case 2: // LFO
-                    if (s_main_sub == 0) s_main_lfo_rate  = u16clamp((int)s_main_lfo_rate  + delta * 500);
-                    else                 s_main_lfo_depth = u16clamp((int)s_main_lfo_depth + delta * 500);
+                case 2: // EG1
+                    if (p == 0) s_main_eg1_depth = u16clamp((int)s_main_eg1_depth + delta*500);
+                    else        s_main_eg1_decay  = u16clamp((int)s_main_eg1_decay  + delta*500);
+                    amy_engine_set_filter_env(s_main_eg1_depth, s_main_eg1_decay);
+                    break;
+                case 3: // LFO
+                    if (p == 0) s_main_lfo_rate  = u16clamp((int)s_main_lfo_rate  + delta*500);
+                    else        s_main_lfo_depth = u16clamp((int)s_main_lfo_depth + delta*500);
                     amy_engine_set_lfo(s_main_lfo_rate, s_main_lfo_depth);
                     break;
-                case 3: // ECH
-                    if (s_main_sub == 0) s_main_ech_amt = u16clamp((int)s_main_ech_amt + delta * 500);
-                    else                 s_main_ech_fb  = u16clamp((int)s_main_ech_fb  + delta * 500);
-                    amy_engine_set_echo(s_main_ech_amt, s_main_ech_fb);
+                case 4: // ECHO
+                    if (p == 0)      { s_main_ech_amt = u16clamp((int)s_main_ech_amt + delta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
+                    else if (p == 1) { s_main_ech_fb  = u16clamp((int)s_main_ech_fb  + delta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
+                    else { // DLY: snap through fractions
+                        int idx = echo_snap_idx(s_main_ech_dly) + (delta > 0 ? 1 : -1);
+                        if (idx < 0) idx = 0;
+                        if (idx > 5) idx = 5;
+                        s_main_ech_dly = s_echo_delay_snaps[idx];
+                        amy_engine_set_echo_delay(s_main_ech_dly);
+                    }
                     break;
-                case 4: // GLD
-                    s_main_gld = u16clamp((int)s_main_gld + delta * 500);
+                case 5: // GLD
+                    s_main_gld = u16clamp((int)s_main_gld + delta*500);
                     amy_engine_set_glide(s_main_gld);
                     break;
                 }
                 s_dirty = true;
             }
             if (short_press) {
-                s_main_sub = (s_main_sub + 1) % s_main_sub_max[s_main_col];
+                if (s_main_param + 1 >= s_card_param_max[s_main_card]) {
+                    amy_engine_save_state();
+                    s_main_in_card = false;
+                    s_main_param   = 0;
+                } else {
+                    s_main_param++;
+                }
                 s_dirty = true;
             }
-            if (long_press) { amy_engine_save_state(); s_main_editing = false; s_dirty = true; }
+            if (long_press) {
+                amy_engine_save_state();
+                s_main_in_card = false;
+                s_main_param   = 0;
+                s_dirty        = true;
+            }
         }
         break;
 

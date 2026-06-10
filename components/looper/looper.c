@@ -7,7 +7,7 @@ static const char *TAG = "Looper";
 
 // AMY renders 48000 Hz stereo — looper captures mono int16.
 #define LOOPER_SAMPLE_RATE  48000
-#define LOOPER_PSRAM_HEADROOM  65536   // bytes kept free for other allocations
+#define LOOPER_PSRAM_HEADROOM  (150 * 1024)  // bytes kept free — must cover echo (2ch × 12000 × 2B = 48KB) + fragmentation
 
 static volatile looper_state_t s_state    = LOOPER_IDLE;
 static int16_t * volatile      s_buf      = NULL;

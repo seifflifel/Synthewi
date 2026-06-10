@@ -38,6 +38,7 @@ typedef struct {
     uint16_t reverb_decay;      // 0-10000 → liveness 0.5-0.95
     uint16_t echo_amount;       // 0-10000 → level 0.0-1.0
     uint16_t echo_feedback;     // 0-10000 → feedback 0.0-0.9
+    uint16_t echo_delay;        // 0-10000 → 50-500 ms
     uint16_t filter_cutoff;     // 0-10000 → 200-10000 Hz
     uint16_t filter_resonance;  // 0-10000 → Q 0.0-0.9
     uint16_t env_attack;        // 0-10000 → 2-2000 ms
@@ -65,6 +66,7 @@ void amy_engine_note_off(uint8_t pad);
 void amy_engine_set_wave(uint8_t wave_id);
 void amy_engine_set_reverb(uint16_t amount, uint16_t decay);
 void amy_engine_set_echo(uint16_t amount, uint16_t feedback);
+void amy_engine_set_echo_delay(uint16_t delay);               // 0-10000 → 50-500 ms
 void amy_engine_set_filter(uint16_t cutoff, uint16_t resonance);
 void amy_engine_set_filter_type(uint8_t type);                        // 0=LPF 1=BPF 2=HPF
 void amy_engine_set_filter_env(uint16_t depth, uint16_t decay);       // EG1 → filter

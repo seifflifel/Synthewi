@@ -17,7 +17,7 @@ static const char *TAG = "AMY_ENGINE";
 // ---------------------------------------------------------------------------
 // Session synth state (all uint16 params use 0-10000 scale)
 // ---------------------------------------------------------------------------
-#define NVS_SYNTH_VERSION 2  // bump when param formulas change; forces fresh defaults
+#define NVS_SYNTH_VERSION 3  // bump when param formulas change; forces fresh defaults
 
 static uint8_t  s_wave_id            = AMY_ENGINE_WAVE_SQUARE;
 static uint8_t  s_filter_type        = AMY_ENGINE_FILTER_LPF;
@@ -36,6 +36,7 @@ static uint16_t s_pressure_depth     = 0; // 0 = feature off
 static uint16_t    s_portamento         = 0; // 0 = instant (no glide)
 static uint16_t s_echo_amount        = 0;    // 0 = off
 static uint16_t s_echo_feedback      = 3000; // ~27% feedback
+static uint16_t s_echo_delay_scaled  = 5000; // 0-10000 → 50-500 ms; 5000 ≈ 275 ms
 static synth_mode_t s_mode             = SYNTH_MODE_CUSTOM;
 static uint8_t      s_patch_num        = 0;  // 0-127 within current bank
 
@@ -60,8 +61,8 @@ static bool s_initialized = false;
 
 // ---------------------------------------------------------------------------
 // Scaling helpers
-// Filter cutoff: Spark Synth (Juno) exponential — 13 Hz at min, ~20 kHz at max.
-static float    sc_filter_hz(uint16_t v)     { return fminf(13.0f * powf(2.0f, 0.0938f * ((v / 10000.0f) * 127.0f)), 12000.0f); }
+// Filter cutoff: 200 Hz at min, 12000 Hz at max (exponential, ~6 octaves).
+static float    sc_filter_hz(uint16_t v)     { return fminf(200.0f * powf(2.0f, 5.9f * (v / 10000.0f)), 12000.0f); }
 // Filter resonance: Spark Synth exponential — Q≈0.7 (flat) at 0, Q≈11 at max.
 static float    sc_filter_res(uint16_t v)    { return 0.7f  * powf(2.0f, 4.0f   *  (v / 10000.0f)); }
 // LFO rate: Juno formula — ~0.5 Hz at 0, ~20 Hz at max.
@@ -76,6 +77,7 @@ static float    sc_fenv_depth_hz(uint16_t v) { return (v / 10000.0f) * 8000.0f; 
 static uint32_t sc_fenv_decay_ms(uint16_t v) { return (uint32_t)(5.0f  + (v / 10000.0f) * 1995.0f); }
 static float    sc_ks_feedback(uint16_t v)   { return 0.85f + (v / 10000.0f) * 0.145f; }
 static uint16_t sc_portamento_ms(uint16_t v) { return (uint16_t)((v / 10000.0f) * 500.0f); }
+static float    sc_echo_delay_ms(uint16_t v) { return fmaxf(50.0f + (v / 10000.0f) * 450.0f, 10.0f); }
 
 // ---------------------------------------------------------------------------
 // NVS persistence
@@ -101,6 +103,7 @@ static void nvs_save_all(void)
     nvs_set_u16(h, "portamento",s_portamento);
     nvs_set_u16(h, "echo_amt",  s_echo_amount);
     nvs_set_u16(h, "echo_fb",   s_echo_feedback);
+    nvs_set_u16(h, "echo_dly",  s_echo_delay_scaled);
     nvs_set_u8(h,  "ver",       NVS_SYNTH_VERSION);
     nvs_commit(h);
     nvs_close(h);
@@ -133,8 +136,9 @@ static void nvs_load_all(void)
     if (nvs_get_u16(h, "chorus",   &u16) == ESP_OK) s_chorus_amount      = u16;
     if (nvs_get_u16(h, "pres_dep",  &u16) == ESP_OK) s_pressure_depth  = u16;
     if (nvs_get_u16(h, "portamento",&u16) == ESP_OK) s_portamento      = u16;
-    if (nvs_get_u16(h, "echo_amt",  &u16) == ESP_OK) s_echo_amount     = u16;
-    if (nvs_get_u16(h, "echo_fb",   &u16) == ESP_OK) s_echo_feedback   = u16;
+    if (nvs_get_u16(h, "echo_amt",  &u16) == ESP_OK) s_echo_amount        = u16;
+    if (nvs_get_u16(h, "echo_fb",   &u16) == ESP_OK) s_echo_feedback      = u16;
+    if (nvs_get_u16(h, "echo_dly",  &u16) == ESP_OK) s_echo_delay_scaled  = u16;
     nvs_close(h);
 }
 
@@ -145,12 +149,17 @@ static void setup_lfo_osc(void)
     e.osc = LFO_OSC;
     e.wave = SINE;
     e.freq_coefs[COEF_CONST] = sc_lfo_rate_hz(s_lfo_rate);
-    e.amp_coefs[COEF_CONST]  = 1.0f;  // normalized — depth scaled by COEF_MOD on voice oscs
-    e.amp_coefs[COEF_EG0]    = 0.0f;  // disable EG0 so amplitude never gates to 0
-    e.amp_coefs[COEF_VEL]    = 0.0f;  // don't scale by velocity
     e.freq_coefs[COEF_NOTE]  = 0.0f;
+    e.amp_coefs[COEF_CONST]  = 1.0f;  // fixed amplitude — depth is COEF_MOD on voice oscs
+    e.amp_coefs[COEF_EG0]    = 0.0f;  // EG0 doesn't scale amplitude, only keeps osc alive
+    e.amp_coefs[COEF_VEL]    = 0.0f;
     e.amp_coefs[COEF_NOTE]   = 0.0f;
-    e.velocity               = 1.0f;  // transition osc from SYNTH_OFF → SYNTH_RUNNING
+    // Explicit EG0 that holds for 10 minutes — prevents AMY from transitioning osc to SYNTH_OFF
+    // when the default EG completes. COEF_EG0=0 means these values don't affect amplitude.
+    e.eg0_times[0]  = 1;      e.eg0_values[0] = 1.0f;  // 1ms attack
+    e.eg0_times[1]  = 600000; e.eg0_values[1] = 1.0f;  // 600s sustain
+    e.eg0_times[2]  = 600000; e.eg0_values[2] = 1.0f;  // 600s release (never sent, just in case)
+    e.velocity               = 1.0f;  // transition osc to SYNTH_RUNNING
     amy_add_event(&e);
 }
 
@@ -273,7 +282,7 @@ void amy_engine_init(void)
     cfg.platform.multicore      = 1;
     cfg.platform.multithread    = 1;
     cfg.max_oscs             = SYNTH_PAD_COUNT * 2; // 16
-    cfg.ks_oscs              = 0;
+    cfg.ks_oscs              = 4;
     cfg.max_sequencer_tags   = 1;
     cfg.max_voices           = 10;
     cfg.max_synths           = 3;  // 0=reserved, 1=custom, 2=patch
@@ -291,8 +300,8 @@ void amy_engine_init(void)
     {
         amy_event e = amy_default_event();
         e.echo_level        = s_echo_amount / 10000.0f;
-        e.echo_delay_ms     = 250.0f;
-        e.echo_max_delay_ms = 500.0f;  // pre-allocates PSRAM buffer; set only at boot
+        e.echo_delay_ms     = sc_echo_delay_ms(s_echo_delay_scaled);
+        e.echo_max_delay_ms = 500.0f;  // covers full 50-500ms range; ~22KB PSRAM (stereo)
         e.echo_feedback     = (s_echo_feedback / 10000.0f) * 0.9f;
         e.echo_filter_coef  = 0.5f;
         amy_add_event(&e);
@@ -312,6 +321,12 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
     amy_event e = amy_default_event();
 
     if (s_mode == SYNTH_MODE_CUSTOM) {
+        // Re-arm LFO osc on first note of each phrase (all pads were idle)
+        // Avoids phase jumps mid-chord while guaranteeing LFO is alive after long silences
+        bool any_active = false;
+        for (int i = 0; i < SYNTH_PAD_COUNT; i++) any_active |= s_pad_active[i];
+        if (!any_active) setup_lfo_osc();
+
         float freq = 440.0f * powf(2.0f, ((float)midi_note - 69.0f) / 12.0f);
 
         // Cross-pad portamento: prime the idle osc at the last played frequency so AMY's
@@ -397,12 +412,21 @@ void amy_engine_set_echo(uint16_t amount, uint16_t feedback)
     s_echo_feedback = feedback;
     amy_event e = amy_default_event();
     e.echo_level       = amount / 10000.0f;
-    e.echo_delay_ms    = 250.0f;
+    e.echo_delay_ms    = sc_echo_delay_ms(s_echo_delay_scaled);
     // echo_max_delay_ms intentionally omitted — buffer already allocated in init
     e.echo_feedback    = (feedback / 10000.0f) * 0.9f;
     e.echo_filter_coef = 0.5f;
     amy_add_event(&e);
-    ESP_LOGI(TAG, "echo amt=%u fb=%u", amount, feedback);
+    ESP_LOGI(TAG, "echo amt=%u fb=%u dly=%.0fms", amount, feedback, sc_echo_delay_ms(s_echo_delay_scaled));
+}
+
+void amy_engine_set_echo_delay(uint16_t delay)
+{
+    s_echo_delay_scaled = delay;
+    amy_event e = amy_default_event();
+    e.echo_delay_ms = sc_echo_delay_ms(delay);
+    amy_add_event(&e);
+    ESP_LOGI(TAG, "echo_delay → %u (%.0f ms)", delay, sc_echo_delay_ms(delay));
 }
 
 void amy_engine_set_filter(uint16_t cutoff, uint16_t resonance)
@@ -512,6 +536,7 @@ void amy_engine_get_state(amy_engine_state_t *out)
     out->reverb_decay     = 0;
     out->echo_amount      = s_echo_amount;
     out->echo_feedback    = s_echo_feedback;
+    out->echo_delay       = s_echo_delay_scaled;
     out->filter_cutoff    = s_filter_cutoff;
     out->filter_resonance = s_filter_resonance;
     out->env_attack       = s_env_attack;
