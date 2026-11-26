@@ -1,0 +1,10 @@
+[submodule "third_party/amy"]
+	path = third_party/amy
+	url = https://github.com/seifflifel/amy.git
+	branch = synthewi
+[submodule "third_party/spark-synth"]
+	path = third_party/spark-synth
+	url = https://github.com/povle/spark-synth.git
+[submodule "third_party/esp32-usb-uac-experiments"]
+	path = third_party/esp32-usb-uac-experiments
+	url = https://github.com/atomic14/esp32-usb-uac-experiments.git
