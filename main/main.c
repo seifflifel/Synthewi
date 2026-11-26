@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "esp_heap_caps.h"
 #include "amy_engine.h"
 #include "touch_telemetry.h"
 #include "looper.h"
@@ -144,7 +145,11 @@ void app_main(void)
     amy_engine_init();
     esp_log_level_set("AMY_ENGINE", ESP_LOG_WARN);
     vTaskDelay(pdMS_TO_TICKS(200)); // let AMY render task process echo event and allocate PSRAM before looper grabs it
-    looper_init(); // allocates remaining PSRAM after AMY echo buffer
+    looper_init(); // allocates remaining PSRAM after AMY's echo + reverb buffers
+    ESP_LOGI(TAG, "memory after init: PSRAM free %u KB (largest %u KB), internal free %u KB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     // mux_pots_init();
 
     touch_telemetry_set_event_cb(on_touch);

@@ -1,4 +1,4 @@
 idf_component_register(
-    SRCS "looper.c"
+    SRCS "looper.c" "output_limiter.c"
     INCLUDE_DIRS "include"
 )

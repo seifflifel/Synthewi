@@ -2,6 +2,7 @@
 // UI module — include exactly once from main.c
 
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <inttypes.h>
 #include <math.h>
@@ -254,7 +255,8 @@ static int      s_main_card    = 0;    // 0-5: selected card in overview
 static bool     s_main_in_card = false; // false=overview, true=card edit
 static int      s_main_param   = 0;    // param index within card edit
 // Param counts per card: ENV FLT EG1 LFO ECH GLD
-static const int s_card_param_max[6] = {4, 3, 2, 2, 3, 1};
+// Param counts per card: ENV FLT EG1 LFO FX GLD   (FX = echo AMT/FB/DLY + reverb REV/SIZE)
+static const int s_card_param_max[6] = {4, 3, 2, 2, 5, 1};
 // Mirror of engine state for display (loaded on enter, pot-synced in overview)
 static uint16_t s_main_adsr[4];        // 0=A 1=D 2=S 3=R
 static uint16_t s_main_flt_cut;
@@ -265,6 +267,8 @@ static uint16_t s_main_lfo_depth;
 static uint16_t s_main_ech_amt;
 static uint16_t s_main_ech_fb;
 static uint16_t s_main_ech_dly;
+static uint16_t s_main_rev_amt;        // reverb amount (0 = off)
+static uint16_t s_main_rev_dec;        // reverb size / decay
 static uint16_t s_main_eg1_depth;
 static uint16_t s_main_eg1_decay;
 static uint16_t s_main_gld;
@@ -300,7 +304,13 @@ typedef struct __attribute__((packed)) {
     uint16_t eg1_depth;
     uint16_t eg1_decay;
     uint16_t ech_dly;
+    // ── appended 2026-11 (reverb). Blobs saved before this are shorter
+    //    (PRESET_SIZE_V1); they load with reverb off. Only ever APPEND fields.
+    uint16_t rev_amt;
+    uint16_t rev_dec;
 } preset_t;
+#define PRESET_SIZE_V1   offsetof(preset_t, rev_amt)   // 34-byte pre-reverb layout
+#define PRESET_REV_DEC_DEFAULT 7000
 
 static preset_t s_presets[PRESET_COUNT];
 static bool     s_preset_valid[PRESET_COUNT];
@@ -405,8 +415,15 @@ static void preset_nvs_load(int slot)
     if (nvs_get_str(h, nkey, s_preset_name[slot], &nlen) != ESP_OK)
         s_preset_name[slot][0] = '\0';
     nvs_close(h);
-    s_preset_valid[slot] = (err == ESP_OK && sz == sizeof(preset_t)
+    s_preset_valid[slot] = (err == ESP_OK
+                            && (sz == sizeof(preset_t) || sz == PRESET_SIZE_V1)
                             && s_presets[slot].magic == PRESET_MAGIC);
+    if (s_preset_valid[slot] && sz == PRESET_SIZE_V1) {
+        // Pre-reverb preset: fill the appended fields and re-save in the new size
+        s_presets[slot].rev_amt = 0;
+        s_presets[slot].rev_dec = PRESET_REV_DEC_DEFAULT;
+        preset_nvs_save(slot);
+    }
     if (s_preset_valid[slot] && s_presets[slot].fmt != PRESET_FMT) {
         preset_migrate(&s_presets[slot]);
         preset_nvs_save(slot);   // persist converted values once
@@ -479,6 +496,8 @@ static void preset_capture(int slot)
     p->eg1_depth = st.filter_env_depth;
     p->eg1_decay = st.filter_env_decay;
     p->ech_dly   = st.echo_delay;
+    p->rev_amt   = st.reverb_amount;
+    p->rev_dec   = st.reverb_decay;
     s_preset_valid[slot] = true;
 }
 
@@ -493,6 +512,7 @@ static void preset_apply(int slot)
     amy_engine_set_lfo(p->lfo_rt, p->lfo_dp);
     amy_engine_set_echo(p->ech_amt, p->ech_fb);
     amy_engine_set_echo_delay(p->ech_dly);
+    amy_engine_set_reverb(p->rev_amt, p->rev_dec);
     amy_engine_set_filter_env(p->eg1_depth, p->eg1_decay);
     amy_engine_set_glide(p->gld);
     amy_engine_save_state();
@@ -815,7 +835,7 @@ static void ui_draw_main_overview(void)
     static const int    cws[3]  = {52, 52, 53};
     static const int    rys[2]  = {22, 75};
     static const int    rhs[2]  = {52, 53};
-    static const char * const nm[6] = {"ENV","FLT","EG1","LFO","ECH","GLD"};
+    static const char * const nm[6] = {"ENV","FLT","EG1","LFO","FX","GLD"};
     static const char * const flt_nm[3] = {"LPF","BPF","HPF"};
 
     amy_engine_state_t st;
@@ -831,7 +851,7 @@ static void ui_draw_main_overview(void)
         tft_rrect(cx, ry, cx+cw-1, ry+rh-1, oc);
         // Header (10px): filled orange when selected
         tft_fill(cx+1, ry+1, cx+cw-2, ry+9, sel ? C_ORANGE : C_BLACK);
-        int tx = cx + (cw - 3*6) / 2;
+        int tx = cx + (cw - (int)strlen(nm[ci])*6) / 2;
         tft_text(nm[ci], tx, ry+1, sel ? C_BLACK : C_DKGRAY, sel ? C_ORANGE : C_BLACK, 1);
         tft_fill(cx+1, ry+10, cx+cw-2, ry+10, oc);
 
@@ -889,11 +909,13 @@ static void ui_draw_main_overview(void)
             tft_text(buf, bx, by+9, oc, C_BLACK, 1);
             break;
         }
-        case 4: { // ECHO — amount% + delay fraction
+        case 4: { // FX — echo amount + delay fraction, reverb amount
             char buf[24];
-            snprintf(buf,sizeof(buf),"%3u%%",(unsigned)(st.echo_amount/100));
-            tft_text(buf, bx, by,   oc, C_BLACK, 1);
+            snprintf(buf,sizeof(buf),"E%3u%%",(unsigned)(st.echo_amount/100));
+            tft_text(buf, bx, by,    oc, C_BLACK, 1);
             tft_text(ui_echo_frac(st.echo_delay), bx, by+9, oc, C_BLACK, 1);
+            snprintf(buf,sizeof(buf),"R%3u%%",(unsigned)(st.reverb_amount/100));
+            tft_text(buf, bx, by+18, oc, C_BLACK, 1);
             break;
         }
         case 5: { // GLD — ms value
@@ -914,7 +936,7 @@ static void ui_draw_main_card_edit(void)
 {
     tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
 
-    static const char * const nm[6]       = {"ENV","FLT","EG1","LFO","ECH","GLD"};
+    static const char * const nm[6]       = {"ENV","FLT","EG1","LFO","FX","GLD"};
     static const char * const flt_nm[3]   = {"LPF","BPF","HPF"};
 
     tft_text_bold(nm[s_main_card], 4, 24, C_ORANGE, C_BLACK, 2);
@@ -923,8 +945,9 @@ static void ui_draw_main_card_edit(void)
     int p  = s_main_param;
     // ENV needs 4 param lines so visual is shorter; others get more visual space.
     int vt = 46;
-    int vb = (s_main_card == 0) ? 80 : 88;
-    int py = (s_main_card == 0) ? 83 : 91;
+    // FX needs 5 lines (79..118, just above the footer at 119).
+    int vb = (s_main_card == 0) ? 80 : (s_main_card == 4) ? 70 : 88;
+    int py = (s_main_card == 0) ? 83 : (s_main_card == 4) ? 79 : 91;
 
     // pc(i): blue if current param, orange otherwise
     #define PC(i) ((p==(i)) ? C_BLUE : C_ORANGE)
@@ -1008,21 +1031,31 @@ static void ui_draw_main_card_edit(void)
         tft_text(buf,4,py+8, PC(1),C_BLACK,1);
         break;
     }
-    case 4: { // ECHO — two bars + fraction text + 3 param lines
-        int bw=5,gap=12;
-        int bx0=(TFT_W/2-(bw+gap/2))-4, bx1=bx0+bw+gap;
-        ui_vbar(bx0,bx0+bw-1,vt,vb,s_main_ech_amt,PC(0));
-        ui_vbar(bx1,bx1+bw-1,vt,vb,s_main_ech_fb, PC(1));
-        tft_text("A",bx0+1,vb+2,PC(0),C_BLACK,1);
-        tft_text("F",bx1+1,vb+2,PC(1),C_BLACK,1);
-        tft_text(ui_echo_frac(s_main_ech_dly), bx1+14, vt+16, PC(2), C_BLACK, 1);
+    case 4: { // FX — echo (AMT/FB/DLY) + reverb (REV/SIZE): 4 bars + 5 param lines
+        // Bars sit on the right half; their labels share the first text row
+        // but not its x range (text lines end at x~64).
+        int bw=5, gap=9;
+        int ex0=78, ex1=ex0+bw+gap;           // echo pair
+        int rx0=ex1+bw+gap+8, rx1=rx0+bw+gap; // reverb pair
+        ui_vbar(ex0,ex0+bw-1,vt,vb,s_main_ech_amt,PC(0));
+        ui_vbar(ex1,ex1+bw-1,vt,vb,s_main_ech_fb, PC(1));
+        ui_vbar(rx0,rx0+bw-1,vt,vb,s_main_rev_amt,PC(3));
+        ui_vbar(rx1,rx1+bw-1,vt,vb,s_main_rev_dec,PC(4));
+        tft_text("A",ex0+1,vb+2,PC(0),C_BLACK,1);
+        tft_text("F",ex1+1,vb+2,PC(1),C_BLACK,1);
+        tft_text("R",rx0+1,vb+2,PC(3),C_BLACK,1);
+        tft_text("S",rx1+1,vb+2,PC(4),C_BLACK,1);
         char buf[24];
-        snprintf(buf,sizeof(buf),"AMT  %3u%%",(unsigned)(s_main_ech_amt/100));
+        snprintf(buf,sizeof(buf),"ECHO %3u%%",(unsigned)(s_main_ech_amt/100));
         tft_text(buf,4,py,   PC(0),C_BLACK,1);
         snprintf(buf,sizeof(buf),"FB   %3u%%",(unsigned)(s_main_ech_fb/100));
         tft_text(buf,4,py+8, PC(1),C_BLACK,1);
         snprintf(buf,sizeof(buf),"DLY  %s",ui_echo_frac(s_main_ech_dly));
         tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"REV  %3u%%",(unsigned)(s_main_rev_amt/100));
+        tft_text(buf,4,py+24,PC(3),C_BLACK,1);
+        snprintf(buf,sizeof(buf),"SIZE %3u%%",(unsigned)(s_main_rev_dec/100));
+        tft_text(buf,4,py+32,PC(4),C_BLACK,1);
         break;
     }
     case 5: { // GLD — single bar + 1 param line
@@ -1315,6 +1348,8 @@ static void ui_enter(ui_section_t sec)
         s_main_ech_amt   = st.echo_amount;
         s_main_ech_fb    = st.echo_feedback;
         s_main_ech_dly   = st.echo_delay;
+        s_main_rev_amt   = st.reverb_amount;
+        s_main_rev_dec   = st.reverb_decay;
         s_main_eg1_depth = st.filter_env_depth;
         s_main_eg1_decay = st.filter_env_decay;
         s_main_gld       = st.glide;
@@ -1384,7 +1419,8 @@ void ui_set_pad_active(uint8_t pad, bool active)
 // v1: P1-P5 contents.  v2: preset names (only applied to slots whose contents
 // still exactly match the factory preset, so user edits are never renamed).
 // v3: P5 renamed VOWEL -> WAHWAH (names re-applied with the same rule).
-#define FACTORY_SET_VERSION 3
+// v4: reverb added to P1-P5 (only slots still holding the untouched factory sound).
+#define FACTORY_SET_VERSION 4
 
 static const char * const s_factory_names[5] = { "ACID", "DREAMPAD", "KALIMBA", "WOBBLE", "WAHWAH" };
 
@@ -1399,7 +1435,8 @@ static const preset_t s_factory_presets[5] = {
       .lfo_rt  = 4000,  .lfo_dp = 0,
       .ech_amt = 2500,  .ech_fb = 3500,  .ech_dly = 1667,  /* 1/8 s    */
       .gld     = 1000,  /* 50 ms      */
-      .eg1_depth = 7000, /* +3.5 oct */  .eg1_decay = 5500, /* ~200 ms */ },
+      .eg1_depth = 7000, /* +3.5 oct */  .eg1_decay = 5500, /* ~200 ms */
+      .rev_amt = 1000,   /* small room */ .rev_dec = 5000, },
 
     // P2 "DREAM PAD" — slow-blooming saw pad: soft attack, long release, slow LFO
     // breathing on the filter, gentle EG1 bloom, wide 1/4 echo. Hold chords.
@@ -1411,7 +1448,8 @@ static const preset_t s_factory_presets[5] = {
       .lfo_rt  = 2000,  /* ~0.3 Hz   */  .lfo_dp = 3000,   /* ±0.9 oct  */
       .ech_amt = 3500,  .ech_fb = 5000,  .ech_dly = 4444,  /* 1/4 s    */
       .gld     = 0,
-      .eg1_depth = 1000, /* +0.5 oct */  .eg1_decay = 8000, /* ~1 s    */ },
+      .eg1_depth = 1000, /* +0.5 oct */  .eg1_decay = 8000, /* ~1 s    */
+      .rev_amt = 4500,   /* big hall  */ .rev_dec = 9000, },
 
     // P3 "KALIMBA" — plucked triangle: instant attack, no sustain, bright filter
     // "tick" from a very short EG1, 1/6 echo for a thumb-piano shimmer.
@@ -1423,7 +1461,8 @@ static const preset_t s_factory_presets[5] = {
       .lfo_rt  = 4000,  .lfo_dp = 0,
       .ech_amt = 3000,  .ech_fb = 4000,  .ech_dly = 2593,  /* 1/6 s    */
       .gld     = 0,
-      .eg1_depth = 4000, /* +2 oct   */  .eg1_decay = 4000, /* ~70 ms  */ },
+      .eg1_depth = 4000, /* +2 oct   */  .eg1_decay = 4000, /* ~70 ms  */
+      .rev_amt = 2500,   /* room      */ .rev_dec = 6500, },
 
     // P4 "WOBBLE BASS" — square through a resonant low LPF swept by a ~4 Hz LFO
     // (restarts on every note, so each hit wobbles the same way). Try OCT -1/-2.
@@ -1435,7 +1474,8 @@ static const preset_t s_factory_presets[5] = {
       .lfo_rt  = 7000,  /* ~4 Hz     */  .lfo_dp = 6500,   /* ±1.95 oct */
       .ech_amt = 0,     .ech_fb = 0,     .ech_dly = 4444,
       .gld     = 0,
-      .eg1_depth = 0,                    .eg1_decay = 5000, },
+      .eg1_depth = 0,                    .eg1_decay = 5000,
+      .rev_amt = 0,      /* dry bass  */ .rev_dec = PRESET_REV_DEC_DEFAULT, },
 
     // P5 "WAHWAH" — saw through a band-pass: each note says "wah" (EG1 sweep),
     // fast LFO shimmer on the formant, glides between pads, 1/4 echo.
@@ -1447,7 +1487,8 @@ static const preset_t s_factory_presets[5] = {
       .lfo_rt  = 7500,  /* ~5.3 Hz   */  .lfo_dp = 1000,   /* ±0.3 oct  */
       .ech_amt = 3000,  .ech_fb = 4500,  .ech_dly = 4444,  /* 1/4 s    */
       .gld     = 2500,  /* 125 ms     */
-      .eg1_depth = 3000, /* +1.5 oct */  .eg1_decay = 6500, /* ~390 ms */ },
+      .eg1_depth = 3000, /* +1.5 oct */  .eg1_decay = 6500, /* ~390 ms */
+      .rev_amt = 2000,   /* plate-ish */ .rev_dec = 7000, },
 };
 
 // P6 factory "Juno Brass" (SAW + warm LPF + filter env). Values are in the old
@@ -1455,6 +1496,7 @@ static const preset_t s_factory_presets[5] = {
 static void preset_p6_factory(preset_t *p)
 {
     memset(p, 0, sizeof(*p));
+    p->rev_dec   = PRESET_REV_DEC_DEFAULT;   // no reverb on P6 (rev_amt 0)
     p->magic     = PRESET_MAGIC;
     p->wave_id   = AMY_ENGINE_WAVE_SAW_DOWN; // SAW — Juno character
     p->flt_type  = AMY_ENGINE_FILTER_LPF;
@@ -1490,6 +1532,19 @@ static void preset_seed_factory(void)
             s_presets[i]       = s_factory_presets[i];
             s_preset_valid[i]  = true;
             preset_nvs_save(i);
+        }
+    } else if (ver < 4) {
+        // v4: give untouched factory presets their new reverb settings. A slot is
+        // "untouched" when everything before the reverb fields matches the factory
+        // preset and its reverb is still the pre-reverb default (off).
+        for (int i = 0; i < 5; i++) {
+            if (s_preset_valid[i]
+                && memcmp(&s_presets[i], &s_factory_presets[i], PRESET_SIZE_V1) == 0
+                && s_presets[i].rev_amt == 0
+                && s_presets[i].rev_dec == PRESET_REV_DEC_DEFAULT) {
+                s_presets[i] = s_factory_presets[i];
+                preset_nvs_save(i);
+            }
         }
     }
     // Names: only for slots that still hold the untouched factory sound
@@ -1601,6 +1656,8 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
                 s_main_ech_amt   = st.echo_amount;
                 s_main_ech_fb    = st.echo_feedback;
                 s_main_ech_dly   = st.echo_delay;
+                s_main_rev_amt   = st.reverb_amount;
+                s_main_rev_dec   = st.reverb_decay;
                 s_main_eg1_depth = st.filter_env_depth;
                 s_main_eg1_decay = st.filter_env_decay;
                 s_main_gld       = st.glide;
@@ -1640,9 +1697,11 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
                     else        s_main_lfo_depth = u16clamp((int)s_main_lfo_depth + delta*500);
                     amy_engine_set_lfo(s_main_lfo_rate, s_main_lfo_depth);
                     break;
-                case 4: // ECHO
+                case 4: // FX: 0 echo AMT, 1 echo FB, 2 echo DLY, 3 reverb REV, 4 reverb SIZE
                     if (p == 0)      { s_main_ech_amt = u16clamp((int)s_main_ech_amt + delta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
                     else if (p == 1) { s_main_ech_fb  = u16clamp((int)s_main_ech_fb  + delta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
+                    else if (p == 3) { s_main_rev_amt = u16clamp((int)s_main_rev_amt + delta*500); amy_engine_set_reverb(s_main_rev_amt,s_main_rev_dec); }
+                    else if (p == 4) { s_main_rev_dec = u16clamp((int)s_main_rev_dec + delta*500); amy_engine_set_reverb(s_main_rev_amt,s_main_rev_dec); }
                     else { // DLY: snap through fractions
                         int idx = echo_snap_idx(s_main_ech_dly) + (delta > 0 ? 1 : -1);
                         if (idx < 0) idx = 0;

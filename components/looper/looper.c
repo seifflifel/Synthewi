@@ -72,9 +72,10 @@ looper_state_t looper_get_state(void)    { return s_state; }
 uint32_t       looper_get_position(void) { return s_pos; }
 uint32_t       looper_get_length(void)   { return s_loop_len; }
 
-// ── Audio hook ────────────────────────────────────────────────
-// Called from AMY's esp_fill_audio_buffer_task (Core 0) on every
-// audio block, between amy_fill_buffer() and amy_i2s_write().
+// ── Audio block processing ────────────────────────────────────
+// Called (via amy_audio_block_hook in output_limiter.c) from AMY's
+// esp_fill_audio_buffer_task on every audio block, between
+// amy_fill_buffer() and amy_i2s_write().
 // block: stereo int16, interleaved L/R, n_frames samples per channel.
 
 static inline int16_t clamp16(int32_t v)
@@ -82,7 +83,7 @@ static inline int16_t clamp16(int32_t v)
     return (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
 }
 
-void amy_audio_block_hook(int16_t *block, int n_frames)
+void looper_process_block(int16_t *block, int n_frames)
 {
     looper_state_t state = s_state;
     if (state == LOOPER_IDLE || !s_buf) return;

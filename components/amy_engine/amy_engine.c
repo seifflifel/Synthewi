@@ -34,6 +34,8 @@ static uint16_t s_filter_env_decay   = 5000;  // ~140 ms
 static uint16_t s_lfo_rate           = 4000;  // ~0.8 Hz
 static uint16_t s_lfo_depth          = 0;
 static uint16_t s_chorus_amount      = 0;
+static uint16_t s_reverb_amount      = 0;     // 0-10000 → reverb level 0-1 (0 = off, no CPU)
+static uint16_t s_reverb_decay       = 7000;  // 0-10000 → liveness 0.5-0.95 (~0.8)
 static uint16_t s_pressure_depth     = 0; // 0 = feature off
 static uint16_t    s_portamento         = 0; // 0 = instant (no glide)
 static uint16_t s_echo_amount        = 0;    // 0 = off
@@ -172,6 +174,8 @@ static void nvs_save_all(void)
     nvs_set_u16(h, "echo_amt",  s_echo_amount);
     nvs_set_u16(h, "echo_fb",   s_echo_feedback);
     nvs_set_u16(h, "echo_dly",  s_echo_delay_scaled);
+    nvs_set_u16(h, "rvb_amt",   s_reverb_amount);
+    nvs_set_u16(h, "rvb_dec",   s_reverb_decay);
     nvs_set_u8(h,  "ver",       NVS_SYNTH_VERSION);
     nvs_commit(h);
     nvs_close(h);
@@ -208,6 +212,10 @@ static void nvs_load_all(void)
     if (nvs_get_u16(h, "echo_amt",  &u16) == ESP_OK) s_echo_amount        = u16;
     if (nvs_get_u16(h, "echo_fb",   &u16) == ESP_OK) s_echo_feedback      = u16;
     if (nvs_get_u16(h, "echo_dly",  &u16) == ESP_OK) s_echo_delay_scaled  = u16;
+    // Reverb keys are new (2026-11); older saves simply keep the defaults (off).
+    // Named rvb_* because older firmware left stale "rev_*" keys in NVS.
+    if (nvs_get_u16(h, "rvb_amt",   &u16) == ESP_OK) s_reverb_amount      = u16;
+    if (nvs_get_u16(h, "rvb_dec",   &u16) == ESP_OK) s_reverb_decay       = u16;
     nvs_close(h);
 
     if (ver == 3) {
@@ -348,7 +356,7 @@ void amy_engine_init(void)
     cfg.midi                    = AMY_MIDI_IS_NONE;
     cfg.features.startup_bleep  = 1; // boot beep confirms audio path works
     cfg.features.default_synths = 0;
-    cfg.features.reverb         = 0; // removed — frees ~108 KB PSRAM for future looping
+    cfg.features.reverb         = 1; // ~108 KB PSRAM delay lines, allocated in init (before the looper)
     cfg.features.echo           = 1;
     cfg.features.chorus         = 0;
     cfg.ram_caps_delay          = MALLOC_CAP_SPIRAM; // route all delay lines to 2MB PSRAM
@@ -369,19 +377,42 @@ void amy_engine_init(void)
     setup_lfo_osc();
 
     amy_event vol_e = amy_default_event();
-    vol_e.volume = 1.0f; // headroom for up to 8 simultaneous oscs at full amplitude
+    // 0.5 = 6 dB of internal headroom: AMY's soft clipper (and its -6 dBFS
+    // output ceiling on ESP32) is no longer reached by 8 voices + reverb/echo
+    // build-ups. The 6 dB are added back after AMY by the output limiter
+    // (components/looper/output_limiter.c, LIM_MAKEUP), which also catches peaks.
+    vol_e.volume = 0.5f;
     amy_add_event(&vol_e);
 
     {
+        // Echo delay lines are allocated by AMY the first time the echo level is
+        // > 0 (500 ms → 32768 samples × 2 ch × 4 B ≈ 256 KB PSRAM). Always force
+        // that allocation now, even if the saved level is 0, so it happens before
+        // looper_init() claims the remaining PSRAM — otherwise turning echo on
+        // later fails (256 KB doesn't fit in the looper's headroom).
         amy_event e = amy_default_event();
-        e.echo_level        = s_echo_amount / 10000.0f;
+        e.echo_level        = 0.01f;   // > 0 → allocate
         e.echo_delay_ms     = sc_echo_delay_ms(s_echo_delay_scaled);
-        e.echo_max_delay_ms = 500.0f;  // covers full 50-500ms range; ~22KB PSRAM (stereo)
+        e.echo_max_delay_ms = 500.0f;  // covers full 50-500 ms range
         e.echo_feedback     = (s_echo_feedback / 10000.0f) * 0.9f;
         e.echo_filter_coef  = 0.5f;
         amy_add_event(&e);
+        amy_event lvl = amy_default_event();
+        lvl.echo_level      = s_echo_amount / 10000.0f;  // real saved level (may be 0)
+        amy_add_event(&lvl);
     }
     apply_filter_to_all_oscs();  // prime filter + LFO wiring on all pad oscs at boot
+
+    // Reverb: AMY allocates its delay lines (~108 KB PSRAM) the first time the
+    // level goes above 0, and only once. Force that now so the allocation
+    // happens before looper_init() claims the remaining PSRAM, then apply the
+    // real level (0 = off: AMY skips reverb processing entirely).
+    {
+        amy_event e = amy_default_event();
+        e.reverb_level = 0.01f;
+        amy_add_event(&e);
+    }
+    amy_engine_set_reverb(s_reverb_amount, s_reverb_decay);
 
     s_initialized = true;
     ESP_LOGI(TAG, "init OK — I2S on GPIO 38/39/40, wave=%u atk=%u rel=%u",
@@ -460,9 +491,22 @@ void amy_engine_set_wave(uint8_t wave_id)
     ESP_LOGI(TAG, "wave → %u", wave_id);
 }
 
+// Wet level is added on top of the full dry mix and the tail feeds back on
+// itself, so with long releases + fast playing the energy builds up. 1.0 / 0.95
+// ran away into the output clipper (2026-11); 0.6 / 0.92 still gives a big hall.
+#define REVERB_LEVEL_MAX     0.6f
+#define REVERB_LIVENESS_MIN  0.5f
+#define REVERB_LIVENESS_MAX  0.92f
 void amy_engine_set_reverb(uint16_t amount, uint16_t decay)
 {
-    (void)amount; (void)decay; // reverb disabled — no PSRAM allocated
+    s_reverb_amount = amount;
+    s_reverb_decay  = decay;
+    amy_event e = amy_default_event();
+    e.reverb_level    = (amount / 10000.0f) * REVERB_LEVEL_MAX;
+    e.reverb_liveness = REVERB_LIVENESS_MIN + (decay / 10000.0f) * (REVERB_LIVENESS_MAX - REVERB_LIVENESS_MIN);
+    amy_add_event(&e);
+    ESP_LOGI(TAG, "reverb amt=%u decay=%u (level %.2f liveness %.2f)",
+             amount, decay, e.reverb_level, e.reverb_liveness);
 }
 
 void amy_engine_set_echo(uint16_t amount, uint16_t feedback)
@@ -591,8 +635,8 @@ void amy_engine_get_state(amy_engine_state_t *out)
     if (!out) return;
     out->wave_id          = s_wave_id;
     out->filter_type      = s_filter_type;
-    out->reverb_amount    = 0;
-    out->reverb_decay     = 0;
+    out->reverb_amount    = s_reverb_amount;
+    out->reverb_decay     = s_reverb_decay;
     out->echo_amount      = s_echo_amount;
     out->echo_feedback    = s_echo_feedback;
     out->echo_delay       = s_echo_delay_scaled;
