@@ -20,7 +20,7 @@ static const char *TAG = "touch_telemetry";
 #define TOUCH_CHANNEL_COUNT   TOUCH_TOTAL_PADS  // 10: 8 note pads + oct- + oct+
 
 // Touch channel IDs: pads 0-7 = notes, pad 8 = oct- (GPIO9, ch9), pad 9 = oct+ (GPIO10, ch10)
-static const uint8_t s_touch_channels[TOUCH_CHANNEL_COUNT] = {4, 5, 6, 7, 8, 12, 1, 2, 9, 10};
+static const uint8_t s_touch_channels[TOUCH_CHANNEL_COUNT] = {4, 5, 6, 7, 8, 3, 1, 2, 9, 10};
 
 static touch_sensor_t    s_touch_pads[TOUCH_CHANNEL_COUNT];
 static volatile uint16_t s_thresholds[TOUCH_CHANNEL_COUNT] = {100,100,100,100,100,100,100,100,100,100};

@@ -18,7 +18,7 @@ with a rotary-encoder + TFT UI for real-time sound shaping.
 | **Octave shift** | Two touch pads (GPIO 9/10) shift all notes ±1 octave, range −2 to +2 |
 | **AMY synth engine** | CUSTOM mode — one osc per pad, all params live-editable |
 | **Waveforms** | Square, Saw, Triangle — 3-position physical lever (GPIO 41/42) |
-| **KS pluck (easter egg)** | Karplus-Strong synthesis — load preset P6 to activate; ribbon shows bold "P"; lever overrides back to waveform |
+| **Factory preset P6** | "Juno Brass" — SAW wave, warm LPF ~1.5 kHz, slow attack, filter envelope sweep |
 | **Filter** | LPF / BPF / HPF — exponential curve, 200 Hz min · 12 kHz max |
 | **Filter envelope (EG1)** | Depth 0–8000 Hz · Decay 5–2000 ms — sweeps cutoff on each note |
 | **ADSR amplitude** | Attack 2–2000 ms · Decay 5–1000 ms · Sustain 0–100 % · Release 10–5000 ms |
@@ -28,7 +28,7 @@ with a rotary-encoder + TFT UI for real-time sound shaping.
 | **Looper** | Event-based record / playback / overdub in PSRAM |
 | **NVS persistence** | All params saved on card exit; version-checked (v3); stale saves auto-reset |
 | **Presets** | 6 NVS-backed slots — save / load / clear; P6 factory-seeded with KS pluck; pots lock on load, smooth takeover on move |
-| **6-pot MUX** | Attack · Release · Filter · Resonance · Echo · Glide via CD4067BE; EMA smoothing, dual deadband, preset lock |
+| **6-pot MUX** | CD4067BE wired on breadboard (GPIO 11/13/14/47); firmware disabled — encoder-only control for now |
 | **Menu UI** | Encoder + ST7735 TFT — MAIN · PRST · CAL cards |
 | **Speaker** | MAX98357A I2S amplifier, 3W |
 | **Power** | USB from PC |
@@ -73,7 +73,7 @@ Encoder scrolls highlight. Short press → per-card full-screen edit (ROT adjust
 | ECHO | Amount · Feedback · Delay (musical fraction) |
 | GLD | Glide time |
 
-**PRST card** — 6 preset slots. Short press → LOAD / SAVE / CLR action menu. P6 factory-seeded with KS pluck.
+**PRST card** — 6 preset slots. Short press → LOAD / SAVE / CLR action menu. P6 factory-seeded with "Juno Brass".
 
 **CAL card** — touch threshold editor for all 10 inputs (8 note pads + OCT− OCT+).
 
@@ -102,7 +102,7 @@ Encoder scrolls highlight. Short press → per-card full-screen edit (ROT adjust
 | Octave up (touch CH9) | 10 |
 | Note pads 1–8 (touch CH0–CH5, CH1–CH2) | 4,5,6,7,8,12,1,2 |
 
-### Potentiometer MUX (live)
+### Potentiometer MUX (wired, firmware disabled)
 
 | Function | GPIO |
 |----------|------|
@@ -111,7 +111,7 @@ Encoder scrolls highlight. Short press → per-card full-screen edit (ROT adjust
 | CD4067BE select B | 14 |
 | CD4067BE select C | 47 |
 
-6 pots wired and active — see [docs/POTENTIOMETER_MUX_SYSTEM.md](docs/POTENTIOMETER_MUX_SYSTEM.md) for full wiring and firmware details.
+Hardware wired on breadboard. Firmware disabled — all parameter control is via rotary encoder. Re-enable by uncommenting `mux_pots.h` include and calls in `main/main.c` and `main/ui.h`.
 
 ### Board
 
@@ -143,8 +143,8 @@ NVS writes happen only on explicit section exit (long press back), not on every 
 
 ### Short term
 
-- **KS pluck sound quality** — P6 easter egg works but tone character needs tuning (feedback, filter, echo params)
-- **Better sounds** — KS pluck tuning; Juno/DX7 preset mode exploration; more factory presets
+- **More factory presets** — expand beyond P6; explore DX7 patches via AMY PATCH mode
+- **Better sounds** — more preset variety; Juno/DX7 PATCH mode exploration
 - **Solder Nickel Plates**
 - **Remodel top panel** — sleeker touch key layout, keys embedded under structure and connected to nickel plates
 - **Reset button** — dedicated physical reset input

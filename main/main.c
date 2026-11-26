@@ -8,7 +8,7 @@
 #include "touch_telemetry.h"
 #include "looper.h"
 #include "ui.h"
-#include "mux_pots.h"
+// #include "mux_pots.h"  // MUX pots disabled — encoder-only control
 
 static const char *TAG = "Synthewi";
 
@@ -103,7 +103,7 @@ void app_main(void)
     esp_log_level_set("AMY_ENGINE", ESP_LOG_WARN);
     vTaskDelay(pdMS_TO_TICKS(200)); // let AMY render task process echo event and allocate PSRAM before looper grabs it
     looper_init(); // allocates remaining PSRAM after AMY echo buffer
-    mux_pots_init();
+    // mux_pots_init();
 
     touch_telemetry_set_event_cb(on_touch);
     err = touch_telemetry_start();
@@ -201,7 +201,7 @@ void app_main(void)
             }
         }
 
-        mux_pots_tick();
+        // mux_pots_tick();
 
         // Single ui_tick per loop — always called so dirty flag and timed refresh work
         ui_tick(delta, short_press, long_press, vlong_press);

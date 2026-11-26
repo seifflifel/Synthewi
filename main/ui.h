@@ -13,7 +13,7 @@
 #include "touch_telemetry.h"
 #include "amy_engine.h"
 #include "looper.h"
-#include "mux_pots.h"
+// #include "mux_pots.h"  // MUX disabled — encoder-only control
 
 // ── TFT hardware pins ────────────────────────────────────────
 #define TFT_SCLK  GPIO_NUM_36
@@ -425,7 +425,7 @@ static void preset_apply(int slot)
     amy_engine_set_filter_env(p->eg1_depth, p->eg1_decay);
     amy_engine_set_glide(p->gld);
     amy_engine_save_state();
-    mux_pots_on_preset_load();  // Lock all pots to prevent jumps when pot is at different position
+    // mux_pots_on_preset_load();  // MUX disabled
 }
 
 // ── Section draw functions ────────────────────────────────────
@@ -469,13 +469,10 @@ static void ui_draw_ribbon(void)
     for (int i = 0; i < TOUCH_NOTE_PADS; i++)
         tft_pad_circle(6 + i * 10, 10, s_pad_active[i]);
 
-    // Waveform glyph (x=90..110, y=3..17) — orange; KS easter egg shows "P" for pluck
+    // Waveform glyph (x=90..110, y=3..17) — orange
     amy_engine_state_t st;
     amy_engine_get_state(&st);
-    if (st.wave_id == AMY_ENGINE_WAVE_KS)
-        tft_text_bold("P", 95, 4, C_ORANGE, C_BLACK, 2);
-    else
-        ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_ORANGE);
+    ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_ORANGE);
 
     // Octave label — yellow when shifted, dim gray at zero
     char oct_buf[8];
@@ -1252,27 +1249,28 @@ void ui_init(void)
     // Pre-load preset validity so the PRST squares in the cards view are correct on first draw
     for (int i = 0; i < PRESET_COUNT; i++)
         preset_nvs_load(i);
-    // Factory preset: slot 6 (index 5) = KS pluck easter egg; written once to NVS if empty
-    if (!s_preset_valid[5]) {
+    // Factory preset: slot 6 = Juno Brass (SAW + warm LPF + filter env).
+    // Re-seed if empty or still contains the old KS preset.
+    if (!s_preset_valid[5] || s_presets[5].wave_id == AMY_ENGINE_WAVE_KS) {
         preset_t *p = &s_presets[5];
         p->magic     = PRESET_MAGIC;
-        p->wave_id   = AMY_ENGINE_WAVE_KS;
+        p->wave_id   = AMY_ENGINE_WAVE_SAW_DOWN; // SAW — Juno character
         p->flt_type  = AMY_ENGINE_FILTER_LPF;
         p->_pad      = 0;
-        p->flt_cut   = 8000;
-        p->flt_res   = 0;
-        p->env_atk   = 100;
-        p->env_dec   = 100;
-        p->env_sus   = 0;
-        p->env_rel   = 6000;
+        p->flt_cut   = 5000;  // ~1.5 kHz — warm Juno tone
+        p->flt_res   = 500;   // very slight resonance
+        p->env_atk   = 1000;  // ~202 ms — slow enough for pad feel
+        p->env_dec   = 2000;  // ~204 ms
+        p->env_sus   = 7500;  // 75%
+        p->env_rel   = 3000;  // ~1.5 s
         p->lfo_rt    = 2000;
         p->lfo_dp    = 0;
-        p->ech_amt   = 2500;
-        p->ech_fb    = 2500;
+        p->ech_amt   = 2000;  // light echo
+        p->ech_fb    = 2000;
         p->gld       = 0;
-        p->eg1_depth = 0;
-        p->eg1_decay = 1000;
-        p->ech_dly   = 4444;
+        p->eg1_depth = 2500;  // +2000 Hz filter sweep on attack
+        p->eg1_decay = 1000;  // ~205 ms filter env decay
+        p->ech_dly   = 4444;  // 1/4 s delay
         s_preset_valid[5] = true;
         preset_nvs_save(5);
     }
