@@ -31,7 +31,8 @@
 #define C_WHITE   0x0000u  // light mode: C_WHITE renders BLACK on screen
 #define C_GREEN   0x07E0u  // G channel symmetric — unchanged
 #define C_RED     0x001Fu  // BGR-corrected (was 0xF800, appeared blue)
-#define C_YELLOW  0x07FFu  // BGR-corrected (was 0xFFE0, appeared cyan)
+#define C_BLUE    0xC9E2u  // deep blue (~R16 G60 B206 on panel) — secondary accent; replaced
+                           // yellow (0x07FF), which was unreadable on the white background
 #define C_CYAN    0xFFE0u  // BGR-corrected (was 0x07FFu, appeared yellow)
 #define C_ORANGE  0x029Fu  // warm amber — TE accent (R=255,G=160,B=0 as seen on panel)
 #define C_DKGRAY  0x2104u
@@ -500,7 +501,7 @@ static void ribbon_draw_oct(int shift)
         snprintf(oct_buf, sizeof(oct_buf), "OCT 0");
     else
         snprintf(oct_buf, sizeof(oct_buf), "OCT%+d", shift);
-    tft_text(oct_buf, 116, 6, shift ? C_YELLOW : C_DKGRAY, C_BLACK, 1);
+    tft_text(oct_buf, 116, 6, shift ? C_BLUE : C_DKGRAY, C_BLACK, 1);
     s_rb_oct = shift;
 }
 
@@ -509,7 +510,7 @@ static void ribbon_draw_loop(looper_state_t ls)
 {
     uint16_t lc = (ls == LOOPER_RECORDING) ? C_RED    :
                   (ls == LOOPER_PLAYING)   ? C_GREEN  :
-                  (ls == LOOPER_OVERDUB)   ? C_YELLOW : C_BLACK;
+                  (ls == LOOPER_OVERDUB)   ? C_BLUE   : C_BLACK;
     tft_fill(154, 5, 158, 9, lc);
     s_rb_loop = ls;
 }
@@ -862,8 +863,8 @@ static void ui_draw_main_card_edit(void)
     int vb = (s_main_card == 0) ? 80 : 88;
     int py = (s_main_card == 0) ? 83 : 91;
 
-    // pc(i): yellow if current param, orange otherwise
-    #define PC(i) ((p==(i)) ? C_YELLOW : C_ORANGE)
+    // pc(i): blue if current param, orange otherwise
+    #define PC(i) ((p==(i)) ? C_BLUE : C_ORANGE)
 
     switch (s_main_card) {
     case 0: { // ENV — ADSR envelope shape + 4 param lines

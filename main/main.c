@@ -66,16 +66,58 @@ static volatile int32_t s_enc_steps    = 0;
 static volatile int     s_btn_flag     = 0;
 static volatile int64_t s_btn_press_us = 0;
 
-static void IRAM_ATTR enc_ab_isr(void *arg)
+// ── Encoder decoder ──────────────────────────────────────────
+// This encoder makes one full quadrature cycle per click and rests at AB=11:
+//   CW:  11 → 01 → 00 → 10 → 11      CCW: 11 → 10 → 00 → 01 → 11
+// (AB = CLK<<1 | DT). Its contacts bounce heavily, and edge interrupts could
+// coalesce bounces and read a stale level, so the pins are polled every 1 ms
+// from a timer and fed into a full-step state machine (Ben Buxton's table).
+// A step is emitted only when a complete cycle ends back at 11; bouncing
+// between neighbouring states just moves the machine back and forth.
+#define ENC_R_START      0x0
+#define ENC_R_CW_FINAL   0x1
+#define ENC_R_CW_BEGIN   0x2
+#define ENC_R_CW_NEXT    0x3
+#define ENC_R_CCW_BEGIN  0x4
+#define ENC_R_CCW_FINAL  0x5
+#define ENC_R_CCW_NEXT   0x6
+#define ENC_DIR_CW       0x10
+#define ENC_DIR_CCW      0x20
+
+static const uint8_t s_enc_table[7][4] = {
+    /* R_START     */ {ENC_R_START,     ENC_R_CW_BEGIN,  ENC_R_CCW_BEGIN, ENC_R_START},
+    /* R_CW_FINAL  */ {ENC_R_CW_NEXT,   ENC_R_START,     ENC_R_CW_FINAL,  ENC_R_START | ENC_DIR_CW},
+    /* R_CW_BEGIN  */ {ENC_R_CW_NEXT,   ENC_R_CW_BEGIN,  ENC_R_START,     ENC_R_START},
+    /* R_CW_NEXT   */ {ENC_R_CW_NEXT,   ENC_R_CW_BEGIN,  ENC_R_CW_FINAL,  ENC_R_START},
+    /* R_CCW_BEGIN */ {ENC_R_CCW_NEXT,  ENC_R_START,     ENC_R_CCW_BEGIN, ENC_R_START},
+    /* R_CCW_FINAL */ {ENC_R_CCW_NEXT,  ENC_R_CCW_FINAL, ENC_R_START,     ENC_R_START | ENC_DIR_CCW},
+    /* R_CCW_NEXT  */ {ENC_R_CCW_NEXT,  ENC_R_CCW_FINAL, ENC_R_CCW_BEGIN, ENC_R_START},
+};
+
+// Encoder debug: records every AB change seen by the poller; the main loop logs
+// one line per burst ("ENC seq=1023 edges=4 steps=+1" = one clean CW click).
+#define ENC_DEBUG 0
+#if ENC_DEBUG
+static volatile uint8_t  s_enc_dbg[256];
+static volatile uint32_t s_enc_dbg_head = 0;
+#endif
+
+// esp_timer callback, 1 kHz. Only this function writes s_enc_steps.
+static void enc_poll_cb(void *arg)
 {
-    static uint8_t old_AB = 3;
-    static int8_t  acc    = 0;
-    static const int8_t lut[16] = {0,-1,1,0, 1,0,0,-1, -1,0,0,1, 0,1,-1,0};
+    static uint8_t state = ENC_R_START;
     uint8_t ab = ((uint8_t)gpio_get_level(ENC_CLK)<<1)|(uint8_t)gpio_get_level(ENC_DT);
-    acc += lut[(old_AB<<2)|ab];
-    old_AB = ab;
-    if      (acc >=  4) { s_enc_steps++; acc = 0; }
-    else if (acc <= -4) { s_enc_steps--; acc = 0; }
+#if ENC_DEBUG
+    static uint8_t last_ab = 3;
+    if (ab != last_ab) {
+        s_enc_dbg[s_enc_dbg_head & 0xFF] = ab;
+        s_enc_dbg_head++;
+        last_ab = ab;
+    }
+#endif
+    state = s_enc_table[state & 0x0F][ab];
+    if      (state & ENC_DIR_CW)  s_enc_steps++;
+    else if (state & ENC_DIR_CCW) s_enc_steps--;
 }
 
 static void IRAM_ATTR enc_sw_isr(void *arg)
@@ -109,13 +151,22 @@ void app_main(void)
     err = touch_telemetry_start();
     if (err != ESP_OK) ESP_LOGW(TAG, "touch init failed (0x%x)", err);
 
-    // Encoder GPIO
+    // Encoder A/B: plain inputs, polled at 1 kHz by enc_poll_cb (no interrupts)
     gpio_config_t enc_ab = {
         .pin_bit_mask = (1ULL<<ENC_CLK)|(1ULL<<ENC_DT),
         .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
-        .intr_type = GPIO_INTR_ANYEDGE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&enc_ab);
+    const esp_timer_create_args_t enc_timer_args = {
+        .callback = enc_poll_cb,
+        .name     = "enc_poll",
+    };
+    esp_timer_handle_t enc_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&enc_timer_args, &enc_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(enc_timer, 1000)); // 1 ms
+
+    // Encoder push button: falling-edge interrupt
     gpio_config_t enc_sw = {
         .pin_bit_mask = (1ULL<<ENC_SW),
         .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
@@ -123,8 +174,6 @@ void app_main(void)
     };
     gpio_config(&enc_sw);
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(ENC_CLK, enc_ab_isr, NULL);
-    gpio_isr_handler_add(ENC_DT,  enc_ab_isr, NULL);
     gpio_isr_handler_add(ENC_SW,  enc_sw_isr, NULL);
 
     gpio_config_t lever_cfg = {
@@ -166,6 +215,27 @@ void app_main(void)
         int32_t steps = s_enc_steps;
         int delta = (int)(steps - last_steps);
         if (delta) last_steps = steps;
+
+#if ENC_DEBUG
+        {
+            // Log once the encoder has been quiet for 300 ms (one burst per click)
+            static uint32_t dbg_tail = 0;
+            static int64_t  dbg_last_us = 0;
+            static int32_t  dbg_steps0 = 0;
+            uint32_t head = s_enc_dbg_head;
+            int64_t  tnow = esp_timer_get_time();
+            if (head != dbg_tail && dbg_last_us == 0) { dbg_last_us = tnow; dbg_steps0 = steps - delta; }
+            if (head != dbg_tail && tnow - dbg_last_us > 300000) {
+                char line[200]; int n = 0;
+                for (uint32_t i = dbg_tail; i != head && n < (int)sizeof(line) - 4; i++)
+                    n += snprintf(line + n, sizeof(line) - n, "%u", s_enc_dbg[i & 0xFF]);
+                ESP_LOGI(TAG, "ENC seq=%s  edges=%u  steps=%+d",
+                         line, (unsigned)(head - dbg_tail), (int)(steps - dbg_steps0));
+                dbg_tail = head;
+                dbg_last_us = 0;
+            }
+        }
+#endif
 
         // Gather button events as flags (one ui_tick call at end of loop)
         bool short_press = false, long_press = false, vlong_press = false;
