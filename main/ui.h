@@ -233,9 +233,20 @@ static ui_section_t s_sec      = UI_CARDS;
 static int          s_card_cur = 0;   // 0=MAIN 1=PRST 2=CAL
 static bool         s_dirty    = true;
 
-// Ribbon state (set by on_touch / octave buttons)
-static int  s_octave_shift = 0;
-static bool s_pad_active[TOUCH_NOTE_PADS] = {false};
+// Ribbon state (written by the touch task via on_touch, read by the UI task)
+static volatile int  s_octave_shift = 0;
+static volatile bool s_pad_active[TOUCH_NOTE_PADS] = {false};
+
+// Ribbon cache — what is currently on screen, so ui_ribbon_update() redraws only what changed.
+static bool           s_rb_valid = false;
+static bool           s_rb_pad[TOUCH_NOTE_PADS];
+static uint8_t        s_rb_wave;
+static int            s_rb_oct;
+static looper_state_t s_rb_loop;
+
+// CAL edit live refresh: redraw only bar + numbers, not the whole screen.
+static bool s_cal_live    = false;
+static int  s_cal_last_tx = -1;   // x of threshold marker currently drawn (-1 = none)
 
 // MAIN 6-card overview + per-card edit
 static int      s_main_card    = 0;    // 0-5: selected card in overview
@@ -459,38 +470,87 @@ static void ui_draw_wave_glyph(uint8_t wave_id, int x0, int y0, int x1, int y1, 
     }
 }
 
-// ---- RIBBON BAR (y=0..21, always drawn last) ----------------
+// ---- RIBBON BAR (y=0..21) -----------------------------------
 // 8 pad circles + waveform glyph + octave label + looper dot + separator.
-static void ui_draw_ribbon(void)
+// Each element has its own draw helper so ui_ribbon_update() can repaint
+// just the element that changed (no full clear → no flicker while playing).
+
+// Pad circles: centers at x=6+i*10, y=10 — radius 3. Each circle paints its
+// whole footprint (filled or ring + hollow), so no clear is needed.
+static void ribbon_draw_pad(int i, bool active)
 {
-    tft_fill(0, 0, TFT_W-1, 19, C_BLACK);
+    tft_pad_circle(6 + i * 10, 10, active);
+    s_rb_pad[i] = active;
+}
 
-    // Pad circles: centers at x=6+i*10, y=10 — radius 3, spaced for 160px
-    for (int i = 0; i < TOUCH_NOTE_PADS; i++)
-        tft_pad_circle(6 + i * 10, 10, s_pad_active[i]);
+// Waveform glyph (x=90..110, y=3..17) — orange
+static void ribbon_draw_wave(uint8_t wave_id)
+{
+    tft_fill(90, 3, 110, 17, C_BLACK);
+    ui_draw_wave_glyph(wave_id, 90, 3, 110, 17, C_ORANGE);
+    s_rb_wave = wave_id;
+}
 
-    // Waveform glyph (x=90..110, y=3..17) — orange
-    amy_engine_state_t st;
-    amy_engine_get_state(&st);
-    ui_draw_wave_glyph(st.wave_id, 90, 3, 110, 17, C_ORANGE);
-
-    // Octave label — yellow when shifted, dim gray at zero
+// Octave label — yellow when shifted, dim gray at zero. Always 5 chars wide,
+// and tft_text paints its background, so it overwrites the previous label.
+static void ribbon_draw_oct(int shift)
+{
     char oct_buf[8];
-    if (s_octave_shift == 0)
+    if (shift == 0)
         snprintf(oct_buf, sizeof(oct_buf), "OCT 0");
     else
-        snprintf(oct_buf, sizeof(oct_buf), "OCT%+d", s_octave_shift);
-    tft_text(oct_buf, 116, 6, s_octave_shift ? C_YELLOW : C_DKGRAY, C_BLACK, 1);
+        snprintf(oct_buf, sizeof(oct_buf), "OCT%+d", shift);
+    tft_text(oct_buf, 116, 6, shift ? C_YELLOW : C_DKGRAY, C_BLACK, 1);
+    s_rb_oct = shift;
+}
 
-    // Looper dot (5×5, top-right) — colors now correct with BGR fix
-    looper_state_t ls = looper_get_state();
+// Looper dot (5×5, top-right)
+static void ribbon_draw_loop(looper_state_t ls)
+{
     uint16_t lc = (ls == LOOPER_RECORDING) ? C_RED    :
                   (ls == LOOPER_PLAYING)   ? C_GREEN  :
                   (ls == LOOPER_OVERDUB)   ? C_YELLOW : C_BLACK;
     tft_fill(154, 5, 158, 9, lc);
+    s_rb_loop = ls;
+}
 
-    // Separator
-    tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY);
+// Full ribbon repaint — used on section changes (called last by ui_redraw).
+static void ui_draw_ribbon(void)
+{
+    tft_fill(0, 0, TFT_W-1, 19, C_BLACK);
+    for (int i = 0; i < TOUCH_NOTE_PADS; i++)
+        ribbon_draw_pad(i, s_pad_active[i]);
+    amy_engine_state_t st;
+    amy_engine_get_state(&st);
+    ribbon_draw_wave(st.wave_id);
+    ribbon_draw_oct(s_octave_shift);
+    ribbon_draw_loop(looper_get_state());
+    tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY); // separator
+    s_rb_valid = true;
+}
+
+// Partial ribbon refresh — compares live state against what is on screen and
+// repaints only the elements that differ. Cheap enough to run every UI tick.
+// Polling (instead of flags) also catches changes nobody signals, e.g. the
+// looper auto-switching REC → PLAY when its buffer fills.
+static void ui_ribbon_update(void)
+{
+    if (!s_rb_valid) { ui_draw_ribbon(); return; }
+
+    for (int i = 0; i < TOUCH_NOTE_PADS; i++) {
+        bool a = s_pad_active[i]; // read once — touch task may change it concurrently
+        if (a != s_rb_pad[i]) ribbon_draw_pad(i, a);
+    }
+
+    amy_engine_state_t st;
+    amy_engine_get_state(&st);
+    if (st.wave_id != s_rb_wave) ribbon_draw_wave(st.wave_id);
+
+    int oct = s_octave_shift;
+    if (oct != s_rb_oct) ribbon_draw_oct(oct);
+
+    looper_state_t ls = looper_get_state();
+    if (ls != s_rb_loop) ribbon_draw_loop(ls);
 }
 
 // ---- CARDS (top-level navigation) ---------------------------
@@ -926,6 +986,55 @@ static void ui_draw_main(void)
 // ---- CALIBRATION --------------------------------------------
 // Overview: 10 live bar columns (50 ms refresh), encoder selects pad, short press → edit.
 // Edit:     full-screen single-pad with RAW/BASE/THR and horizontal bar (preserved).
+// Live part of the single-pad edit screen: delta bar, threshold marker, numbers.
+// Called on its own every 50 ms (and on encoder turns), so it must never clear
+// a region it is about to repaint — every pixel is painted exactly once per call.
+static void ui_draw_calib_live(void)
+{
+    uint32_t raw  = touch_telemetry_get_raw((uint8_t)s_cal_pad);
+    uint32_t base = touch_telemetry_get_baseline((uint8_t)s_cal_pad);
+    uint16_t thr  = s_cal_thr;
+
+    // Large horizontal bar (x=4..155, y=54..88, 34px tall)
+    int bx0=4, bx1=TFT_W-5, by0=54, by1=88, blen=bx1-bx0;
+    // Use delta from baseline (not absolute raw) — absolute values are ~60000+
+    uint32_t dv = (raw >= base) ? (raw - base) : (base - raw);
+    // Fixed scale = base/8 so threshold marker position reflects actual thr value
+    uint32_t scale = base / 8;
+    if (scale < 2000) scale = 2000;
+    int raw_x = (int)(dv  * blen / scale); if (raw_x > blen) raw_x = blen;
+    int thr_x = (int)((uint32_t)thr * blen / scale); if (thr_x > blen) thr_x = blen;
+    int tx = bx0 + thr_x;
+
+    // Marker moved → erase the old one first (its tails stick out above/below
+    // the track, and at x=bx1+1 it sits outside the track entirely).
+    if (s_cal_last_tx >= 0 && s_cal_last_tx != tx)
+        tft_fill(s_cal_last_tx, by0-4, s_cal_last_tx+1, by1+4, C_BLACK);
+
+    // Bar as two non-overlapping segments: delta fill, then remaining track.
+    bool active_touch = (thr > 0 && dv > (uint32_t)thr);
+    int split = bx0;
+    if (raw_x > 0) {
+        tft_fill(bx0, by0, bx0+raw_x, by1, active_touch ? C_GREEN : C_DKGRAY);
+        split = bx0 + raw_x + 1;
+    }
+    if (split <= bx1)
+        tft_fill(split, by0, bx1, by1, C_LTGRAY);
+
+    // Threshold marker: orange 2px vertical line at thr position (moves with encoder)
+    tft_fill(tx, by0-4, tx+1, by1+4, C_ORANGE);
+    s_cal_last_tx = tx;
+
+    // Values — fixed-width fields; tft_text paints its background over old digits
+    char buf[20];
+    snprintf(buf, sizeof(buf), "RAW  %-7" PRIu32, raw);
+    tft_text(buf, 4, 96, C_WHITE, C_BLACK, 1);
+    snprintf(buf, sizeof(buf), "BASE %-7" PRIu32, base);
+    tft_text(buf, 4, 106, C_LTGRAY, C_BLACK, 1);
+    snprintf(buf, sizeof(buf), "THR  %5u", (unsigned)thr);
+    tft_text(buf, 86, 96, C_ORANGE, C_BLACK, 1);
+}
+
 static void ui_draw_calib(void)
 {
     tft_fill(0, 22, TFT_W-1, TFT_H-1, C_BLACK);
@@ -940,37 +1049,8 @@ static void ui_draw_calib(void)
         tft_text_bold(phdr, 4, 24, C_ORANGE, C_BLACK, 2);
         tft_fill(0, 42, TFT_W-1, 43, C_LTGRAY);
 
-        uint32_t raw  = touch_telemetry_get_raw((uint8_t)s_cal_pad);
-        uint32_t base = touch_telemetry_get_baseline((uint8_t)s_cal_pad);
-        uint16_t thr  = s_cal_thr;
-
-        // Large horizontal bar (x=4..155, y=54..88, 34px tall)
-        int bx0=4, bx1=TFT_W-5, by0=54, by1=88, blen=bx1-bx0;
-        // Use delta from baseline (not absolute raw) — absolute values are ~60000+
-        uint32_t dv = (raw >= base) ? (uint32_t)(raw - base) : (uint32_t)(base - raw);
-        // Fixed scale = base/8 so threshold marker position reflects actual thr value
-        uint32_t scale = (uint32_t)base / 8;
-        if (scale < 2000) scale = 2000;
-        int raw_x = (int)(dv  * blen / scale); if (raw_x > blen) raw_x = blen;
-        int thr_x = (int)((uint32_t)thr * blen / scale); if (thr_x > blen) thr_x = blen;
-        // Bar track (light gray)
-        tft_fill(bx0, by0, bx1, by1, C_LTGRAY);
-        // Delta fill — green when touching, dark gray otherwise
-        bool active_touch = (thr > 0 && dv > (uint32_t)thr);
-        if (raw_x > 0)
-            tft_fill(bx0, by0, bx0+raw_x, by1, active_touch ? C_GREEN : C_DKGRAY);
-        // Threshold marker: orange 2px vertical line at thr position (moves with encoder)
-        int tx = bx0 + thr_x;
-        tft_fill(tx, by0-4, tx+1, by1+4, C_ORANGE);
-
-        // Values (scale-1 for clean compact layout)
-        char buf[20];
-        snprintf(buf, sizeof(buf), "RAW  %-7" PRIu32, raw);
-        tft_text(buf, 4, 96, C_WHITE, C_BLACK, 1);
-        snprintf(buf, sizeof(buf), "BASE %-7" PRIu32, base);
-        tft_text(buf, 4, 106, C_LTGRAY, C_BLACK, 1);
-        snprintf(buf, sizeof(buf), "THR  %5u", (unsigned)thr);
-        tft_text(buf, 86, 96, C_ORANGE, C_BLACK, 1);
+        s_cal_last_tx = -1;      // screen was just cleared — no marker on it
+        ui_draw_calib_live();
 
         tft_fill(0, 117, TFT_W-1, 118, C_LTGRAY);
         tft_text("ROT:THR  BTN:SAVE  HLD:BACK", 2, 121, C_LTGRAY, C_BLACK, 1);
@@ -1217,15 +1297,17 @@ static void ui_exit_to_cards(void)
 
 // ── Public API ────────────────────────────────────────────────
 
-void ui_notify_lever(void) { s_dirty = true; }
+// Ribbon-only changes: no s_dirty here. ui_ribbon_update() (every UI tick)
+// notices the new state and repaints just that element. The main task owns
+// SPI — the touch task must never call tft_* directly.
+void ui_notify_lever(void) { }
 
-void ui_set_octave(int shift) { s_octave_shift = shift; s_dirty = true; }
+void ui_set_octave(int shift) { s_octave_shift = shift; }
 
 void ui_set_pad_active(uint8_t pad, bool active)
 {
-    if (pad >= TOUCH_NOTE_PADS || s_pad_active[pad] == active) return;
+    if (pad >= TOUCH_NOTE_PADS) return;
     s_pad_active[pad] = active;
-    s_dirty = true; // main task handles SPI — touch task must not call tft directly
 }
 
 void ui_init(void)
@@ -1283,8 +1365,6 @@ void ui_init(void)
 // vlong_press (3.5 s hold): cycles looper state when in UI_CARDS.
 void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
 {
-    bool changed = (delta != 0) || short_press || long_press || vlong_press;
-
     switch (s_sec) {
 
     case UI_CARDS:
@@ -1431,8 +1511,8 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
             if (delta) {
                 int t = (int)s_cal_thr + delta * 50;
                 if (t < 10) t = 10;
-                s_cal_thr = (uint16_t)t;
-                s_dirty   = true;
+                s_cal_thr  = (uint16_t)t;
+                s_cal_live = true;   // only bar/marker/THR change — no full redraw
             }
             if (short_press) {
                 touch_telemetry_set_threshold((uint8_t)s_cal_pad, s_cal_thr);
@@ -1559,16 +1639,25 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
         break;
     }
 
-    // Timed refresh only for CALIB — RAW/BASE update from hardware without user input
+    // CAL edit live readout — RAW/BASE change without user input, refresh at 20 Hz
     static TickType_t last_refresh = 0;
     TickType_t now = xTaskGetTickCount();
-    if (s_sec == UI_CALIB && s_cal_editing && !changed && (now - last_refresh) >= pdMS_TO_TICKS(50)) {
-        s_dirty      = true;
+    if (s_sec == UI_CALIB && s_cal_editing && (now - last_refresh) >= pdMS_TO_TICKS(50))
+        s_cal_live = true;
+
+    if (s_dirty) {
+        // Layout / section change → full repaint (body + ribbon)
+        s_dirty      = false;
+        s_cal_live   = false;
         last_refresh = now;
-    }
-    if (s_dirty || changed) {
-        last_refresh = now;
-        s_dirty = false;
         ui_redraw();
+    } else {
+        // Partial refresh only
+        if (s_cal_live) {
+            s_cal_live   = false;
+            last_refresh = now;
+            if (s_sec == UI_CALIB && s_cal_editing) ui_draw_calib_live();
+        }
+        ui_ribbon_update();
     }
 }

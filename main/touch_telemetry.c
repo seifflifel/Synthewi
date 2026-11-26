@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "touch_control.h"
 #include "amy_engine.h"
@@ -15,8 +16,13 @@
 
 static const char *TAG = "touch_telemetry";
 
-#define TOUCH_TELEM_HZ        30
+#define TOUCH_TELEM_HZ        100   // was 30 — polling period bounds note-on latency
 #define TOUCH_TELEM_PERIOD_MS (1000 / TOUCH_TELEM_HZ)
+
+// Diagnostic: logs every 5 s how often each channel's smoothed value changes
+// (≈ hardware scan rate). Measured 2026-11-26 with charge_times=600: ~31 updates/s
+// per channel (~32 ms full sweep). Set to 1 to re-measure after changing sampling.
+#define TOUCH_DIAG_RATE       0
 #define TOUCH_CHANNEL_COUNT   TOUCH_TOTAL_PADS  // 10: 8 note pads + oct- + oct+
 
 // Touch channel IDs: pads 0-7 = notes, pad 8 = oct- (GPIO9, ch9), pad 9 = oct+ (GPIO10, ch10)
@@ -26,7 +32,10 @@ static touch_sensor_t    s_touch_pads[TOUCH_CHANNEL_COUNT];
 static volatile uint16_t s_thresholds[TOUCH_CHANNEL_COUNT] = {100,100,100,100,100,100,100,100,100,100};
 static bool              s_prev_touching[TOUCH_CHANNEL_COUNT] = {false};
 static uint8_t           s_off_count[TOUCH_CHANNEL_COUNT]    = {0};
-#define TOUCH_OFF_DEBOUNCE  2   // samples below threshold before firing note_off (~66 ms at 30 Hz)
+// Samples below threshold before firing note_off. Time-based so it stays ~60 ms
+// whatever the polling rate (was 2 samples at 30 Hz ≈ 66 ms).
+#define TOUCH_OFF_DEBOUNCE_MS  60
+#define TOUCH_OFF_DEBOUNCE     ((TOUCH_OFF_DEBOUNCE_MS + TOUCH_TELEM_PERIOD_MS - 1) / TOUCH_TELEM_PERIOD_MS)
 static bool              s_started = false;
 
 static volatile touch_event_cb_t    s_event_cb    = NULL;
@@ -118,10 +127,27 @@ static void touch_telemetry_task(void *arg)
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
     TickType_t period    = pdMS_TO_TICKS(TOUCH_TELEM_PERIOD_MS);
+    if (period == 0) period = 1;
+
+#if TOUCH_DIAG_RATE
+    uint32_t diag_prev[TOUCH_CHANNEL_COUNT] = {0};
+    uint32_t diag_chg[TOUCH_CHANNEL_COUNT]  = {0};
+    uint32_t diag_polls = 0;
+    int64_t  diag_t0    = esp_timer_get_time();
+#endif
 
     while (1) {
+#if TOUCH_DIAG_RATE
+        diag_polls++;
+#endif
         for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
             touch_sensor_sample(&s_touch_pads[i]);
+#if TOUCH_DIAG_RATE
+            if (s_touch_pads[i].raw_value != diag_prev[i]) {
+                diag_chg[i]++;
+                diag_prev[i] = s_touch_pads[i].raw_value;
+            }
+#endif
             uint32_t delta    = abs_delta(&s_touch_pads[i]);
             uint32_t thresh   = s_thresholds[i];
             bool     touching = (delta >= thresh);
@@ -159,6 +185,20 @@ static void touch_telemetry_task(void *arg)
             }
         }
 
+#if TOUCH_DIAG_RATE
+        int64_t diag_now = esp_timer_get_time();
+        if (diag_now - diag_t0 >= 5000000LL) {
+            float secs = (diag_now - diag_t0) / 1e6f;
+            ESP_LOGI(TAG, "DIAG polls/s=%.0f  updates/s per ch: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f | %.0f %.0f",
+                     diag_polls / secs,
+                     diag_chg[0]/secs, diag_chg[1]/secs, diag_chg[2]/secs, diag_chg[3]/secs,
+                     diag_chg[4]/secs, diag_chg[5]/secs, diag_chg[6]/secs, diag_chg[7]/secs,
+                     diag_chg[8]/secs, diag_chg[9]/secs);
+            memset(diag_chg, 0, sizeof(diag_chg));
+            diag_polls = 0;
+            diag_t0    = diag_now;
+        }
+#endif
         vTaskDelayUntil(&last_wake, period);
     }
 }
