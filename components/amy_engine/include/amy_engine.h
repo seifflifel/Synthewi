@@ -39,16 +39,16 @@ typedef struct {
     uint16_t echo_amount;       // 0-10000 → level 0.0-1.0
     uint16_t echo_feedback;     // 0-10000 → feedback 0.0-0.9
     uint16_t echo_delay;        // 0-10000 → 50-500 ms
-    uint16_t filter_cutoff;     // 0-10000 → 200-10000 Hz
-    uint16_t filter_resonance;  // 0-10000 → Q 0.0-0.9
-    uint16_t env_attack;        // 0-10000 → 2-2000 ms
-    uint16_t env_decay;         // 0-10000 → 5-1000 ms
+    uint16_t filter_cutoff;     // 0-10000 → 60 Hz-18 kHz (exp)
+    uint16_t filter_resonance;  // 0-10000 → Q 0.7-11.2 (exp)
+    uint16_t env_attack;        // 0-10000 → 1 ms-3 s (exp)
+    uint16_t env_decay;         // 0-10000 → 5 ms-4 s (exp)
     uint16_t env_sustain;       // 0-10000 → 0-100 %
-    uint16_t env_release;       // 0-10000 → 10-5000 ms
-    uint16_t filter_env_depth;  // 0-10000 → 0-8000 Hz above cutoff
-    uint16_t filter_env_decay;  // 0-10000 → 5-2000 ms
-    uint16_t lfo_rate;          // 0-10000 → 0.1-10 Hz
-    uint16_t lfo_depth;         // 0-10000 → 0-5000 Hz filter swing
+    uint16_t env_release;       // 0-10000 → 10 ms-8 s (exp)
+    uint16_t filter_env_depth;  // 0-10000 → 0-5 octaves above cutoff at EG1 peak
+    uint16_t filter_env_decay;  // 0-10000 → 5 ms-4 s (exp)
+    uint16_t lfo_rate;          // 0-10000 → 0.1-20 Hz (exp)
+    uint16_t lfo_depth;         // 0-10000 → 0-3 octaves filter swing (±)
     uint16_t chorus_amount;     // 0-10000 → level 0.0-1.0
     uint16_t pressure_depth;   // 0-10000 → 0-8000 Hz added to filter at max press
     uint16_t glide;            // 0-10000 → 0-500 ms portamento time
@@ -62,7 +62,7 @@ void amy_engine_init(void);
 void amy_engine_note_on(uint8_t pad, uint8_t midi_note);
 void amy_engine_note_off(uint8_t pad);
 
-// Session-level params (all values 0-10000). Applied immediately and saved to NVS.
+// Session-level params (all values 0-10000). Applied immediately; persisted by amy_engine_save_state().
 void amy_engine_set_wave(uint8_t wave_id);
 void amy_engine_set_reverb(uint16_t amount, uint16_t decay);
 void amy_engine_set_echo(uint16_t amount, uint16_t feedback);
@@ -88,7 +88,22 @@ void amy_engine_get_state(amy_engine_state_t *out);
 // Persist current state to NVS (call on section exit / confirm, NOT on every encoder tick).
 void amy_engine_save_state(void);
 
-// Call every main loop tick: parks idle oscs at last played freq for cross-pad portamento.
-void amy_engine_park_idle_oscs(void);
+// Param (0-10000) → physical value, using the exact curves the engine plays with.
+// Use these for display so the UI always matches the sound.
+uint32_t amy_engine_attack_ms(uint16_t v);       // 1 ms – 3 s (exp)
+uint32_t amy_engine_decay_ms(uint16_t v);        // 5 ms – 4 s (exp)
+uint32_t amy_engine_release_ms(uint16_t v);      // 10 ms – 8 s (exp)
+float    amy_engine_filter_hz(uint16_t v);       // 60 Hz – 18 kHz (exp)
+float    amy_engine_filter_q(uint16_t v);        // Q 0.7 – 11.2 (exp)
+float    amy_engine_lfo_hz(uint16_t v);          // 0.1 – 20 Hz (exp)
+float    amy_engine_lfo_depth_oct(uint16_t v);   // 0 – 3 octaves
+float    amy_engine_fenv_depth_oct(uint16_t v);  // 0 – 5 octaves
+uint32_t amy_engine_fenv_decay_ms(uint16_t v);   // 5 ms – 4 s (exp)
+uint32_t amy_engine_glide_ms(uint16_t v);        // 0 – 500 ms
+
+// Convert values saved with the old v3 (linear) curves to the current curves,
+// preserving their physical meaning. Any pointer may be NULL.
+void amy_engine_migrate_v3(uint16_t *atk, uint16_t *dec, uint16_t *rel,
+                           uint16_t *cut, uint16_t *fenv_dec, uint16_t *lfo_rt);
 
 #endif // AMY_ENGINE_H

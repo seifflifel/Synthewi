@@ -195,8 +195,6 @@ void app_main(void)
     uint8_t lever_wave        = 0xFF; // sentinel: force apply on first tick
 
     for (;;) {
-        amy_engine_park_idle_oscs();
-
         // Lever waveform selector
         {
             uint8_t b0 = (uint8_t)gpio_get_level(WAVE_GPIO0);

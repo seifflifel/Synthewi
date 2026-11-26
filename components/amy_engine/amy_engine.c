@@ -17,19 +17,21 @@ static const char *TAG = "AMY_ENGINE";
 // ---------------------------------------------------------------------------
 // Session synth state (all uint16 params use 0-10000 scale)
 // ---------------------------------------------------------------------------
-#define NVS_SYNTH_VERSION 3  // bump when param formulas change; forces fresh defaults
+// Bump when param curves change. v3 → v4 (2026-11): times/cutoff/LFO rate went
+// exponential; v3 saves are migrated on load (amy_engine_migrate_v3), not reset.
+#define NVS_SYNTH_VERSION 4
 
 static uint8_t  s_wave_id            = AMY_ENGINE_WAVE_SQUARE;
 static uint8_t  s_filter_type        = AMY_ENGINE_FILTER_LPF;
-static uint16_t s_filter_cutoff      = 5000; // ~814 Hz LPF — audible starting point
+static uint16_t s_filter_cutoff      = 5000; // ~1 kHz LPF — audible starting point
 static uint16_t s_filter_resonance   = 0;
-static uint16_t s_env_attack         = 50;    // ~12 ms
-static uint16_t s_env_decay          = 2000;  // ~204 ms
+static uint16_t s_env_attack         = 1500;  // ~3 ms
+static uint16_t s_env_decay          = 6000;  // ~275 ms
 static uint16_t s_env_sustain        = 7000;  // 70 %
-static uint16_t s_env_release        = 5000;  // ~2.5 s
+static uint16_t s_env_release        = 6000;  // ~550 ms
 static uint16_t s_filter_env_depth   = 0;
-static uint16_t s_filter_env_decay   = 1000;  // ~205 ms
-static uint16_t s_lfo_rate           = 2000;  // ~2 Hz
+static uint16_t s_filter_env_decay   = 5000;  // ~140 ms
+static uint16_t s_lfo_rate           = 4000;  // ~0.8 Hz
 static uint16_t s_lfo_depth          = 0;
 static uint16_t s_chorus_amount      = 0;
 static uint16_t s_pressure_depth     = 0; // 0 = feature off
@@ -40,7 +42,6 @@ static uint16_t s_echo_delay_scaled  = 5000; // 0-10000 → 50-500 ms; 5000 ≈ 
 static synth_mode_t s_mode             = SYNTH_MODE_CUSTOM;
 static uint8_t      s_patch_num        = 0;  // 0-127 within current bank
 
-static float   s_last_freq_hz                   = 0.0f;  // last note freq for cross-pad portamento
 static bool    s_pad_active[SYNTH_PAD_COUNT]    = {false};
 static uint8_t s_pad_midi_note[SYNTH_PAD_COUNT] = {0}; // last midi note played per pad
 
@@ -60,24 +61,91 @@ static bool s_initialized = false;
 #define LFO_OSC  8
 
 // ---------------------------------------------------------------------------
-// Scaling helpers
-// Filter cutoff: 200 Hz at min, 12000 Hz at max (exponential, ~6 octaves).
-static float    sc_filter_hz(uint16_t v)     { return fminf(200.0f * powf(2.0f, 5.9f * (v / 10000.0f)), 12000.0f); }
-// Filter resonance: Spark Synth exponential — Q≈0.7 (flat) at 0, Q≈11 at max.
-static float    sc_filter_res(uint16_t v)    { return 0.7f  * powf(2.0f, 4.0f   *  (v / 10000.0f)); }
-// LFO rate: Juno formula — ~0.5 Hz at 0, ~20 Hz at max.
-static float    sc_lfo_rate_hz(uint16_t v)   { return fmaxf(0.6f * powf(2.0f, 0.04f * ((v / 10000.0f) * 127.0f)) - 0.1f, 0.001f); }
-// LFO depth: linear 0–5000 Hz filter swing.
-static float    sc_lfo_depth_hz(uint16_t v)  { return (v / 10000.0f) * 5000.0f; }
-static uint32_t sc_attack_ms(uint16_t v)     { return (uint32_t)(2.0f  + (v / 10000.0f) * 1998.0f); }
-static uint32_t sc_decay_ms(uint16_t v)      { return (uint32_t)(5.0f  + (v / 10000.0f) *  995.0f); }
-static float    sc_sustain_f(uint16_t v)     { return v / 10000.0f; }
-static uint32_t sc_release_ms(uint16_t v)    { return (uint32_t)(10.0f + (v / 10000.0f) * 4990.0f); }
-static float    sc_fenv_depth_hz(uint16_t v) { return (v / 10000.0f) * 8000.0f; }
-static uint32_t sc_fenv_decay_ms(uint16_t v) { return (uint32_t)(5.0f  + (v / 10000.0f) * 1995.0f); }
-static float    sc_ks_feedback(uint16_t v)   { return 0.85f + (v / 10000.0f) * 0.145f; }
-static uint16_t sc_portamento_ms(uint16_t v) { return (uint16_t)((v / 10000.0f) * 500.0f); }
-static float    sc_echo_delay_ms(uint16_t v) { return fmaxf(50.0f + (v / 10000.0f) * 450.0f, 10.0f); }
+// Parameter curves (0-10000 → physical) — format v4, 2026-11.
+// Single source of truth: the UI displays values through the amy_engine_*()
+// wrappers below, so screen and sound can never disagree.
+//
+// Times and frequencies are EXPONENTIAL: every encoder click (500) multiplies
+// the value by a constant ratio, giving fine control at the short/low end.
+//   attack      1 ms – 3 s        decay / EG1 decay   5 ms – 4 s
+//   release    10 ms – 8 s        filter cutoff      60 Hz – 18 kHz
+//   LFO rate  0.1 Hz – 20 Hz      resonance Q        0.7 – 11.2
+// Linear: sustain 0–100 %, EG1 depth 0–5 oct, LFO depth 0–3 oct,
+//         glide 0–500 ms, echo level/feedback, echo delay 50–500 ms.
+//
+// NOTE: AMY combines filter-frequency controls in the log2 domain. Only
+// filter_freq_coefs[COEF_CONST] is in Hz; COEF_EG1 / COEF_MOD are in OCTAVES.
+// ---------------------------------------------------------------------------
+#define ATK_MIN_MS     1.0f
+#define ATK_MAX_MS  3000.0f
+#define DEC_MIN_MS     5.0f
+#define DEC_MAX_MS  4000.0f
+#define REL_MIN_MS    10.0f
+#define REL_MAX_MS  8000.0f
+#define FLT_MIN_HZ    60.0f
+#define FLT_MAX_HZ 18000.0f
+#define LFO_MIN_HZ     0.1f
+#define LFO_MAX_HZ    20.0f
+#define FENV_DEC_MIN_MS    5.0f
+#define FENV_DEC_MAX_MS 4000.0f
+#define LFO_DEPTH_MAX_OCT  3.0f
+#define FENV_DEPTH_MAX_OCT 5.0f
+
+// lo · (hi/lo)^(v/10000)
+static float exp_map(uint16_t v, float lo, float hi) { return lo * powf(hi / lo, v / 10000.0f); }
+// Inverse of exp_map, clamped to 0..10000 (used for migrating old saved values).
+static uint16_t exp_unmap(float x, float lo, float hi)
+{
+    if (x <= lo) return 0;
+    if (x >= hi) return 10000;
+    return (uint16_t)lroundf(10000.0f * logf(x / lo) / logf(hi / lo));
+}
+
+static float    sc_filter_hz(uint16_t v)      { return exp_map(v, FLT_MIN_HZ, FLT_MAX_HZ); }
+// Filter resonance: Q≈0.7 (flat) at 0, Q≈11.2 at max.
+static float    sc_filter_res(uint16_t v)     { return 0.7f * powf(2.0f, 4.0f * (v / 10000.0f)); }
+static float    sc_lfo_rate_hz(uint16_t v)    { return exp_map(v, LFO_MIN_HZ, LFO_MAX_HZ); }
+// LFO depth: ± octaves of filter swing around the cutoff.
+static float    sc_lfo_depth_oct(uint16_t v)  { return (v / 10000.0f) * LFO_DEPTH_MAX_OCT; }
+static uint32_t sc_attack_ms(uint16_t v)      { return (uint32_t)lroundf(exp_map(v, ATK_MIN_MS, ATK_MAX_MS)); }
+static uint32_t sc_decay_ms(uint16_t v)       { return (uint32_t)lroundf(exp_map(v, DEC_MIN_MS, DEC_MAX_MS)); }
+static float    sc_sustain_f(uint16_t v)      { return v / 10000.0f; }
+static uint32_t sc_release_ms(uint16_t v)     { return (uint32_t)lroundf(exp_map(v, REL_MIN_MS, REL_MAX_MS)); }
+// Filter envelope (EG1) depth: octaves above the cutoff at the envelope peak.
+static float    sc_fenv_depth_oct(uint16_t v) { return (v / 10000.0f) * FENV_DEPTH_MAX_OCT; }
+static uint32_t sc_fenv_decay_ms(uint16_t v)  { return (uint32_t)lroundf(exp_map(v, FENV_DEC_MIN_MS, FENV_DEC_MAX_MS)); }
+static float    sc_ks_feedback(uint16_t v)    { return 0.85f + (v / 10000.0f) * 0.145f; }
+static uint16_t sc_portamento_ms(uint16_t v)  { return (uint16_t)((v / 10000.0f) * 500.0f); }
+static float    sc_echo_delay_ms(uint16_t v)  { return fmaxf(50.0f + (v / 10000.0f) * 450.0f, 10.0f); }
+
+// Public display wrappers (see amy_engine.h)
+uint32_t amy_engine_attack_ms(uint16_t v)       { return sc_attack_ms(v); }
+uint32_t amy_engine_decay_ms(uint16_t v)        { return sc_decay_ms(v); }
+uint32_t amy_engine_release_ms(uint16_t v)      { return sc_release_ms(v); }
+float    amy_engine_filter_hz(uint16_t v)       { return sc_filter_hz(v); }
+float    amy_engine_filter_q(uint16_t v)        { return sc_filter_res(v); }
+float    amy_engine_lfo_hz(uint16_t v)          { return sc_lfo_rate_hz(v); }
+float    amy_engine_lfo_depth_oct(uint16_t v)   { return sc_lfo_depth_oct(v); }
+float    amy_engine_fenv_depth_oct(uint16_t v)  { return sc_fenv_depth_oct(v); }
+uint32_t amy_engine_fenv_decay_ms(uint16_t v)   { return sc_fenv_decay_ms(v); }
+uint32_t amy_engine_glide_ms(uint16_t v)        { return sc_portamento_ms(v); }
+
+// Convert values saved with the v3 (linear) curves to the v4 curves so saved
+// sounds keep their physical attack/decay/release/cutoff/EG1-decay/LFO-rate.
+// Any pointer may be NULL.
+void amy_engine_migrate_v3(uint16_t *atk, uint16_t *dec, uint16_t *rel,
+                           uint16_t *cut, uint16_t *fenv_dec, uint16_t *lfo_rt)
+{
+    if (atk)      *atk      = exp_unmap(2.0f  + (*atk / 10000.0f) * 1998.0f, ATK_MIN_MS, ATK_MAX_MS);
+    if (dec)      *dec      = exp_unmap(5.0f  + (*dec / 10000.0f) *  995.0f, DEC_MIN_MS, DEC_MAX_MS);
+    if (rel)      *rel      = exp_unmap(10.0f + (*rel / 10000.0f) * 4990.0f, REL_MIN_MS, REL_MAX_MS);
+    if (cut)      *cut      = exp_unmap(fminf(200.0f * powf(2.0f, 5.9f * (*cut / 10000.0f)), 12000.0f),
+                                        FLT_MIN_HZ, FLT_MAX_HZ);
+    if (fenv_dec) *fenv_dec = exp_unmap(5.0f + (*fenv_dec / 10000.0f) * 1995.0f,
+                                        FENV_DEC_MIN_MS, FENV_DEC_MAX_MS);
+    if (lfo_rt)   *lfo_rt   = exp_unmap(fmaxf(0.6f * powf(2.0f, 0.04f * ((*lfo_rt / 10000.0f) * 127.0f)) - 0.1f, 0.001f),
+                                        LFO_MIN_HZ, LFO_MAX_HZ);
+}
 
 // ---------------------------------------------------------------------------
 // NVS persistence
@@ -115,8 +183,9 @@ static void nvs_load_all(void)
     if (nvs_open("synth", NVS_READONLY, &h) != ESP_OK) return;
     uint8_t  u8  = 0;
     uint16_t u16 = 0;
-    // Version check — stale NVS (different formula) gets ignored; fresh defaults used.
-    if (nvs_get_u8(h, "ver", &u8) != ESP_OK || u8 != NVS_SYNTH_VERSION) {
+    // Version check — v3 is migrated below; anything else unknown → fresh defaults.
+    uint8_t ver = 0;
+    if (nvs_get_u8(h, "ver", &ver) != ESP_OK || (ver != NVS_SYNTH_VERSION && ver != 3)) {
         nvs_close(h);
         ESP_LOGI(TAG, "NVS version mismatch — using defaults");
         return;
@@ -140,9 +209,21 @@ static void nvs_load_all(void)
     if (nvs_get_u16(h, "echo_fb",   &u16) == ESP_OK) s_echo_feedback      = u16;
     if (nvs_get_u16(h, "echo_dly",  &u16) == ESP_OK) s_echo_delay_scaled  = u16;
     nvs_close(h);
+
+    if (ver == 3) {
+        amy_engine_migrate_v3(&s_env_attack, &s_env_decay, &s_env_release,
+                              &s_filter_cutoff, &s_filter_env_decay, &s_lfo_rate);
+        nvs_save_all(); // persist as v4
+        ESP_LOGI(TAG, "NVS synth state migrated v3 → v4");
+    }
 }
 
-// Kick the dedicated LFO oscillator with current rate/depth.
+// Configure the dedicated LFO oscillator (rate only — depth is COEF_MOD on the pad oscs).
+// It must NOT get a note-on: velocity>0 sets its status to SYNTH_AUDIBLE, which
+// mixed a full-scale 2 Hz sine into the output and advanced its phase twice per
+// block. As a mod source (status set by the pads' mod_source) AMY evaluates it
+// on demand via compute_mod_value(); each pad note-on re-triggers its phase.
+// With all amp coefs except CONST at 0, its amplitude is a constant 1.0.
 static void setup_lfo_osc(void)
 {
     amy_event e = amy_default_event();
@@ -150,32 +231,26 @@ static void setup_lfo_osc(void)
     e.wave = SINE;
     e.freq_coefs[COEF_CONST] = sc_lfo_rate_hz(s_lfo_rate);
     e.freq_coefs[COEF_NOTE]  = 0.0f;
-    e.amp_coefs[COEF_CONST]  = 1.0f;  // fixed amplitude — depth is COEF_MOD on voice oscs
-    e.amp_coefs[COEF_EG0]    = 0.0f;  // EG0 doesn't scale amplitude, only keeps osc alive
+    e.amp_coefs[COEF_CONST]  = 1.0f;
+    e.amp_coefs[COEF_EG0]    = 0.0f;
     e.amp_coefs[COEF_VEL]    = 0.0f;
     e.amp_coefs[COEF_NOTE]   = 0.0f;
-    // Explicit EG0 that holds for 10 minutes — prevents AMY from transitioning osc to SYNTH_OFF
-    // when the default EG completes. COEF_EG0=0 means these values don't affect amplitude.
-    e.eg0_times[0]  = 1;      e.eg0_values[0] = 1.0f;  // 1ms attack
-    e.eg0_times[1]  = 600000; e.eg0_values[1] = 1.0f;  // 600s sustain
-    e.eg0_times[2]  = 600000; e.eg0_values[2] = 1.0f;  // 600s release (never sent, just in case)
-    e.velocity               = 1.0f;  // transition osc to SYNTH_RUNNING
     amy_add_event(&e);
 }
 
 // Lightweight filter+LFO update — sends filter fields + mod_source wiring to all pad oscs.
 static void apply_filter_to_all_oscs(void)
 {
-    float base_hz  = sc_filter_hz(s_filter_cutoff);
-    float depth_hz = sc_lfo_depth_hz(s_lfo_depth);
+    float base_hz   = sc_filter_hz(s_filter_cutoff);
+    float depth_oct = sc_lfo_depth_oct(s_lfo_depth);
     for (uint8_t pad = 0; pad < SYNTH_PAD_COUNT; pad++) {
         amy_event e = amy_default_event();
         e.osc                           = pad;
         e.mod_source                    = LFO_OSC;            // wire LFO osc as modulator
         e.filter_type                   = s_filter_type_map[s_filter_type];
-        e.filter_freq_coefs[COEF_CONST] = base_hz;
-        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
-        e.filter_freq_coefs[COEF_MOD]   = depth_hz;          // LFO output × depth_hz = Hz swing
+        e.filter_freq_coefs[COEF_CONST] = base_hz;            // Hz
+        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_oct(s_filter_env_depth); // octaves
+        e.filter_freq_coefs[COEF_MOD]   = depth_oct;          // LFO (±1) × octaves
         e.resonance                     = sc_filter_res(s_filter_resonance);
         e.eg1_times[0] = 5;                                    e.eg1_values[0] = 1.0f;
         e.eg1_times[1] = sc_fenv_decay_ms(s_filter_env_decay); e.eg1_values[1] = 0.0f;
@@ -220,8 +295,8 @@ static void setup_custom_synth(void)
         e.mod_source                    = LFO_OSC;
         e.filter_type                   = s_filter_type_map[s_filter_type];
         e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
-        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
-        e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
+        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_oct(s_filter_env_depth);
+        e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_oct(s_lfo_depth);
         e.resonance                     = sc_filter_res(s_filter_resonance);
         e.eg1_times[0] = 5;                                    e.eg1_values[0] = 1.0f;
         e.eg1_times[1] = sc_fenv_decay_ms(s_filter_env_decay); e.eg1_values[1] = 0.0f;
@@ -321,25 +396,10 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
     amy_event e = amy_default_event();
 
     if (s_mode == SYNTH_MODE_CUSTOM) {
-        // Re-arm LFO osc on first note of each phrase (all pads were idle)
-        // Avoids phase jumps mid-chord while guaranteeing LFO is alive after long silences
-        bool any_active = false;
-        for (int i = 0; i < SYNTH_PAD_COUNT; i++) any_active |= s_pad_active[i];
-        if (!any_active) setup_lfo_osc();
-
         float freq = 440.0f * powf(2.0f, ((float)midi_note - 69.0f) / 12.0f);
 
-        // Cross-pad portamento: prime the idle osc at the last played frequency so AMY's
-        // portamento glides from there rather than from logfreq=0.
-        // The prep event sets the freq target; after one render block the osc's last_logfreq
-        // is updated, so the following note_on glides correctly.
-        if (s_portamento > 0 && s_last_freq_hz > 0.0f && !s_pad_active[pad]) {
-            amy_event prep = amy_default_event();
-            prep.osc = pad;
-            prep.freq_coefs[COEF_CONST] = s_last_freq_hz;
-            amy_add_event(&prep);
-        }
-
+        // Cross-pad glide is handled inside AMY (patched note-on): each note
+        // glides from the previous note-on pitch of any pad when portamento_ms > 0.
         e.osc                    = pad;
         e.freq_coefs[COEF_CONST] = freq;
         e.pan_coefs[COEF_CONST]  = 0.5f;
@@ -357,15 +417,14 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
         e.mod_source                    = LFO_OSC;
         e.filter_type                   = s_filter_type_map[s_filter_type];
         e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
-        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_hz(s_filter_env_depth);
-        e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_hz(s_lfo_depth);
+        e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_oct(s_filter_env_depth);
+        e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_oct(s_lfo_depth);
         e.resonance                     = sc_filter_res(s_filter_resonance);
         e.eg1_times[0] = 5;                                    e.eg1_values[0] = 1.0f;
         e.eg1_times[1] = sc_fenv_decay_ms(s_filter_env_decay); e.eg1_values[1] = 0.0f;
         e.eg1_times[2] = 0;                                    e.eg1_values[2] = 0.0f;
         e.portamento_ms = sc_portamento_ms(s_portamento);
         e.velocity = 1.0f;
-        s_last_freq_hz = freq;
     } else {
         e.synth     = SYNTH_CH_PATCH;
         e.midi_note = (float)midi_note;
@@ -557,17 +616,4 @@ void amy_engine_get_state(amy_engine_state_t *out)
 void amy_engine_save_state(void)
 {
     nvs_save_all();
-}
-
-void amy_engine_park_idle_oscs(void)
-{
-    if (!s_initialized || s_portamento == 0 || s_last_freq_hz <= 0.0f) return;
-    if (s_mode != SYNTH_MODE_CUSTOM) return;
-    for (uint8_t pad = 0; pad < SYNTH_PAD_COUNT; pad++) {
-        if (s_pad_active[pad]) continue;
-        amy_event e = amy_default_event();
-        e.osc = pad;
-        e.freq_coefs[COEF_CONST] = s_last_freq_hz;
-        amy_add_event(&e);
-    }
 }

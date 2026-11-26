@@ -276,13 +276,16 @@ static inline uint16_t u16clamp(int v) { return (uint16_t)(v < 0 ? 0 : v > 10000
 // ── Presets ──────────────────────────────────────────────────
 #define PRESET_COUNT  6
 #define PRESET_MAGIC  0xA5u
+// Param-curve format stored in preset_t.fmt (was the always-0 "_pad" byte).
+// 0 = v3 linear curves (migrated on load), 4 = current curves (amy_engine v4).
+#define PRESET_FMT    4u
 #define PRESET_NVS_NS "pst"
 
 typedef struct __attribute__((packed)) {
     uint8_t  magic;
     uint8_t  wave_id;
     uint8_t  flt_type;
-    uint8_t  _pad;
+    uint8_t  fmt;      // param-curve format, see PRESET_FMT (old saves: 0)
     uint16_t flt_cut;
     uint16_t flt_res;
     uint16_t env_atk;
@@ -301,6 +304,11 @@ typedef struct __attribute__((packed)) {
 
 static preset_t s_presets[PRESET_COUNT];
 static bool     s_preset_valid[PRESET_COUNT];
+// Preset display names, stored as separate NVS strings ("n0".."n5") so the
+// preset_t blob format stays unchanged. Empty = generic "P1".."P6" (shows the
+// wave name instead). Factory presets are named; SAVE and CLR clear the name.
+#define PRESET_NAME_LEN 8   // max chars that fit in a preset cell (6 px/char)
+static char     s_preset_name[PRESET_COUNT][PRESET_NAME_LEN + 1];
 
 static int  s_prst_cur    = 0;     // 0..5 currently highlighted slot
 static bool s_prst_action = false; // in action sub-menu
@@ -324,16 +332,21 @@ static int      s_adsr_cur     = 0;  // 0=A 1=D 2=S 3=R
 static bool     s_adsr_editing = false;
 static uint16_t s_adsr[4];           // loaded from engine on enter
 
-// ── ADSR display conversion ───────────────────────────────────
-static uint32_t ui_a_ms(uint16_t v)      { return (uint32_t)(2.0f   + (v/10000.0f)*1998.0f); }
-static uint32_t ui_d_ms(uint16_t v)      { return (uint32_t)(5.0f   + (v/10000.0f)*995.0f);  }
-static uint32_t ui_s_pct(uint16_t v)     { return v / 100u; }
-static uint32_t ui_r_ms(uint16_t v)      { return (uint32_t)(10.0f  + (v/10000.0f)*4990.0f); }
-static float    ui_filter_hz(uint16_t v) { return fminf(200.0f * powf(2.0f, 5.9f * (v/10000.0f)), 12000.0f); }
-static float    ui_filter_q(uint16_t v)  { return 0.7f  * powf(2.0f, 4.0f * (v/10000.0f)); }
-static float    ui_lfo_hz(uint16_t v)    { return fmaxf(0.6f*powf(2.0f,0.04f*((v/10000.0f)*127.0f))-0.1f,0.001f); }
-static uint32_t ui_eg1_decay_ms(uint16_t v) { return (uint32_t)(5.0f + (v/10000.0f)*1995.0f); }
-static uint32_t ui_glide_ms(uint16_t v)  { return (uint32_t)((v/10000.0f)*500.0f); }
+// ── Display conversion ────────────────────────────────────────
+// Thin wrappers over the engine's curves (amy_engine.c is the single source of
+// truth) — the screen always shows exactly what the engine plays.
+static uint32_t ui_a_ms(uint16_t v)         { return amy_engine_attack_ms(v); }
+static uint32_t ui_d_ms(uint16_t v)         { return amy_engine_decay_ms(v); }
+static uint32_t ui_s_pct(uint16_t v)        { return v / 100u; }
+static uint32_t ui_r_ms(uint16_t v)         { return amy_engine_release_ms(v); }
+static float    ui_filter_hz(uint16_t v)    { return amy_engine_filter_hz(v); }
+static float    ui_filter_q(uint16_t v)     { return amy_engine_filter_q(v); }
+static float    ui_lfo_hz(uint16_t v)       { return amy_engine_lfo_hz(v); }
+static uint32_t ui_eg1_decay_ms(uint16_t v) { return amy_engine_fenv_decay_ms(v); }
+static uint32_t ui_glide_ms(uint16_t v)     { return amy_engine_glide_ms(v); }
+// EG1 / LFO filter depth in tenths of an octave
+static unsigned ui_fenv_oct10(uint16_t v)   { return (unsigned)lroundf(amy_engine_fenv_depth_oct(v) * 10.0f); }
+static unsigned ui_lfo_oct10(uint16_t v)    { return (unsigned)lroundf(amy_engine_lfo_depth_oct(v) * 10.0f); }
 
 // Returns fraction string for echo delay (0-10000 scale, snapped to nearest 1/x of a second).
 static const char* ui_echo_frac(uint16_t v) {
@@ -357,6 +370,23 @@ static int echo_snap_idx(uint16_t v) {
 
 // ── Preset helpers ────────────────────────────────────────────
 
+static void preset_nvs_save(int slot);
+
+// Convert a preset saved with the old v3 (linear) curves to the current ones,
+// keeping its physical attack/decay/release/cutoff/EG1-decay/LFO-rate.
+static void preset_migrate(preset_t *p)
+{
+    if (p->fmt == 0) {
+        // preset_t is packed — copy through aligned locals (no pointers to packed members)
+        uint16_t atk = p->env_atk, dec = p->env_dec, rel = p->env_rel;
+        uint16_t cut = p->flt_cut, fdec = p->eg1_decay, lfo = p->lfo_rt;
+        amy_engine_migrate_v3(&atk, &dec, &rel, &cut, &fdec, &lfo);
+        p->env_atk = atk; p->env_dec = dec; p->env_rel = rel;
+        p->flt_cut = cut; p->eg1_decay = fdec; p->lfo_rt = lfo;
+    }
+    p->fmt = PRESET_FMT;
+}
+
 static void preset_nvs_load(int slot)
 {
     char key[4];
@@ -364,13 +394,23 @@ static void preset_nvs_load(int slot)
     nvs_handle_t h;
     if (nvs_open(PRESET_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
         s_preset_valid[slot] = false;
+        s_preset_name[slot][0] = '\0';
         return;
     }
     size_t sz = sizeof(preset_t);
     esp_err_t err = nvs_get_blob(h, key, &s_presets[slot], &sz);
+    char nkey[4];
+    snprintf(nkey, sizeof(nkey), "n%d", slot);
+    size_t nlen = sizeof(s_preset_name[slot]);
+    if (nvs_get_str(h, nkey, s_preset_name[slot], &nlen) != ESP_OK)
+        s_preset_name[slot][0] = '\0';
     nvs_close(h);
     s_preset_valid[slot] = (err == ESP_OK && sz == sizeof(preset_t)
                             && s_presets[slot].magic == PRESET_MAGIC);
+    if (s_preset_valid[slot] && s_presets[slot].fmt != PRESET_FMT) {
+        preset_migrate(&s_presets[slot]);
+        preset_nvs_save(slot);   // persist converted values once
+    }
 }
 
 static void preset_nvs_save(int slot)
@@ -380,6 +420,24 @@ static void preset_nvs_save(int slot)
     nvs_handle_t h;
     if (nvs_open(PRESET_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_blob(h, key, &s_presets[slot], sizeof(preset_t));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Set (name != NULL/"") or remove (NULL/"") a preset's display name.
+static void preset_name_set(int slot, const char *name)
+{
+    char nkey[4];
+    snprintf(nkey, sizeof(nkey), "n%d", slot);
+    nvs_handle_t h;
+    if (nvs_open(PRESET_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (name && name[0]) {
+        snprintf(s_preset_name[slot], sizeof(s_preset_name[slot]), "%s", name);
+        nvs_set_str(h, nkey, s_preset_name[slot]);
+    } else {
+        s_preset_name[slot][0] = '\0';
+        nvs_erase_key(h, nkey);
+    }
     nvs_commit(h);
     nvs_close(h);
 }
@@ -395,6 +453,7 @@ static void preset_nvs_clear(int slot)
     nvs_close(h);
     s_preset_valid[slot] = false;
     memset(&s_presets[slot], 0, sizeof(preset_t));
+    preset_name_set(slot, NULL);   // cleared slot loses its name
 }
 
 static void preset_capture(int slot)
@@ -405,7 +464,7 @@ static void preset_capture(int slot)
     p->magic    = PRESET_MAGIC;
     p->wave_id  = st.wave_id;
     p->flt_type = st.filter_type;
-    p->_pad     = 0;
+    p->fmt      = PRESET_FMT;
     p->flt_cut  = st.filter_cutoff;
     p->flt_res  = st.filter_resonance;
     p->env_atk  = st.env_attack;
@@ -706,7 +765,9 @@ static void ui_draw_presets(void)
             ui_draw_wave_glyph(p->wave_id, gx0, body_top+2, gx0+19, body_top+13, fc);
 
             // Wave name (2 chars)
-            const char *wname = (p->wave_id < 7) ? wn[p->wave_id] : "??";
+            // Preset name if it has one (factory presets), else the wave name
+            const char *wname = s_preset_name[i][0] ? s_preset_name[i]
+                              : (p->wave_id < 7) ? wn[p->wave_id] : "??";
             tft_text(wname, cx+2, body_top+16, fc, C_BLACK, 1);
 
             // Filter cutoff summary
@@ -717,7 +778,7 @@ static void ui_draw_presets(void)
             tft_text(fstr, cx+2, body_top+26, fc, C_BLACK, 1);
 
             // Attack summary
-            uint32_t atk = (uint32_t)(2.0f + (p->env_atk/10000.0f)*1998.0f);
+            uint32_t atk = ui_a_ms(p->env_atk);
             char astr[6];
             snprintf(astr, sizeof(astr), atk >= 1000 ? "A%uK" : "A%u",
                      (unsigned)(atk >= 1000 ? atk/1000 : atk));
@@ -798,7 +859,7 @@ static void ui_draw_main_overview(void)
         case 1: { // FLT — type + F + Q
             tft_text(flt_nm[st.filter_type], bx, by, oc, C_BLACK, 1);
             float fhz = ui_filter_hz(st.filter_cutoff);
-            char buf[16];
+            char buf[24];
             if(fhz>=1000.0f) snprintf(buf,sizeof(buf),"F%3uK",(unsigned)(fhz/1000.0f+0.5f));
             else              snprintf(buf,sizeof(buf),"F%4u",(unsigned)fhz);
             tft_text(buf, bx, by+9,  oc, C_BLACK, 1);
@@ -809,8 +870,9 @@ static void ui_draw_main_overview(void)
             break;
         }
         case 2: { // EG1 — depth + decay
-            char buf[16];
-            snprintf(buf,sizeof(buf),"F%4u",(unsigned)((st.filter_env_depth/10000.0f)*8000.0f));
+            char buf[24];
+            { unsigned t = ui_fenv_oct10(st.filter_env_depth);
+              snprintf(buf,sizeof(buf),"F+%u.%uOCT",t/10,t%10); }
             tft_text(buf, bx, by,   oc, C_BLACK, 1);
             snprintf(buf,sizeof(buf),"D%4u",(unsigned)ui_eg1_decay_ms(st.filter_env_decay));
             tft_text(buf, bx, by+9, oc, C_BLACK, 1);
@@ -819,15 +881,16 @@ static void ui_draw_main_overview(void)
         case 3: { // LFO — rate + depth
             float rh2=ui_lfo_hz(st.lfo_rate);
             uint32_t rh10=(uint32_t)(rh2*10.0f);
-            char buf[16];
+            char buf[24];
             snprintf(buf,sizeof(buf),"R%u.%uHZ",(unsigned)(rh10/10),(unsigned)(rh10%10));
             tft_text(buf, bx, by,   oc, C_BLACK, 1);
-            snprintf(buf,sizeof(buf),"D%4u",(unsigned)((st.lfo_depth/10000.0f)*5000.0f));
+            { unsigned t = ui_lfo_oct10(st.lfo_depth);
+              snprintf(buf,sizeof(buf),"D%u.%uOCT",t/10,t%10); }
             tft_text(buf, bx, by+9, oc, C_BLACK, 1);
             break;
         }
         case 4: { // ECHO — amount% + delay fraction
-            char buf[16];
+            char buf[24];
             snprintf(buf,sizeof(buf),"%3u%%",(unsigned)(st.echo_amount/100));
             tft_text(buf, bx, by,   oc, C_BLACK, 1);
             tft_text(ui_echo_frac(st.echo_delay), bx, by+9, oc, C_BLACK, 1);
@@ -835,9 +898,9 @@ static void ui_draw_main_overview(void)
         }
         case 5: { // GLD — ms value
             uint32_t ms=ui_glide_ms(st.glide);
-            char buf[16];
+            char buf[24];
             if(ms==0) snprintf(buf,sizeof(buf),"OFF");
-            else      snprintf(buf,sizeof(buf),"%3ums",(unsigned)ms);
+            else      snprintf(buf,sizeof(buf),"%3uMS",(unsigned)ms);
             int tw=(int)strlen(buf)*6;
             tft_text(buf, cx+(cw-tw)/2, by+9, oc, C_BLACK, 1);
             break;
@@ -880,14 +943,14 @@ static void ui_draw_main_card_edit(void)
         int xa=ex0+Aw,xd=xa+Dw,xs=xd+Sw,xr=xs+Rw;
         tft_line(ex0,vb,xa,vt,PC(0)); tft_line(xa,vt,xd,sy,PC(1));
         tft_line(xd,sy,xs,sy,PC(2)); tft_line(xs,sy,xr,vb,PC(3));
-        char buf[16];
-        snprintf(buf,sizeof(buf),"A  %4ums",(unsigned)ui_a_ms(s_main_adsr[0]));
+        char buf[24];
+        snprintf(buf,sizeof(buf),"A  %4uMS",(unsigned)ui_a_ms(s_main_adsr[0]));
         tft_text(buf,4,py,   PC(0),C_BLACK,1);
-        snprintf(buf,sizeof(buf),"D  %4ums",(unsigned)ui_d_ms(s_main_adsr[1]));
+        snprintf(buf,sizeof(buf),"D  %4uMS",(unsigned)ui_d_ms(s_main_adsr[1]));
         tft_text(buf,4,py+8, PC(1),C_BLACK,1);
         snprintf(buf,sizeof(buf),"S    %3u%%",(unsigned)ui_s_pct(s_main_adsr[2]));
         tft_text(buf,4,py+16,PC(2),C_BLACK,1);
-        snprintf(buf,sizeof(buf),"R  %4ums",(unsigned)ui_r_ms(s_main_adsr[3]));
+        snprintf(buf,sizeof(buf),"R  %4uMS",(unsigned)ui_r_ms(s_main_adsr[3]));
         tft_text(buf,4,py+24,PC(3),C_BLACK,1);
         break;
     }
@@ -899,7 +962,7 @@ static void ui_draw_main_card_edit(void)
         ui_vbar(bx1,bx1+bw-1,vt+12,vb,s_main_flt_res,PC(1));
         tft_text("F",bx0+1,vb+2,PC(0),C_BLACK,1);
         tft_text("Q",bx1+1,vb+2,PC(1),C_BLACK,1);
-        char buf[16];
+        char buf[24];
         float fhz=ui_filter_hz(s_main_flt_cut);
         if(fhz>=1000.0f) snprintf(buf,sizeof(buf),"F  %3uKHZ",(unsigned)(fhz/1000.0f+0.5f));
         else              snprintf(buf,sizeof(buf),"F  %4uHZ", (unsigned)fhz);
@@ -919,10 +982,11 @@ static void ui_draw_main_card_edit(void)
         ui_vbar(bx1,bx1+bw-1,vt,vb,s_main_eg1_decay, PC(1));
         tft_text("F",bx0+1,vb+2,PC(0),C_BLACK,1);
         tft_text("D",bx1+1,vb+2,PC(1),C_BLACK,1);
-        char buf[16];
-        snprintf(buf,sizeof(buf),"F  %4uHZ",(unsigned)((s_main_eg1_depth/10000.0f)*8000.0f));
+        char buf[24];
+        { unsigned t = ui_fenv_oct10(s_main_eg1_depth);
+          snprintf(buf,sizeof(buf),"F  +%u.%u OCT",t/10,t%10); }
         tft_text(buf,4,py,   PC(0),C_BLACK,1);
-        snprintf(buf,sizeof(buf),"D  %4ums",(unsigned)ui_eg1_decay_ms(s_main_eg1_decay));
+        snprintf(buf,sizeof(buf),"D  %4uMS",(unsigned)ui_eg1_decay_ms(s_main_eg1_decay));
         tft_text(buf,4,py+8, PC(1),C_BLACK,1);
         break;
     }
@@ -933,13 +997,14 @@ static void ui_draw_main_card_edit(void)
         ui_vbar(bx1,bx1+bw-1,vt,vb,s_main_lfo_depth,PC(1));
         tft_text("R",bx0+1,vb+2,PC(0),C_BLACK,1);
         tft_text("D",bx1+1,vb+2,PC(1),C_BLACK,1);
-        char buf[16];
+        char buf[24];
         float rh=ui_lfo_hz(s_main_lfo_rate);
         uint8_t rh_i=(uint8_t)(rh>99.0f?99.0f:rh);
         uint8_t rh_f=(uint8_t)((unsigned)(rh*10.0f)%10);
         snprintf(buf,sizeof(buf),"R  %u.%uHZ",rh_i,rh_f);
         tft_text(buf,4,py,   PC(0),C_BLACK,1);
-        snprintf(buf,sizeof(buf),"D  %4uHZ",(unsigned)((s_main_lfo_depth/10000.0f)*5000.0f));
+        { unsigned t = ui_lfo_oct10(s_main_lfo_depth);
+          snprintf(buf,sizeof(buf),"D  %u.%u OCT",t/10,t%10); }
         tft_text(buf,4,py+8, PC(1),C_BLACK,1);
         break;
     }
@@ -951,7 +1016,7 @@ static void ui_draw_main_card_edit(void)
         tft_text("A",bx0+1,vb+2,PC(0),C_BLACK,1);
         tft_text("F",bx1+1,vb+2,PC(1),C_BLACK,1);
         tft_text(ui_echo_frac(s_main_ech_dly), bx1+14, vt+16, PC(2), C_BLACK, 1);
-        char buf[16];
+        char buf[24];
         snprintf(buf,sizeof(buf),"AMT  %3u%%",(unsigned)(s_main_ech_amt/100));
         tft_text(buf,4,py,   PC(0),C_BLACK,1);
         snprintf(buf,sizeof(buf),"FB   %3u%%",(unsigned)(s_main_ech_fb/100));
@@ -965,9 +1030,9 @@ static void ui_draw_main_card_edit(void)
         ui_vbar(bx,bx+5,vt,vb,s_main_gld,PC(0));
         tft_text("G",bx+1,vb+2,PC(0),C_BLACK,1);
         uint16_t ms=(uint16_t)ui_glide_ms(s_main_gld);
-        char buf[16];
+        char buf[24];
         if(ms==0) snprintf(buf,sizeof(buf),"GLD  OFF");
-        else      snprintf(buf,sizeof(buf),"GLD  %3ums",ms);
+        else      snprintf(buf,sizeof(buf),"GLD  %3uMS",ms);
         tft_text(buf,4,py,PC(0),C_BLACK,1);
         break;
     }
@@ -1311,6 +1376,138 @@ void ui_set_pad_active(uint8_t pad, bool active)
     s_pad_active[pad] = active;
 }
 
+// ── Factory presets P1–P5 ─────────────────────────────────────
+// Written once into slots 1-5 (P6 is left alone). Re-seeding happens only when
+// FACTORY_SET_VERSION is bumped, so user saves in P1-P5 survive reboots.
+// Values use the v4 curves (see amy_engine.c header table). Approx physical values
+// are noted per line; the encoder moves in 500 steps, all values sit on that grid.
+// v1: P1-P5 contents.  v2: preset names (only applied to slots whose contents
+// still exactly match the factory preset, so user edits are never renamed).
+// v3: P5 renamed VOWEL -> WAHWAH (names re-applied with the same rule).
+#define FACTORY_SET_VERSION 3
+
+static const char * const s_factory_names[5] = { "ACID", "DREAMPAD", "KALIMBA", "WOBBLE", "WAHWAH" };
+
+static const preset_t s_factory_presets[5] = {
+    // P1 "ACID LINE" — squelchy 303-style: low resonant LPF slammed open by a fast
+    // filter envelope, short notes, slides between pads, 1/8 echo. Try OCT -1.
+    { .magic = PRESET_MAGIC, .wave_id = AMY_ENGINE_WAVE_SAW_DOWN, .flt_type = AMY_ENGINE_FILTER_LPF,
+      .fmt = PRESET_FMT,
+      .flt_cut = 2000,  /* ~190 Hz   */  .flt_res = 8500,  /* Q ~7.4    */
+      .env_atk = 0,     /* 1 ms      */  .env_dec = 6000,  /* ~275 ms   */
+      .env_sus = 4000,  /* 40 %      */  .env_rel = 3500,  /* ~105 ms   */
+      .lfo_rt  = 4000,  .lfo_dp = 0,
+      .ech_amt = 2500,  .ech_fb = 3500,  .ech_dly = 1667,  /* 1/8 s    */
+      .gld     = 1000,  /* 50 ms      */
+      .eg1_depth = 7000, /* +3.5 oct */  .eg1_decay = 5500, /* ~200 ms */ },
+
+    // P2 "DREAM PAD" — slow-blooming saw pad: soft attack, long release, slow LFO
+    // breathing on the filter, gentle EG1 bloom, wide 1/4 echo. Hold chords.
+    { .magic = PRESET_MAGIC, .wave_id = AMY_ENGINE_WAVE_SAW_DOWN, .flt_type = AMY_ENGINE_FILTER_LPF,
+      .fmt = PRESET_FMT,
+      .flt_cut = 5500,  /* ~1.4 kHz  */  .flt_res = 2500,  /* Q ~1.4    */
+      .env_atk = 8000,  /* ~600 ms   */  .env_dec = 8500,  /* ~1.5 s    */
+      .env_sus = 8000,  /* 80 %      */  .env_rel = 8500,  /* ~3 s      */
+      .lfo_rt  = 2000,  /* ~0.3 Hz   */  .lfo_dp = 3000,   /* ±0.9 oct  */
+      .ech_amt = 3500,  .ech_fb = 5000,  .ech_dly = 4444,  /* 1/4 s    */
+      .gld     = 0,
+      .eg1_depth = 1000, /* +0.5 oct */  .eg1_decay = 8000, /* ~1 s    */ },
+
+    // P3 "KALIMBA" — plucked triangle: instant attack, no sustain, bright filter
+    // "tick" from a very short EG1, 1/6 echo for a thumb-piano shimmer.
+    { .magic = PRESET_MAGIC, .wave_id = AMY_ENGINE_WAVE_TRIANGLE, .flt_type = AMY_ENGINE_FILTER_LPF,
+      .fmt = PRESET_FMT,
+      .flt_cut = 7000,  /* ~3.3 kHz  */  .flt_res = 1500,  /* Q ~1.1    */
+      .env_atk = 0,     /* 1 ms      */  .env_dec = 7000,  /* ~535 ms   */
+      .env_sus = 0,                      .env_rel = 6000,  /* ~550 ms   */
+      .lfo_rt  = 4000,  .lfo_dp = 0,
+      .ech_amt = 3000,  .ech_fb = 4000,  .ech_dly = 2593,  /* 1/6 s    */
+      .gld     = 0,
+      .eg1_depth = 4000, /* +2 oct   */  .eg1_decay = 4000, /* ~70 ms  */ },
+
+    // P4 "WOBBLE BASS" — square through a resonant low LPF swept by a ~4 Hz LFO
+    // (restarts on every note, so each hit wobbles the same way). Try OCT -1/-2.
+    { .magic = PRESET_MAGIC, .wave_id = AMY_ENGINE_WAVE_SQUARE, .flt_type = AMY_ENGINE_FILTER_LPF,
+      .fmt = PRESET_FMT,
+      .flt_cut = 3000,  /* ~330 Hz   */  .flt_res = 7500,  /* Q ~5.6    */
+      .env_atk = 0,     /* 1 ms      */  .env_dec = 5000,
+      .env_sus = 10000, /* 100 %     */  .env_rel = 4000,  /* ~145 ms   */
+      .lfo_rt  = 7000,  /* ~4 Hz     */  .lfo_dp = 6500,   /* ±1.95 oct */
+      .ech_amt = 0,     .ech_fb = 0,     .ech_dly = 4444,
+      .gld     = 0,
+      .eg1_depth = 0,                    .eg1_decay = 5000, },
+
+    // P5 "WAHWAH" — saw through a band-pass: each note says "wah" (EG1 sweep),
+    // fast LFO shimmer on the formant, glides between pads, 1/4 echo.
+    { .magic = PRESET_MAGIC, .wave_id = AMY_ENGINE_WAVE_SAW_DOWN, .flt_type = AMY_ENGINE_FILTER_BPF,
+      .fmt = PRESET_FMT,
+      .flt_cut = 5000,  /* ~1 kHz    */  .flt_res = 5000,  /* Q ~2.8    */
+      .env_atk = 3500,  /* ~16 ms    */  .env_dec = 7500,  /* ~750 ms   */
+      .env_sus = 7000,  /* 70 %      */  .env_rel = 5500,  /* ~400 ms   */
+      .lfo_rt  = 7500,  /* ~5.3 Hz   */  .lfo_dp = 1000,   /* ±0.3 oct  */
+      .ech_amt = 3000,  .ech_fb = 4500,  .ech_dly = 4444,  /* 1/4 s    */
+      .gld     = 2500,  /* 125 ms     */
+      .eg1_depth = 3000, /* +1.5 oct */  .eg1_decay = 6500, /* ~390 ms */ },
+};
+
+// P6 factory "Juno Brass" (SAW + warm LPF + filter env). Values are in the old
+// v3 curves and migrated, so they match what earlier firmware stored in P6.
+static void preset_p6_factory(preset_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    p->magic     = PRESET_MAGIC;
+    p->wave_id   = AMY_ENGINE_WAVE_SAW_DOWN; // SAW — Juno character
+    p->flt_type  = AMY_ENGINE_FILTER_LPF;
+    p->fmt       = 0;     // values below use the v3 curves → migrated before saving
+    p->flt_cut   = 5000;  // ~1.5 kHz — warm Juno tone
+    p->flt_res   = 500;   // very slight resonance
+    p->env_atk   = 1000;  // ~202 ms — slow enough for pad feel
+    p->env_dec   = 2000;  // ~204 ms
+    p->env_sus   = 7500;  // 75%
+    p->env_rel   = 3000;  // ~1.5 s
+    p->lfo_rt    = 2000;
+    p->lfo_dp    = 0;
+    p->ech_amt   = 2000;  // light echo
+    p->ech_fb    = 2000;
+    p->gld       = 0;
+    p->eg1_depth = 2500;  // +2000 Hz filter sweep on attack
+    p->eg1_decay = 1000;  // ~205 ms filter env decay
+    p->ech_dly   = 4444;  // 1/4 s delay
+    preset_migrate(p);
+}
+
+static void preset_seed_factory(void)
+{
+    nvs_handle_t h;
+    uint8_t ver = 0;
+    if (nvs_open(PRESET_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_get_u8(h, "fac", &ver);
+    nvs_close(h);
+    if (ver >= FACTORY_SET_VERSION) return;
+
+    if (ver < 1) {   // first time: write the factory sounds into P1-P5
+        for (int i = 0; i < 5; i++) {
+            s_presets[i]       = s_factory_presets[i];
+            s_preset_valid[i]  = true;
+            preset_nvs_save(i);
+        }
+    }
+    // Names: only for slots that still hold the untouched factory sound
+    for (int i = 0; i < 5; i++) {
+        if (s_preset_valid[i] && memcmp(&s_presets[i], &s_factory_presets[i], sizeof(preset_t)) == 0)
+            preset_name_set(i, s_factory_names[i]);
+    }
+    preset_t p6;
+    preset_p6_factory(&p6);
+    if (s_preset_valid[5] && memcmp(&s_presets[5], &p6, sizeof(preset_t)) == 0)
+        preset_name_set(5, "BRASS");
+    if (nvs_open(PRESET_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "fac", FACTORY_SET_VERSION);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI("ui", "factory preset set applied (v%u)", FACTORY_SET_VERSION);
+}
+
 void ui_init(void)
 {
     spi_bus_config_t bus = {
@@ -1335,28 +1532,12 @@ void ui_init(void)
     // Factory preset: slot 6 = Juno Brass (SAW + warm LPF + filter env).
     // Re-seed if empty or still contains the old KS preset.
     if (!s_preset_valid[5] || s_presets[5].wave_id == AMY_ENGINE_WAVE_KS) {
-        preset_t *p = &s_presets[5];
-        p->magic     = PRESET_MAGIC;
-        p->wave_id   = AMY_ENGINE_WAVE_SAW_DOWN; // SAW — Juno character
-        p->flt_type  = AMY_ENGINE_FILTER_LPF;
-        p->_pad      = 0;
-        p->flt_cut   = 5000;  // ~1.5 kHz — warm Juno tone
-        p->flt_res   = 500;   // very slight resonance
-        p->env_atk   = 1000;  // ~202 ms — slow enough for pad feel
-        p->env_dec   = 2000;  // ~204 ms
-        p->env_sus   = 7500;  // 75%
-        p->env_rel   = 3000;  // ~1.5 s
-        p->lfo_rt    = 2000;
-        p->lfo_dp    = 0;
-        p->ech_amt   = 2000;  // light echo
-        p->ech_fb    = 2000;
-        p->gld       = 0;
-        p->eg1_depth = 2500;  // +2000 Hz filter sweep on attack
-        p->eg1_decay = 1000;  // ~205 ms filter env decay
-        p->ech_dly   = 4444;  // 1/4 s delay
+        preset_p6_factory(&s_presets[5]);
         s_preset_valid[5] = true;
         preset_nvs_save(5);
+        preset_name_set(5, "BRASS");
     }
+    preset_seed_factory();
     ui_redraw();
 }
 
@@ -1623,6 +1804,7 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
                     break;
                 case 1: // SAVE — always available
                     preset_capture(s_prst_cur);
+                    preset_name_set(s_prst_cur, NULL);   // user save → generic "Pn"
                     preset_nvs_save(s_prst_cur);
                     break;
                 case 2: // CLR — no-op on empty slot
