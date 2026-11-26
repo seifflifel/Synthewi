@@ -8,15 +8,18 @@
 typedef struct {
     uint8_t touch_channel;
     uint16_t threshold;          // Base sensitivity hint for adaptive detector
-    uint16_t raw_value;          // Latest smooth touch data
-    uint16_t baseline_value;     // Latest benchmark value from driver
+    // Raw/baseline are 32-bit: the S3 driver reports values above 65535 when
+    // wiring adds parasitic capacitance (e.g. enclosure closed). Clamping to
+    // 16 bits made raw == baseline == 65535 and killed touch detection.
+    uint32_t raw_value;          // Latest smooth touch data
+    uint32_t baseline_value;     // Latest benchmark value from driver
     uint16_t normalized_value;   // Normalized to 0-127 (MIDI velocity range)
-    uint16_t jump_value;         // |current_raw - previous_raw|
+    uint32_t jump_value;         // |current_raw - previous_raw|
     uint16_t adaptive_delta_on;  // Learned ON threshold for absolute delta
     uint16_t adaptive_jump_on;   // Learned ON threshold for jump detector
     bool is_touching;
     uint8_t state_change_count;  // Debounce counter for state changes
-    uint16_t prev_raw_value;
+    uint32_t prev_raw_value;
     uint32_t idle_abs_ema;
     uint32_t idle_jump_ema;
     touch_channel_handle_t chan_handle;
@@ -35,7 +38,7 @@ void touch_sensor_init(touch_sensor_t *sensor, uint8_t adc_channel, uint16_t thr
  * @param sensor Pointer to touch sensor structure
  * @return Smooth touch data from hardware filter
  */
-uint16_t touch_sensor_read(touch_sensor_t *sensor);
+uint32_t touch_sensor_read(touch_sensor_t *sensor);
 
 /**
  * Sample live touch data without changing touch on/off state.

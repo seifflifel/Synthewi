@@ -40,7 +40,7 @@ void      touch_telemetry_set_pressure_cb(touch_pressure_cb_t cb);
 void      touch_telemetry_set_pressure_range(uint16_t range_x100);
 
 // Direct data access (no WiFi needed)
-uint16_t  touch_telemetry_get_raw(uint8_t pad);
-uint16_t  touch_telemetry_get_baseline(uint8_t pad);
+uint32_t  touch_telemetry_get_raw(uint8_t pad);
+uint32_t  touch_telemetry_get_baseline(uint8_t pad);
 uint16_t  touch_telemetry_get_threshold(uint8_t pad);
 void      touch_telemetry_set_threshold(uint8_t pad, uint16_t threshold);

@@ -104,7 +104,7 @@ void touch_sensor_init(touch_sensor_t *sensor, uint8_t adc_channel, uint16_t thr
     ESP_LOGI(TAG, "Touch channel %d initialized (delta=%u)", adc_channel, sensor->threshold);
 }
 
-uint16_t touch_sensor_read(touch_sensor_t *sensor)
+uint32_t touch_sensor_read(touch_sensor_t *sensor)
 {
     if ((sensor == NULL) || (sensor->chan_handle == NULL)) {
         return 0;
@@ -121,11 +121,7 @@ uint16_t touch_sensor_read(touch_sensor_t *sensor)
         return sensor->raw_value;
     }
 
-    if (smooth > 0xFFFF) {
-        smooth = 0xFFFF;
-    }
-
-    return (uint16_t)smooth;
+    return smooth;
 }
 
 void touch_sensor_sample(touch_sensor_t *sensor)
@@ -138,13 +134,13 @@ void touch_sensor_sample(touch_sensor_t *sensor)
         return;
     }
 
-    uint16_t current_raw = touch_sensor_read(sensor);
+    uint32_t current_raw = touch_sensor_read(sensor);
     if (sensor->prev_raw_value == 0) {
         sensor->prev_raw_value = current_raw;
     }
     sensor->jump_value = (current_raw >= sensor->prev_raw_value)
-                             ? (uint16_t)(current_raw - sensor->prev_raw_value)
-                             : (uint16_t)(sensor->prev_raw_value - current_raw);
+                             ? (current_raw - sensor->prev_raw_value)
+                             : (sensor->prev_raw_value - current_raw);
     sensor->raw_value = current_raw;
     sensor->prev_raw_value = current_raw;
 
@@ -155,10 +151,7 @@ void touch_sensor_sample(touch_sensor_t *sensor)
         benchmark = sensor->baseline_value;
     }
 
-    if (benchmark > 0xFFFF) {
-        benchmark = 0xFFFF;
-    }
-    sensor->baseline_value = (uint16_t)benchmark;
+    sensor->baseline_value = benchmark;
 }
 
 bool touch_sensor_update(touch_sensor_t *sensor)
@@ -222,7 +215,7 @@ bool touch_sensor_update(touch_sensor_t *sensor)
     if (!sensor->is_touching) {
         sensor->normalized_value = 0;
     } else {
-        uint16_t effective = (abs_delta > off_delta) ? (uint16_t)(abs_delta - off_delta) : 0;
+        uint32_t effective = (abs_delta > off_delta) ? (abs_delta - off_delta) : 0;
         if (effective >= TOUCH_INTENSITY_SPAN) {
             sensor->normalized_value = 127;
         } else {

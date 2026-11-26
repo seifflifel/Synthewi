@@ -75,13 +75,13 @@ void touch_telemetry_set_pressure_range(uint16_t r)          { s_pressure_range 
 // ---------------------------------------------------------------------------
 // Public data accessors
 // ---------------------------------------------------------------------------
-uint16_t touch_telemetry_get_raw(uint8_t pad)
+uint32_t touch_telemetry_get_raw(uint8_t pad)
 {
     if (pad >= TOUCH_CHANNEL_COUNT) return 0;
     return s_touch_pads[pad].raw_value;
 }
 
-uint16_t touch_telemetry_get_baseline(uint8_t pad)
+uint32_t touch_telemetry_get_baseline(uint8_t pad)
 {
     if (pad >= TOUCH_CHANNEL_COUNT) return 0;
     return s_touch_pads[pad].baseline_value;
@@ -104,10 +104,10 @@ void touch_telemetry_set_threshold(uint8_t pad, uint16_t threshold)
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-static uint16_t abs_delta(const touch_sensor_t *s)
+static uint32_t abs_delta(const touch_sensor_t *s)
 {
-    int32_t d = (int32_t)s->raw_value - (int32_t)s->baseline_value;
-    return (uint16_t)(d < 0 ? -d : d);
+    return (s->raw_value >= s->baseline_value) ? (s->raw_value - s->baseline_value)
+                                               : (s->baseline_value - s->raw_value);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,8 +122,8 @@ static void touch_telemetry_task(void *arg)
     while (1) {
         for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
             touch_sensor_sample(&s_touch_pads[i]);
-            uint16_t delta    = abs_delta(&s_touch_pads[i]);
-            uint16_t thresh   = s_thresholds[i];
+            uint32_t delta    = abs_delta(&s_touch_pads[i]);
+            uint32_t thresh   = s_thresholds[i];
             bool     touching = (delta >= thresh);
 
             if (touching) {

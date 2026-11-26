@@ -940,8 +940,8 @@ static void ui_draw_calib(void)
         tft_text_bold(phdr, 4, 24, C_ORANGE, C_BLACK, 2);
         tft_fill(0, 42, TFT_W-1, 43, C_LTGRAY);
 
-        uint16_t raw  = touch_telemetry_get_raw((uint8_t)s_cal_pad);
-        uint16_t base = touch_telemetry_get_baseline((uint8_t)s_cal_pad);
+        uint32_t raw  = touch_telemetry_get_raw((uint8_t)s_cal_pad);
+        uint32_t base = touch_telemetry_get_baseline((uint8_t)s_cal_pad);
         uint16_t thr  = s_cal_thr;
 
         // Large horizontal bar (x=4..155, y=54..88, 34px tall)
@@ -965,9 +965,9 @@ static void ui_draw_calib(void)
 
         // Values (scale-1 for clean compact layout)
         char buf[20];
-        snprintf(buf, sizeof(buf), "RAW  %5u", (unsigned)raw);
+        snprintf(buf, sizeof(buf), "RAW  %-7" PRIu32, raw);
         tft_text(buf, 4, 96, C_WHITE, C_BLACK, 1);
-        snprintf(buf, sizeof(buf), "BASE %5u", (unsigned)base);
+        snprintf(buf, sizeof(buf), "BASE %-7" PRIu32, base);
         tft_text(buf, 4, 106, C_LTGRAY, C_BLACK, 1);
         snprintf(buf, sizeof(buf), "THR  %5u", (unsigned)thr);
         tft_text(buf, 86, 96, C_ORANGE, C_BLACK, 1);
