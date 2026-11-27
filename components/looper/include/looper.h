@@ -30,6 +30,8 @@ typedef struct {
 } limiter_stats_t;
 void output_limiter_process(int16_t *block, int n_frames);
 void output_limiter_get_stats(limiter_stats_t *out);       // read + reset
+// Master volume 0-100 % (perceptual curve), applied after the limiter. Any task.
+void output_set_master_volume(uint8_t percent);
 
 looper_state_t looper_get_state(void);
 uint32_t       looper_get_position(void);   // current playback position in samples

@@ -41,7 +41,7 @@ void looper_cycle(void)
         s_pos      = 0;
         s_loop_len = 0;
         s_state    = LOOPER_RECORDING;
-        ESP_LOGI(TAG, "REC started");
+        ESP_LOGI(TAG, "REC started (buffer %u samples)", (unsigned)s_max_len);
         break;
     case LOOPER_RECORDING:
         s_loop_len = s_pos;

@@ -9,7 +9,7 @@
 // Fix: amy_engine runs AMY 6 dB quieter (volume 0.5) so the internal sum has
 // headroom and never reaches AMY's clipper. Here we add the 6 dB back
 // (LIM_MAKEUP) for normal playing, and a peak limiter keeps build-ups below
-// LIM_THRESHOLD by turning the whole mix down smoothly (~250 ms recovery).
+// LIM_THRESHOLD by turning the whole mix down smoothly (~500 ms recovery).
 //
 // Runs in AMY's fill task (core 1) once per block: no logging, no allocation,
 // no locks. Cost: one peak scan + one multiply per sample.
@@ -19,9 +19,14 @@
 
 #define LIM_MAKEUP        2.0f       // +6 dB: undoes amy_engine's volume 0.5
 #define LIM_THRESHOLD     13000.0f   // ~-8 dBFS: just under AMY's old -6 dBFS ceiling
-#define LIM_RELEASE_COEF  0.0106f    // per block: 1-exp(-Tblock/250ms), Tblock = 128/48k
+#define LIM_RELEASE_COEF  0.0106f    // per block: 1-exp(-Tblock/500ms), Tblock = 256/48k (measured: 188 blocks/s)
 
 static float s_gain = LIM_MAKEUP;    // current total gain (audio thread only)
+
+// Master volume, applied after the limiter (so it never changes how hard the
+// limiter works). Set from the UI task; the audio thread ramps toward it.
+static volatile float s_master_target = 1.0f;
+static float          s_master        = 1.0f;   // audio thread only
 
 // Diagnostics (written by audio thread, read+reset by output_limiter_get_stats)
 static volatile int16_t s_stat_peak     = 0;
@@ -58,6 +63,12 @@ void output_limiter_process(int16_t *block, int n_frames)
     float red = g1 / LIM_MAKEUP;  // 1.0 = no limiting
     if (red < s_stat_min_gain) s_stat_min_gain = red;
 
+    // Master volume: move toward the target within one block (no zipper noise)
+    float m0 = s_master, m1 = s_master_target;
+    s_master = m1;
+    g0 *= m0;
+    g1 *= m1;
+
     // Ramp g0 → g1 across the block (no zipper noise on gain changes)
     float step = (g1 - g0) / (float)n_frames;
     float g = g0;
@@ -68,6 +79,13 @@ void output_limiter_process(int16_t *block, int n_frames)
         block[f * 2]     = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
         block[f * 2 + 1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
     }
+}
+
+void output_set_master_volume(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    float v = percent / 100.0f;
+    s_master_target = v * v;   // perceptual curve: 50 % ≈ -12 dB, 25 % ≈ -24 dB, 0 = mute
 }
 
 void output_limiter_get_stats(limiter_stats_t *out)

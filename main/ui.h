@@ -253,7 +253,9 @@ static int  s_cal_last_tx = -1;   // x of threshold marker currently drawn (-1 =
 // MAIN 6-card overview + per-card edit
 static int      s_main_card    = 0;    // 0-5: selected card in overview
 static bool     s_main_in_card = false; // false=overview, true=card edit
-static int      s_main_param   = 0;    // param index within card edit
+static int      s_main_param   = 0;    // param index within card edit (focus)
+static bool     s_main_editing = false; // card edit: false = focus mode (rotate moves between params),
+                                        //            true  = edit mode (rotate changes the focused value)
 // Param counts per card: ENV FLT EG1 LFO ECH GLD
 // Param counts per card: ENV FLT EG1 LFO FX GLD   (FX = echo AMT/FB/DLY + reverb REV/SIZE)
 static const int s_card_param_max[6] = {4, 3, 2, 2, 5, 1};
@@ -949,8 +951,13 @@ static void ui_draw_main_card_edit(void)
     int vb = (s_main_card == 0) ? 80 : (s_main_card == 4) ? 70 : 88;
     int py = (s_main_card == 0) ? 83 : (s_main_card == 4) ? 79 : 91;
 
-    // pc(i): blue if current param, orange otherwise
+    // PC(i): blue if focused param, orange otherwise (bars, labels, line text)
+    // PF/PB(i): param LINE colours — while editing, the focused line is inverted
+    //           (white on blue) so it is obvious that rotating changes the value.
     #define PC(i) ((p==(i)) ? C_BLUE : C_ORANGE)
+    #define PEDIT(i) ((p==(i)) && s_main_editing)
+    #define PF(i) (PEDIT(i) ? C_BLACK : PC(i))
+    #define PB(i) (PEDIT(i) ? C_BLUE  : C_BLACK)
 
     switch (s_main_card) {
     case 0: { // ENV — ADSR envelope shape + 4 param lines
@@ -968,13 +975,13 @@ static void ui_draw_main_card_edit(void)
         tft_line(xd,sy,xs,sy,PC(2)); tft_line(xs,sy,xr,vb,PC(3));
         char buf[24];
         snprintf(buf,sizeof(buf),"A  %4uMS",(unsigned)ui_a_ms(s_main_adsr[0]));
-        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        tft_text(buf,4,py,PF(0),PB(0),1);
         snprintf(buf,sizeof(buf),"D  %4uMS",(unsigned)ui_d_ms(s_main_adsr[1]));
-        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        tft_text(buf,4,py+8,PF(1),PB(1),1);
         snprintf(buf,sizeof(buf),"S    %3u%%",(unsigned)ui_s_pct(s_main_adsr[2]));
-        tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        tft_text(buf,4,py+16,PF(2),PB(2),1);
         snprintf(buf,sizeof(buf),"R  %4uMS",(unsigned)ui_r_ms(s_main_adsr[3]));
-        tft_text(buf,4,py+24,PC(3),C_BLACK,1);
+        tft_text(buf,4,py+24,PF(3),PB(3),1);
         break;
     }
     case 1: { // FLT — type label + two bars + 3 param lines
@@ -989,13 +996,13 @@ static void ui_draw_main_card_edit(void)
         float fhz=ui_filter_hz(s_main_flt_cut);
         if(fhz>=1000.0f) snprintf(buf,sizeof(buf),"F  %3uKHZ",(unsigned)(fhz/1000.0f+0.5f));
         else              snprintf(buf,sizeof(buf),"F  %4uHZ", (unsigned)fhz);
-        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        tft_text(buf,4,py,PF(0),PB(0),1);
         float fq=ui_filter_q(s_main_flt_res);
         uint32_t qi=(uint32_t)(fq*10.0f);
         snprintf(buf,sizeof(buf),"Q  %u.%u",(unsigned)(qi/10),(unsigned)(qi%10));
-        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        tft_text(buf,4,py+8,PF(1),PB(1),1);
         snprintf(buf,sizeof(buf),"TYPE  %s",flt_nm[s_main_flt_type]);
-        tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        tft_text(buf,4,py+16,PF(2),PB(2),1);
         break;
     }
     case 2: { // EG1 — two bars + 2 param lines
@@ -1008,9 +1015,9 @@ static void ui_draw_main_card_edit(void)
         char buf[24];
         { unsigned t = ui_fenv_oct10(s_main_eg1_depth);
           snprintf(buf,sizeof(buf),"F  +%u.%u OCT",t/10,t%10); }
-        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        tft_text(buf,4,py,PF(0),PB(0),1);
         snprintf(buf,sizeof(buf),"D  %4uMS",(unsigned)ui_eg1_decay_ms(s_main_eg1_decay));
-        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        tft_text(buf,4,py+8,PF(1),PB(1),1);
         break;
     }
     case 3: { // LFO — two bars + 2 param lines
@@ -1025,10 +1032,10 @@ static void ui_draw_main_card_edit(void)
         uint8_t rh_i=(uint8_t)(rh>99.0f?99.0f:rh);
         uint8_t rh_f=(uint8_t)((unsigned)(rh*10.0f)%10);
         snprintf(buf,sizeof(buf),"R  %u.%uHZ",rh_i,rh_f);
-        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        tft_text(buf,4,py,PF(0),PB(0),1);
         { unsigned t = ui_lfo_oct10(s_main_lfo_depth);
           snprintf(buf,sizeof(buf),"D  %u.%u OCT",t/10,t%10); }
-        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        tft_text(buf,4,py+8,PF(1),PB(1),1);
         break;
     }
     case 4: { // FX — echo (AMT/FB/DLY) + reverb (REV/SIZE): 4 bars + 5 param lines
@@ -1047,15 +1054,15 @@ static void ui_draw_main_card_edit(void)
         tft_text("S",rx1+1,vb+2,PC(4),C_BLACK,1);
         char buf[24];
         snprintf(buf,sizeof(buf),"ECHO %3u%%",(unsigned)(s_main_ech_amt/100));
-        tft_text(buf,4,py,   PC(0),C_BLACK,1);
+        tft_text(buf,4,py,PF(0),PB(0),1);
         snprintf(buf,sizeof(buf),"FB   %3u%%",(unsigned)(s_main_ech_fb/100));
-        tft_text(buf,4,py+8, PC(1),C_BLACK,1);
+        tft_text(buf,4,py+8,PF(1),PB(1),1);
         snprintf(buf,sizeof(buf),"DLY  %s",ui_echo_frac(s_main_ech_dly));
-        tft_text(buf,4,py+16,PC(2),C_BLACK,1);
+        tft_text(buf,4,py+16,PF(2),PB(2),1);
         snprintf(buf,sizeof(buf),"REV  %3u%%",(unsigned)(s_main_rev_amt/100));
-        tft_text(buf,4,py+24,PC(3),C_BLACK,1);
+        tft_text(buf,4,py+24,PF(3),PB(3),1);
         snprintf(buf,sizeof(buf),"SIZE %3u%%",(unsigned)(s_main_rev_dec/100));
-        tft_text(buf,4,py+32,PC(4),C_BLACK,1);
+        tft_text(buf,4,py+32,PF(4),PB(4),1);
         break;
     }
     case 5: { // GLD — single bar + 1 param line
@@ -1066,14 +1073,18 @@ static void ui_draw_main_card_edit(void)
         char buf[24];
         if(ms==0) snprintf(buf,sizeof(buf),"GLD  OFF");
         else      snprintf(buf,sizeof(buf),"GLD  %3uMS",ms);
-        tft_text(buf,4,py,PC(0),C_BLACK,1);
+        tft_text(buf,4,py,PF(0),PB(0),1);
         break;
     }
     }
     #undef PC
+    #undef PEDIT
+    #undef PF
+    #undef PB
 
     tft_fill(0, 119, TFT_W-1, 120, C_DKGRAY);
-    tft_text("ROT:ADJ  BTN:NEXT  HLD:BACK", 2, 122, C_DKGRAY, C_BLACK, 1);
+    tft_text(s_main_editing ? "ROT:ADJ  BTN:OK    HLD:BACK"
+                            : "ROT:SEL  BTN:EDIT  HLD:BACK", 2, 122, C_DKGRAY, C_BLACK, 1);
 }
 
 static void ui_draw_main(void)
@@ -1598,15 +1609,33 @@ void ui_init(void)
 
 // Called from main loop every ~20 ms.
 // delta: encoder steps since last call (signed).
-// short_press / long_press / vlong_press: button event flags (at most one true per call).
-// vlong_press (3.5 s hold): cycles looper state when in UI_CARDS.
-void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
+// Button gestures (from main.c):
+//   short_press  : click — normal navigation (reported 250 ms after release)
+//   long_press   : 0.5 s hold — back (on the top screen: arms loop clear)
+//   vlong_press  : 2 s hold — clears the loop, only if the hold STARTED on the
+//                  top screen (a "back" hold that continues can't wipe the loop)
+//   double_click : looper REC → PLAY → OVERDUB → PLAY … from any screen
+void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong_press, bool double_click)
 {
+    // accel (1..3): subtle encoder acceleration from main.c. Applied ONLY to
+    // value changes; list/focus navigation always moves one item per click.
+    int vdelta = delta * accel;
+    // Looper: double click works everywhere; recording starts on the 2nd click.
+    if (double_click) looper_cycle();   // ribbon dot updates via ui_ribbon_update()
+
+    // A loop clear is armed only by a hold whose long-press fired on the top
+    // screen. Every hold fires long_press before vlong_press, so this is
+    // re-evaluated for each hold.
+    static bool s_clear_armed = false;
+    if (long_press) s_clear_armed = (s_sec == UI_CARDS);
+
     switch (s_sec) {
 
     case UI_CARDS:
         if (delta) {
-            s_card_cur = (s_card_cur + delta % 3 + 3) % 3;
+            s_card_cur = s_card_cur + delta;              // lists stop at the ends (no wrap)
+            if (s_card_cur < 0) s_card_cur = 0;
+            if (s_card_cur > 2) s_card_cur = 2;
             s_dirty = true;
         }
         if (short_press) {
@@ -1616,13 +1645,10 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
                 case 2: ui_enter(UI_CALIB);   break;
             }
         }
-        if (long_press) {
-            looper_cycle(); // IDLE→REC→PLAY→OD→PLAY→...
-            s_dirty = true;
-        }
-        if (vlong_press) {
-            looper_clear(); // 3.5 s hold — stop and clear loop
-            s_dirty = true;
+        // long_press on the top screen only arms the clear (see above)
+        if (vlong_press && s_clear_armed) {
+            looper_clear(); // 2 s hold started here — stop and clear loop
+            s_clear_armed = false;
         }
         break;
 
@@ -1668,40 +1694,62 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
         if (!s_main_in_card) {
             // Overview: encoder scrolls cards, short press enters card, long press → CARDS
             if (delta) {
-                s_main_card = (s_main_card + delta % 6 + 6) % 6;
+                s_main_card = s_main_card + delta;        // stop at the ends
+                if (s_main_card < 0) s_main_card = 0;
+                if (s_main_card > 5) s_main_card = 5;
                 s_dirty = true;
             }
-            if (short_press) { s_main_in_card = true; s_main_param = 0; s_dirty = true; }
+            if (short_press) { s_main_in_card = true; s_main_param = 0; s_main_editing = false; s_dirty = true; }
             if (long_press)  { amy_engine_save_state(); ui_enter(UI_CARDS); }
         } else {
-            // Card edit: encoder adjusts current param, short press advances (last → save+overview)
+            // Card edit, two modes (car-radio style "direct manipulation"):
+            //   focus: rotate moves between params (stops at the ends), click → edit
+            //   edit : rotate changes the focused value (with acceleration), click → back to focus
+            //   hold (either mode): save and return to the overview
             int p = s_main_param;
+            bool edit_entered_now = false;
+            if (!s_main_editing) {
+                if (delta) {
+                    int np = s_main_param + delta;
+                    if (np < 0) np = 0;
+                    if (np > s_card_param_max[s_main_card] - 1) np = s_card_param_max[s_main_card] - 1;
+                    if (np != s_main_param) { s_main_param = np; s_dirty = true; }
+                }
+                if (short_press) { s_main_editing = true; edit_entered_now = true; s_dirty = true; }
+                delta = 0;   // rotation was used for focus — don't fall into value edits below
+            }
             if (delta) {
                 switch (s_main_card) {
                 case 0: // ENV
-                    s_main_adsr[p] = u16clamp((int)s_main_adsr[p] + delta * 500);
+                    s_main_adsr[p] = u16clamp((int)s_main_adsr[p] + vdelta * 500);
                     amy_engine_set_adsr(s_main_adsr[0],s_main_adsr[1],s_main_adsr[2],s_main_adsr[3]);
                     break;
                 case 1: // FLT
-                    if (p == 0)      { s_main_flt_cut = u16clamp((int)s_main_flt_cut + delta*500); amy_engine_set_filter(s_main_flt_cut,s_main_flt_res); }
-                    else if (p == 1) { s_main_flt_res = u16clamp((int)s_main_flt_res + delta*500); amy_engine_set_filter(s_main_flt_cut,s_main_flt_res); }
-                    else             { s_main_flt_type = (uint8_t)((s_main_flt_type + (delta>0?1:2)) % 3); amy_engine_set_filter_type(s_main_flt_type); }
+                    if (p == 0)      { s_main_flt_cut = u16clamp((int)s_main_flt_cut + vdelta*500); amy_engine_set_filter(s_main_flt_cut,s_main_flt_res); }
+                    else if (p == 1) { s_main_flt_res = u16clamp((int)s_main_flt_res + vdelta*500); amy_engine_set_filter(s_main_flt_cut,s_main_flt_res); }
+                    else { // TYPE: LPF/BPF/HPF, stops at the ends
+                        int t = (int)s_main_flt_type + (delta > 0 ? 1 : -1);
+                        if (t < 0) t = 0;
+                        if (t > 2) t = 2;
+                        s_main_flt_type = (uint8_t)t;
+                        amy_engine_set_filter_type(s_main_flt_type);
+                    }
                     break;
                 case 2: // EG1
-                    if (p == 0) s_main_eg1_depth = u16clamp((int)s_main_eg1_depth + delta*500);
-                    else        s_main_eg1_decay  = u16clamp((int)s_main_eg1_decay  + delta*500);
+                    if (p == 0) s_main_eg1_depth = u16clamp((int)s_main_eg1_depth + vdelta*500);
+                    else        s_main_eg1_decay  = u16clamp((int)s_main_eg1_decay  + vdelta*500);
                     amy_engine_set_filter_env(s_main_eg1_depth, s_main_eg1_decay);
                     break;
                 case 3: // LFO
-                    if (p == 0) s_main_lfo_rate  = u16clamp((int)s_main_lfo_rate  + delta*500);
-                    else        s_main_lfo_depth = u16clamp((int)s_main_lfo_depth + delta*500);
+                    if (p == 0) s_main_lfo_rate  = u16clamp((int)s_main_lfo_rate  + vdelta*500);
+                    else        s_main_lfo_depth = u16clamp((int)s_main_lfo_depth + vdelta*500);
                     amy_engine_set_lfo(s_main_lfo_rate, s_main_lfo_depth);
                     break;
                 case 4: // FX: 0 echo AMT, 1 echo FB, 2 echo DLY, 3 reverb REV, 4 reverb SIZE
-                    if (p == 0)      { s_main_ech_amt = u16clamp((int)s_main_ech_amt + delta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
-                    else if (p == 1) { s_main_ech_fb  = u16clamp((int)s_main_ech_fb  + delta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
-                    else if (p == 3) { s_main_rev_amt = u16clamp((int)s_main_rev_amt + delta*500); amy_engine_set_reverb(s_main_rev_amt,s_main_rev_dec); }
-                    else if (p == 4) { s_main_rev_dec = u16clamp((int)s_main_rev_dec + delta*500); amy_engine_set_reverb(s_main_rev_amt,s_main_rev_dec); }
+                    if (p == 0)      { s_main_ech_amt = u16clamp((int)s_main_ech_amt + vdelta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
+                    else if (p == 1) { s_main_ech_fb  = u16clamp((int)s_main_ech_fb  + vdelta*500); amy_engine_set_echo(s_main_ech_amt,s_main_ech_fb); }
+                    else if (p == 3) { s_main_rev_amt = u16clamp((int)s_main_rev_amt + vdelta*500); amy_engine_set_reverb(s_main_rev_amt,s_main_rev_dec); }
+                    else if (p == 4) { s_main_rev_dec = u16clamp((int)s_main_rev_dec + vdelta*500); amy_engine_set_reverb(s_main_rev_amt,s_main_rev_dec); }
                     else { // DLY: snap through fractions
                         int idx = echo_snap_idx(s_main_ech_dly) + (delta > 0 ? 1 : -1);
                         if (idx < 0) idx = 0;
@@ -1711,25 +1759,20 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
                     }
                     break;
                 case 5: // GLD
-                    s_main_gld = u16clamp((int)s_main_gld + delta*500);
+                    s_main_gld = u16clamp((int)s_main_gld + vdelta*500);
                     amy_engine_set_glide(s_main_gld);
                     break;
                 }
                 s_dirty = true;
             }
-            if (short_press) {
-                if (s_main_param + 1 >= s_card_param_max[s_main_card]) {
-                    amy_engine_save_state();
-                    s_main_in_card = false;
-                    s_main_param   = 0;
-                } else {
-                    s_main_param++;
-                }
+            if (short_press && s_main_editing && !edit_entered_now) {
+                s_main_editing = false;   // confirm → back to focus mode
                 s_dirty = true;
             }
             if (long_press) {
                 amy_engine_save_state();
                 s_main_in_card = false;
+                s_main_editing = false;
                 s_main_param   = 0;
                 s_dirty        = true;
             }
@@ -1739,7 +1782,9 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
     case UI_CALIB:
         if (!s_cal_editing) {
             if (delta) {
-                s_cal_pad = (s_cal_pad + delta % TOUCH_TOTAL_PADS + TOUCH_TOTAL_PADS) % TOUCH_TOTAL_PADS;
+                s_cal_pad = s_cal_pad + delta;            // stop at the ends
+                if (s_cal_pad < 0) s_cal_pad = 0;
+                if (s_cal_pad > TOUCH_TOTAL_PADS - 1) s_cal_pad = TOUCH_TOTAL_PADS - 1;
                 s_dirty = true;
             }
             if (short_press) {
@@ -1750,7 +1795,7 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
             if (long_press) ui_exit_to_cards();
         } else {
             if (delta) {
-                int t = (int)s_cal_thr + delta * 50;
+                int t = (int)s_cal_thr + vdelta * 50;
                 if (t < 10) t = 10;
                 s_cal_thr  = (uint16_t)t;
                 s_cal_live = true;   // only bar/marker/THR change — no full redraw
@@ -1841,7 +1886,9 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
     case UI_PRESETS:
         if (!s_prst_action) {
             if (delta) {
-                s_prst_cur = (s_prst_cur + delta % PRESET_COUNT + PRESET_COUNT) % PRESET_COUNT;
+                s_prst_cur = s_prst_cur + delta;          // stop at the ends
+                if (s_prst_cur < 0) s_prst_cur = 0;
+                if (s_prst_cur > PRESET_COUNT - 1) s_prst_cur = PRESET_COUNT - 1;
                 s_dirty = true;
             }
             if (short_press) {
@@ -1853,7 +1900,9 @@ void ui_tick(int delta, bool short_press, bool long_press, bool vlong_press)
             if (long_press) ui_exit_to_cards();
         } else {
             if (delta) {
-                s_prst_act = (s_prst_act + delta % 3 + 3) % 3;
+                s_prst_act = s_prst_act + delta;          // stop at the ends
+                if (s_prst_act < 0) s_prst_act = 0;
+                if (s_prst_act > 2) s_prst_act = 2;
                 s_dirty = true;
             }
             if (short_press) {

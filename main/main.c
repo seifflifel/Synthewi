@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_heap_caps.h"
 #include "amy_engine.h"
 #include "touch_telemetry.h"
@@ -64,8 +65,20 @@ static void on_touch(uint8_t pad, bool on)
 // Position 3 (right):  b0=HIGH, b1=LOW  → TRIANGLE
 
 static volatile int32_t s_enc_steps    = 0;
-static volatile int     s_btn_flag     = 0;
-static volatile int64_t s_btn_press_us = 0;
+
+// Encoder push button, debounced by enc_poll_cb (1 kHz). Edge counters let the
+// 50 Hz main loop see every press/release even if a tap is shorter than a tick.
+#define BTN_DEBOUNCE_MS   8          // level must be stable this long to count
+static volatile bool     s_btn_down        = false;
+static volatile uint32_t s_btn_press_seq   = 0;
+static volatile uint32_t s_btn_release_seq = 0;
+static volatile int64_t  s_btn_press_us    = 0;
+static volatile int64_t  s_btn_release_us  = 0;
+
+// Button gestures (detected in the main loop)
+#define BTN_LONG_US     500000LL     // hold → long press (back); was 0.8 s
+#define BTN_VLONG_US   2000000LL     // hold → very long press (clear loop on top screen); was 3.5 s
+#define BTN_DOUBLE_US   250000LL     // 2nd press within this after a release → double click
 
 // ── Encoder decoder ──────────────────────────────────────────
 // This encoder makes one full quadrature cycle per click and rests at AB=11:
@@ -119,16 +132,22 @@ static void enc_poll_cb(void *arg)
     state = s_enc_table[state & 0x0F][ab];
     if      (state & ENC_DIR_CW)  s_enc_steps++;
     else if (state & ENC_DIR_CCW) s_enc_steps--;
-}
 
-static void IRAM_ATTR enc_sw_isr(void *arg)
-{
-    static int64_t last = 0;
-    int64_t now = esp_timer_get_time();
-    if (now - last < 200000) return; // 200 ms debounce — blocks release-bounce double-fire
-    last = now;
-    s_btn_press_us = now;
-    s_btn_flag = 1;
+    // Push button (active low): integrate-and-dump debounce. The old edge ISR
+    // used a 200 ms lockout plus a 400 ms dispatch lockout, which made a
+    // double click impossible.
+    static uint8_t btn_cnt = 0;
+    bool raw_down = (gpio_get_level(ENC_SW) == 0);
+    if (raw_down != s_btn_down) {
+        if (++btn_cnt >= BTN_DEBOUNCE_MS) {
+            btn_cnt = 0;
+            s_btn_down = raw_down;
+            if (raw_down) { s_btn_press_us   = esp_timer_get_time(); s_btn_press_seq++;   }
+            else          { s_btn_release_us = esp_timer_get_time(); s_btn_release_seq++; }
+        }
+    } else {
+        btn_cnt = 0;
+    }
 }
 
 // ── Entry point ──────────────────────────────────────────────
@@ -171,15 +190,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&enc_timer_args, &enc_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(enc_timer, 1000)); // 1 ms
 
-    // Encoder push button: falling-edge interrupt
+    // Encoder push button: plain input, debounced in enc_poll_cb
     gpio_config_t enc_sw = {
         .pin_bit_mask = (1ULL<<ENC_SW),
         .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&enc_sw);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(ENC_SW,  enc_sw_isr, NULL);
 
     gpio_config_t lever_cfg = {
         .pin_bit_mask = (1ULL<<WAVE_GPIO0)|(1ULL<<WAVE_GPIO1),
@@ -192,12 +209,32 @@ void app_main(void)
     ESP_LOGI(TAG, "running");
 
     int32_t last_steps        = 0;
-    bool    btn_pending       = false;
-    bool    long_fired        = false;
-    bool    vlong_fired       = false;
-    int64_t btn_start_us      = 0;
-    int64_t btn_dispatch_us   = 0; // time of last dispatched press (short or long)
     uint8_t lever_wave        = 0xFF; // sentinel: force apply on first tick
+
+    // Button gesture state machine
+    enum { G_IDLE, G_DOWN1, G_WAIT2, G_DOWN2 } g_state = G_IDLE;
+    uint32_t g_last_press = 0, g_last_release = 0;
+    int64_t  g_t_down = 0, g_t_up = 0;
+    bool     g_long_fired = false, g_vlong_fired = false;
+    bool     g_turned_held = false;   // encoder turned while the button was held
+    int      deferred_delta = 0;      // rotation held back one tick (see WAIT2)
+
+    // Encoder acceleration (values only, never list navigation): smoothed
+    // detents/second → small multiplier. Deliberately subtle (max ×3).
+    float    enc_rate = 0.0f;
+
+    // Master volume (hold + turn), persisted in NVS "ui"/"mvol"
+    uint8_t  master_vol = 100;
+    {
+        nvs_handle_t h;
+        if (nvs_open("ui", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v;
+            if (nvs_get_u8(h, "mvol", &v) == ESP_OK && v <= 100) master_vol = v;
+            nvs_close(h);
+        }
+        output_set_master_volume(master_vol);
+        ESP_LOGI(TAG, "master volume %u %%", master_vol);
+    }
 
     for (;;) {
         // Lever waveform selector
@@ -218,6 +255,13 @@ void app_main(void)
         int32_t steps = s_enc_steps;
         int delta = (int)(steps - last_steps);
         if (delta) last_steps = steps;
+
+        // Acceleration: EMA of detents/s (loop period 20 ms)
+        enc_rate = 0.7f * enc_rate + 0.3f * ((delta < 0 ? -delta : delta) / 0.02f);
+        int accel = (enc_rate > 20.0f) ? 3 : (enc_rate > 10.0f) ? 2 : 1;
+
+        delta += deferred_delta;
+        deferred_delta = 0;
 
 #if ENC_DEBUG
         {
@@ -240,44 +284,78 @@ void app_main(void)
         }
 #endif
 
-        // Gather button events as flags (one ui_tick call at end of loop)
-        bool short_press = false, long_press = false, vlong_press = false;
-        if (s_btn_flag && !btn_pending) {
-            s_btn_flag = 0;
-            if (esp_timer_get_time() - btn_dispatch_us >= 400000) {
-                btn_pending  = true;
-                long_fired   = false;
-                vlong_fired  = false;
-                btn_start_us = s_btn_press_us;
+        // Button gestures → flags (one ui_tick call at end of loop)
+        //   click        : press+release < 0.8 s, no 2nd press within 250 ms
+        //                  (a single click is reported 250 ms after release)
+        //   double click : 2nd press within 250 ms of the 1st release (fires on press)
+        //   long         : held 0.5 s  (fires while held)
+        //   very long    : held 2 s    (fires while held, after long)
+        //   hold + turn  : master volume (cancels long / click for that press)
+        bool short_press = false, long_press = false, vlong_press = false, double_click = false;
+        {
+            int64_t  now      = esp_timer_get_time();
+            uint32_t presses  = s_btn_press_seq;
+            uint32_t releases = s_btn_release_seq;
+            bool new_press   = (presses  != g_last_press);
+            bool new_release = (releases != g_last_release);
+            g_last_press = presses; g_last_release = releases;
+            bool down = s_btn_down;
+
+            if (g_state == G_IDLE && new_press) {
+                g_state = G_DOWN1; g_t_down = s_btn_press_us;
+                g_long_fired = g_vlong_fired = g_turned_held = false;
+                new_press = false;
             }
-        }
-        if (btn_pending) {
-            int64_t held = esp_timer_get_time() - btn_start_us;
-            if (!long_fired && held >= 800000) {
-                long_fired      = true;
-                btn_dispatch_us = esp_timer_get_time();
-                long_press      = true;
-            }
-            if (!vlong_fired && held >= 3500000) {
-                vlong_fired     = true;
-                btn_dispatch_us = esp_timer_get_time();
-                vlong_press     = true;
-            }
-            if (gpio_get_level(ENC_SW) == 1) {
-                btn_pending = false;
-                if (!long_fired && !vlong_fired) {
-                    btn_dispatch_us = esp_timer_get_time();
-                    short_press     = true;
+            if (g_state == G_DOWN1) {
+                if (down && !new_release) {
+                    // Hold + turn: master volume. Takes the rotation away from the UI
+                    // and cancels the long press for this hold (unless already fired).
+                    if (delta && !g_long_fired) {
+                        g_turned_held = true;
+                        int v = (int)master_vol + delta * 5 * accel;   // 5 % per detent
+                        master_vol = (uint8_t)(v < 0 ? 0 : v > 100 ? 100 : v);
+                        output_set_master_volume(master_vol);
+                        delta = 0;
+                    }
+                    if (!g_turned_held) {
+                        if (!g_long_fired  && now - g_t_down >= BTN_LONG_US)  { g_long_fired  = true; long_press  = true; }
+                        if (!g_vlong_fired && now - g_t_down >= BTN_VLONG_US) { g_vlong_fired = true; vlong_press = true; }
+                    }
+                } else {                                   // released
+                    if (g_turned_held) {                   // volume gesture: persist, no click
+                        nvs_handle_t h;
+                        if (nvs_open("ui", NVS_READWRITE, &h) == ESP_OK) {
+                            nvs_set_u8(h, "mvol", master_vol); nvs_commit(h); nvs_close(h);
+                        }
+                        ESP_LOGI(TAG, "master volume %u %%", master_vol);
+                        g_state = G_IDLE;
+                    } else if (g_long_fired) {
+                        g_state = G_IDLE;                  // hold gestures end here
+                    } else {
+                        g_state = G_WAIT2; g_t_up = s_btn_release_us;
+                    }
+                    new_release = false;
                 }
-                long_fired  = false;
-                vlong_fired = false;
+            }
+            if (g_state == G_WAIT2) {
+                if (new_press)                         { double_click = true; g_state = G_DOWN2; }
+                else if (now - g_t_up >= BTN_DOUBLE_US){ short_press  = true; g_state = G_IDLE;  }
+                else if (delta) {
+                    // Turning right after a click: deliver the click NOW and the
+                    // rotation next tick, so the click acts on what was selected.
+                    short_press = true; g_state = G_IDLE;
+                    deferred_delta = delta; delta = 0;
+                }
+            }
+            if (g_state == G_DOWN2 && !down && (new_release || !new_press)) {
+                g_state = G_IDLE;                      // wait for the 2nd release
             }
         }
 
         // mux_pots_tick();
 
         // Single ui_tick per loop — always called so dirty flag and timed refresh work
-        ui_tick(delta, short_press, long_press, vlong_press);
+        ui_tick(delta, accel, short_press, long_press, vlong_press, double_click);
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
