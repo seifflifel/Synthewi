@@ -22,4 +22,5 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
 // new state; ui_tick() repaints the ribbon element (the UI task owns SPI).
 void ui_set_pad_active(uint8_t pad, bool active);
 void ui_set_octave(int shift);   // UI copy only — main.c owns the octave shift
+void ui_octave_limit_hit(void);  // octave pad pressed at ±2: flash the label red (any task)
 void ui_notify_lever(void);

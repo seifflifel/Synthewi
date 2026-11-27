@@ -2,6 +2,7 @@
 // redraw. Also the ribbon-state setters of the public API.
 
 #include <stdio.h>
+#include "esp_timer.h"
 #include "touch_telemetry.h"
 #include "looper.h"
 #include "ui.h"
@@ -10,6 +11,13 @@
 // Ribbon state (written by the touch task via on_touch, read by the UI task)
 // UI's copy of the octave shift — main.c owns the value and pushes it via ui_set_octave().
 static volatile int  s_octave_shift = 0;
+
+// Octave-limit flash: when an octave pad is pressed at ±2 (nothing can change),
+// the label blinks red twice so the press doesn't feel ignored.
+// Set from the touch task (timestamp only); drawn by the UI task.
+#define OCT_FLASH_US 400000LL
+static volatile int64_t s_oct_flash_start = 0;   // 0 = no flash running
+static bool             s_rb_oct_red      = false;
 static volatile bool s_pad_active[TOUCH_NOTE_PADS] = {false};
 
 // Ribbon cache — what is currently on screen, so ui_ribbon_update() redraws only what changed.
@@ -71,15 +79,27 @@ static void ribbon_draw_wave(uint8_t wave_id)
 
 // Octave label — yellow when shifted, dim gray at zero. Always 5 chars wide,
 // and tft_text paints its background, so it overwrites the previous label.
-static void ribbon_draw_oct(int shift)
+static void ribbon_draw_oct(int shift, bool red)
 {
     char oct_buf[8];
     if (shift == 0)
         snprintf(oct_buf, sizeof(oct_buf), "OCT 0");
     else
         snprintf(oct_buf, sizeof(oct_buf), "OCT%+d", shift);
-    tft_text(oct_buf, 116, 6, shift ? C_BLUE : C_DKGRAY, C_BLACK, 1);
-    s_rb_oct = shift;
+    uint16_t fg = red ? C_RED : (shift ? C_BLUE : C_DKGRAY);
+    tft_text(oct_buf, 116, 6, fg, C_BLACK, 1);
+    s_rb_oct     = shift;
+    s_rb_oct_red = red;
+}
+
+// Is the octave-limit flash currently in a red phase? (two 130 ms pulses)
+static bool oct_flash_red(void)
+{
+    int64_t start = s_oct_flash_start;
+    if (start == 0) return false;
+    int64_t e = esp_timer_get_time() - start;
+    if (e >= OCT_FLASH_US) { s_oct_flash_start = 0; return false; }
+    return (e < 130000) || (e >= 200000 && e < 330000);
 }
 
 // Looper dot (5×5, top-right)
@@ -101,7 +121,7 @@ void ui_draw_ribbon(void)
     amy_engine_state_t st;
     amy_engine_get_state(&st);
     ribbon_draw_wave(st.wave_id);
-    ribbon_draw_oct(s_octave_shift);
+    ribbon_draw_oct(s_octave_shift, oct_flash_red());
     ribbon_draw_loop(looper_get_state());
     tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY); // separator
     s_rb_valid = true;
@@ -124,8 +144,9 @@ void ui_ribbon_update(void)
     amy_engine_get_state(&st);
     if (st.wave_id != s_rb_wave) ribbon_draw_wave(st.wave_id);
 
-    int oct = s_octave_shift;
-    if (oct != s_rb_oct) ribbon_draw_oct(oct);
+    int  oct = s_octave_shift;
+    bool red = oct_flash_red();
+    if (oct != s_rb_oct || red != s_rb_oct_red) ribbon_draw_oct(oct, red);
 
     looper_state_t ls = looper_get_state();
     if (ls != s_rb_loop) ribbon_draw_loop(ls);
@@ -139,6 +160,8 @@ void ui_ribbon_update(void)
 void ui_notify_lever(void) { }
 
 void ui_set_octave(int shift) { s_octave_shift = shift; }
+
+void ui_octave_limit_hit(void) { s_oct_flash_start = esp_timer_get_time(); }
 
 void ui_set_pad_active(uint8_t pad, bool active)
 {

@@ -53,6 +53,8 @@ static void on_touch(uint8_t pad, bool on)
             apply_octave();
             ui_set_octave(s_octave_shift);
             ESP_LOGI(TAG, "octave %+d", s_octave_shift);
+        } else {
+            ui_octave_limit_hit();   // already at ±2 — flash the octave label red
         }
     }
 }
