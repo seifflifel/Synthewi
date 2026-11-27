@@ -79,6 +79,8 @@ static volatile int64_t  s_btn_release_us  = 0;
 #define BTN_LONG_US     500000LL     // hold → long press (back); was 0.8 s
 #define BTN_VLONG_US   2000000LL     // hold → very long press (clear loop on top screen); was 3.5 s
 #define BTN_DOUBLE_US   250000LL     // 2nd press within this after a release → double click
+#define BTN_PANIC_COUNT 5            // this many presses …
+#define BTN_PANIC_GAP_US 400000LL    // … each within this of the previous press → PANIC
 
 // ── Encoder decoder ──────────────────────────────────────────
 // This encoder makes one full quadrature cycle per click and rests at AB=11:
@@ -217,6 +219,8 @@ void app_main(void)
     int64_t  g_t_down = 0, g_t_up = 0;
     bool     g_long_fired = false, g_vlong_fired = false;
     bool     g_turned_held = false;   // encoder turned while the button was held
+    int      g_press_run   = 0;       // consecutive fast presses (panic detection)
+    int64_t  g_prev_press_us = 0;
     int      deferred_delta = 0;      // rotation held back one tick (see WAIT2)
 
     // Encoder acceleration (values only, never list navigation): smoothed
@@ -225,15 +229,18 @@ void app_main(void)
 
     // Master volume (hold + turn), persisted in NVS "ui"/"mvol"
     uint8_t  master_vol = 100;
+    uint8_t  loop_vol   = 100;   // loop playback volume, NVS "ui"/"lvol" (UI control: coming with the redesign)
     {
         nvs_handle_t h;
         if (nvs_open("ui", NVS_READONLY, &h) == ESP_OK) {
             uint8_t v;
             if (nvs_get_u8(h, "mvol", &v) == ESP_OK && v <= 100) master_vol = v;
+            if (nvs_get_u8(h, "lvol", &v) == ESP_OK && v <= 100) loop_vol   = v;
             nvs_close(h);
         }
         output_set_master_volume(master_vol);
-        ESP_LOGI(TAG, "master volume %u %%", master_vol);
+        looper_set_volume(loop_vol);
+        ESP_LOGI(TAG, "master volume %u %%, loop volume %u %%", master_vol, loop_vol);
     }
 
     for (;;) {
@@ -300,6 +307,24 @@ void app_main(void)
             bool new_release = (releases != g_last_release);
             g_last_press = presses; g_last_release = releases;
             bool down = s_btn_down;
+
+            // PANIC: BTN_PANIC_COUNT presses, each within BTN_PANIC_GAP_US of the
+            // previous one. The earlier presses may already have toggled the
+            // looper via double clicks — panic clears the loop anyway. The panic
+            // press itself is swallowed (no click / double click from it).
+            if (new_press) {
+                int64_t tp = s_btn_press_us;
+                g_press_run = (tp - g_prev_press_us < BTN_PANIC_GAP_US) ? g_press_run + 1 : 1;
+                g_prev_press_us = tp;
+                if (g_press_run >= BTN_PANIC_COUNT) {
+                    g_press_run = 0;
+                    amy_engine_panic();
+                    looper_clear();
+                    for (uint8_t i = 0; i < 8; i++) ui_set_pad_active(i, false);
+                    g_state   = G_DOWN2;      // wait for release, emit nothing
+                    new_press = false;
+                }
+            }
 
             if (g_state == G_IDLE && new_press) {
                 g_state = G_DOWN1; g_t_down = s_btn_press_us;

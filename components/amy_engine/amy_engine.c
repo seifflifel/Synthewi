@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -655,6 +656,60 @@ void amy_engine_get_state(amy_engine_state_t *out)
     out->glide            = s_portamento;
     out->synth_mode       = (uint8_t)s_mode;
     out->patch_num        = s_patch_num;
+}
+
+// ── Panic ─────────────────────────────────────────────────────
+// Silence everything right now: all pad voices AND the echo/reverb tails.
+// Notes: amp CONST 0 + note-off on every pad osc (amp_coefs are re-sent by the
+//        next note_on, so pads work normally afterwards).
+// Tails: AMY skips reverb processing when its level is 0, so zeroing the level
+//        would just freeze the tail and bring it back later. Instead feedback is
+//        set to 0 (echo) / liveness 0 with a tiny level (reverb) so the delay
+//        lines fill with silence; after PANIC_FLUSH_US (> 500 ms max echo delay)
+//        the user's echo/reverb settings are restored.
+#define PANIC_FLUSH_US 700000
+static esp_timer_handle_t s_panic_timer = NULL;
+
+static void panic_restore_cb(void *arg)
+{
+    (void)arg;
+    amy_engine_set_echo(s_echo_amount, s_echo_feedback);
+    amy_engine_set_reverb(s_reverb_amount, s_reverb_decay);
+    ESP_LOGI(TAG, "panic: effects restored");
+}
+
+void amy_engine_panic(void)
+{
+    if (!s_initialized) return;
+    for (uint8_t pad = 0; pad < SYNTH_PAD_COUNT; pad++) {
+        amy_event e = amy_default_event();
+        e.osc = pad;
+        e.amp_coefs[COEF_CONST] = 0.0f;
+        e.velocity = 0.0f;
+        amy_add_event(&e);
+        s_pad_active[pad] = false;
+    }
+    {   // flush echo
+        amy_event e = amy_default_event();
+        e.echo_level    = 0.0f;
+        e.echo_feedback = 0.0f;
+        amy_add_event(&e);
+    }
+    {   // flush reverb (keep it processing at a negligible level)
+        amy_event e = amy_default_event();
+        e.reverb_level    = 0.001f;
+        e.reverb_liveness = 0.0f;
+        amy_add_event(&e);
+    }
+    if (s_panic_timer == NULL) {
+        const esp_timer_create_args_t args = { .callback = panic_restore_cb, .name = "panic" };
+        if (esp_timer_create(&args, &s_panic_timer) != ESP_OK) s_panic_timer = NULL;
+    }
+    if (s_panic_timer) {
+        esp_timer_stop(s_panic_timer);                 // restart if panicked again
+        esp_timer_start_once(s_panic_timer, PANIC_FLUSH_US);
+    }
+    ESP_LOGW(TAG, "PANIC: all notes off, effect tails flushed");
 }
 
 void amy_engine_save_state(void)

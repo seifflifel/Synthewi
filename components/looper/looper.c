@@ -7,13 +7,22 @@ static const char *TAG = "Looper";
 
 // AMY renders 48000 Hz stereo — looper captures mono int16.
 #define LOOPER_SAMPLE_RATE  48000
-#define LOOPER_PSRAM_HEADROOM  (150 * 1024)  // bytes kept free — must cover echo (2ch × 12000 × 2B = 48KB) + fragmentation
+// Bytes left free after the loop buffer. Echo (256 KB) and reverb (~108 KB)
+// are allocated by amy_engine_init() BEFORE looper_init(), so this only has to
+// cover fragmentation and small later allocations.
+#define LOOPER_PSRAM_HEADROOM  (150 * 1024)
 
 static volatile looper_state_t s_state    = LOOPER_IDLE;
 static int16_t * volatile      s_buf      = NULL;
 static volatile uint32_t       s_max_len  = 0;  // allocated samples (mono)
 static volatile uint32_t       s_loop_len = 0;  // recorded loop length in samples
 static volatile uint32_t       s_pos      = 0;  // current position in samples
+
+// Loop playback volume (mix fader for the loop, separate from master volume).
+// Q15 gain, applied only when the loop is mixed into the output — the recorded
+// layers keep their original level, so changing it is non-destructive.
+static volatile int32_t        s_loop_gain_q15 = 32768;   // 1.0
+static volatile uint8_t        s_loop_vol_pct  = 100;
 
 void looper_init(void)
 {
@@ -68,6 +77,27 @@ void looper_clear(void)
     ESP_LOGI(TAG, "cleared");
 }
 
+void looper_set_volume(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    s_loop_vol_pct = percent;
+    float v = percent / 100.0f;
+    s_loop_gain_q15 = (int32_t)(v * v * 32768.0f);   // same perceptual curve as master volume
+}
+uint8_t  looper_get_volume(void)     { return s_loop_vol_pct; }
+uint32_t looper_get_max_length(void) { return s_max_len; }
+
+void looper_get_progress(looper_progress_t *out)
+{
+    // Snapshot for the UI (loop bar). Fields are read individually from the
+    // audio thread's variables, so they may be off by one block — fine for display.
+    out->state      = s_state;
+    out->position   = s_pos;
+    out->length     = s_loop_len;
+    out->max_length = s_max_len;
+    out->sample_rate = LOOPER_SAMPLE_RATE;
+}
+
 looper_state_t looper_get_state(void)    { return s_state; }
 uint32_t       looper_get_position(void) { return s_pos; }
 uint32_t       looper_get_length(void)   { return s_loop_len; }
@@ -110,7 +140,7 @@ void looper_process_block(int16_t *block, int n_frames)
 
         case LOOPER_PLAYING: {
             if (s_loop_len == 0) break;
-            int16_t loop_s = s_buf[s_pos];
+            int16_t loop_s = (int16_t)(((int32_t)s_buf[s_pos] * s_loop_gain_q15) >> 15);
             block[i * 2]     = clamp16((int32_t)live_l + loop_s);
             block[i * 2 + 1] = clamp16((int32_t)live_r + loop_s);
             if (++s_pos >= s_loop_len) s_pos = 0;
@@ -122,7 +152,7 @@ void looper_process_block(int16_t *block, int n_frames)
             int16_t live_mono = clamp16(((int32_t)live_l + live_r) >> 1);
             // Bake live audio into loop (additive mix, no decay — keep it simple)
             s_buf[s_pos] = clamp16((int32_t)s_buf[s_pos] + live_mono);
-            int16_t loop_s = s_buf[s_pos];
+            int16_t loop_s = (int16_t)(((int32_t)s_buf[s_pos] * s_loop_gain_q15) >> 15);
             block[i * 2]     = clamp16((int32_t)live_l + loop_s);
             block[i * 2 + 1] = clamp16((int32_t)live_r + loop_s);
             if (++s_pos >= s_loop_len) s_pos = 0;

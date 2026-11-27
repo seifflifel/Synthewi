@@ -88,6 +88,10 @@ void amy_engine_get_state(amy_engine_state_t *out);
 // Persist current state to NVS (call on section exit / confirm, NOT on every encoder tick).
 void amy_engine_save_state(void);
 
+// Silence all pad voices and flush echo/reverb tails immediately; effect
+// settings are restored automatically ~0.7 s later. (Looper: caller's job.)
+void amy_engine_panic(void);
+
 // Param (0-10000) → physical value, using the exact curves the engine plays with.
 // Use these for display so the UI always matches the sound.
 uint32_t amy_engine_attack_ms(uint16_t v);       // 1 ms – 3 s (exp)

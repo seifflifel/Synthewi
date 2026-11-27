@@ -33,6 +33,23 @@ void output_limiter_get_stats(limiter_stats_t *out);       // read + reset
 // Master volume 0-100 % (perceptual curve), applied after the limiter. Any task.
 void output_set_master_volume(uint8_t percent);
 
+// Loop playback volume 0-100 % (perceptual curve), independent of master
+// volume (which still applies to everything). Non-destructive: only affects
+// how loud the loop is mixed in, not what is recorded.
+void    looper_set_volume(uint8_t percent);
+uint8_t looper_get_volume(void);
+
+// Snapshot for a loop progress bar: position/length in samples at sample_rate.
+typedef struct {
+    looper_state_t state;
+    uint32_t position;     // current play/record position (samples)
+    uint32_t length;       // recorded loop length (0 while recording the first pass)
+    uint32_t max_length;   // buffer capacity (samples) — record progress = position / max_length
+    uint32_t sample_rate;
+} looper_progress_t;
+void     looper_get_progress(looper_progress_t *out);
+uint32_t looper_get_max_length(void);
+
 looper_state_t looper_get_state(void);
 uint32_t       looper_get_position(void);   // current playback position in samples
 uint32_t       looper_get_length(void);     // recorded loop length in samples
