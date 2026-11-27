@@ -102,10 +102,40 @@ void ui_volume_popup(uint8_t percent, bool active)
     s_vol_open = active;
 }
 
-bool ui_popup_active(void) { return s_vol_open || s_vol_p > 0.02f; }
+// Message pop-up (SAVED / LOADED / CLEARED): same box, open for MSG_HOLD_S.
+#define MSG_HOLD_S 0.7f
+static char  s_msg[12];
+static float s_msg_t0 = -100.0f, s_msg_p = 0.0f, s_msg_last = 0.0f;
+
+void ui_msg_popup(const char *text)
+{
+    snprintf(s_msg, sizeof(s_msg), "%s", text);
+    s_msg_t0 = ui_now_s();
+}
+
+static bool msg_open(void) { float t = ui_now_s() - s_msg_t0; return t >= 0.0f && t < MSG_HOLD_S; }
+
+static void msg_draw(void)
+{
+    float now = ui_now_s(), dt = now - s_msg_last;
+    s_msg_last = now;
+    if (dt < 0.0f || dt > 0.5f) dt = 0.02f;
+    s_msg_p += ((msg_open() ? 1.0f : 0.0f) - s_msg_p) * (1.0f - expf(-dt / ANIM_TAU_S));
+    if (!msg_open() && s_msg_p < 0.02f) { s_msg_p = 0.0f; return; }
+    float p = s_msg_p, e = 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p);
+    int hw = (int)lrintf(50 * e), hh = (int)lrintf(16 * e), cx = 80, cy = 66;
+    int r[4] = {cx - hw, cy - hh, cx + hw, cy + hh};
+    anim_box(r);
+    if (p < 0.9f) return;
+    int tw = (int)strlen(s_msg) * 12 - 2;
+    tft_text(s_msg, cx - tw / 2, cy - 7, C_WHITE, C_BLACK, 2);
+}
+
+bool ui_popup_active(void) { return s_vol_open || s_vol_p > 0.02f || msg_open() || s_msg_p > 0.02f; }
 
 void ui_popup_draw(void)
 {
+    msg_draw();
     // Tweens are advanced here (called once per redraw while active).
     float now = ui_now_s(), dt = now - s_vol_p_last;
     s_vol_p_last = now;

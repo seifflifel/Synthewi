@@ -14,11 +14,11 @@
 #include "ui_internal.h"
 
 // ── UI state ─────────────────────────────────────────────────
-typedef enum { UI_HOME, UI_MAIN, UI_CALIB, UI_EFFECTS, UI_ADSR, UI_PRESETS } ui_section_t;
+typedef enum { UI_HOME, UI_MAIN, UI_CALIB, UI_EFFECTS, UI_ADSR, UI_PRESETS, UI_SETTINGS } ui_section_t;
 
 static ui_section_t s_sec       = UI_HOME;
 #define TRANS_TAG_CARD 100            // transition tag: PARAMS grid tile -> edit view
-int                 ui_card_cur = 0;  // HOME tile: 0=PARAMS (MAIN) 1=PRESETS 2=SETTINGS (CAL for now)
+int                 ui_card_cur = 0;  // HOME tile: 0=PARAMS (MAIN) 1=PRESETS 2=SETTINGS
 bool                ui_on_home  = true;
 static bool         s_dirty     = true;
 
@@ -116,6 +116,7 @@ static void draw_section(void)
         case UI_EFFECTS: ui_draw_effects(); break;
         case UI_ADSR:    ui_draw_adsr();    break;
         case UI_PRESETS: ui_draw_presets(); break;
+        case UI_SETTINGS: ui_draw_settings(); break;
     }
 }
 
@@ -210,6 +211,16 @@ static void ui_exit_to_home(void)
     ui_enter(UI_HOME);
 }
 
+// CAL -> SETTINGS: save, then the window shrinks into the CALIBRATE row.
+static void ui_back_to_settings(void)
+{
+    if (ui_cal_editing) { cal_save(); ui_cal_editing = false; }
+    int r[4];
+    ui_settings_row_rect(0, r);
+    trans_begin(UI_BODY_RECT, r, false);
+    ui_enter(UI_SETTINGS);
+}
+
 // Persist the CAL edit values (MIN for every pad, MAX for note pads).
 static void cal_save(void)
 {
@@ -221,6 +232,7 @@ static void cal_save(void)
 void ui_init(void)
 {
     tft_init();   // SPI bus + DC/RST pins + panel init (bus setup was inline here)
+    ui_theme_load();   // light / dark (panel inversion) from NVS
     presets_init();
     ui_redraw();
     tft_flush();
@@ -269,7 +281,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
         }
         if (short_press) {
             // Enter: the tile's frame grows to fill the body, then the section opens.
-            static const ui_section_t dest[3] = {UI_MAIN, UI_PRESETS, UI_CALIB};
+            static const ui_section_t dest[3] = {UI_MAIN, UI_PRESETS, UI_SETTINGS};
             int r[4];
             ui_home_tile_rect(ui_card_cur, r);
             trans_begin(r, UI_BODY_RECT, true);
@@ -417,6 +429,25 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
         }
         break;
 
+    case UI_SETTINGS:
+        if (delta) {
+            ui_set_cur += delta;
+            if (ui_set_cur < 0) ui_set_cur = 0;
+            if (ui_set_cur > UI_SET_ROWS - 1) ui_set_cur = UI_SET_ROWS - 1;
+        }
+        if (short_press) {
+            if (ui_set_cur == 0) {            // CALIBRATE: row grows into the CAL screen
+                int r[4];
+                ui_settings_row_rect(0, r);
+                trans_begin(r, UI_BODY_RECT, true);
+                ui_enter(UI_CALIB);
+            } else {
+                ui_theme_toggle();
+            }
+        }
+        if (long_press) ui_exit_to_home();
+        break;
+
     case UI_CALIB:
         if (!ui_cal_editing) {
             if (delta) {
@@ -432,7 +463,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                 ui_cal_editing = true;
                 s_dirty       = true;
             }
-            if (long_press) ui_exit_to_home();
+            if (long_press) ui_back_to_settings();
         } else {
             // Note pads: click 1 edits MIN (orange), click 2 edits MAX (blue),
             // click 3 saves. Octave pads: single threshold, click saves.
@@ -462,7 +493,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             }
             if (long_press) {
                 cal_save();
-                ui_exit_to_home();
+                ui_back_to_settings();
             }
         }
         break;
@@ -563,15 +594,25 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             if (short_press) {
                 switch (ui_prst_act) {
                 case 0: // LOAD — no-op on empty slot
-                    if (preset_is_valid(ui_prst_cur)) preset_apply(ui_prst_cur);
+                    if (preset_is_valid(ui_prst_cur)) {
+                        preset_apply(ui_prst_cur);
+                        ui_prst_loaded = ui_prst_cur;
+                        ui_msg_popup("LOADED");
+                    }
                     break;
                 case 1: // SAVE — always available
                     preset_capture(ui_prst_cur);
                     preset_name_set(ui_prst_cur, NULL);   // user save → generic "Pn"
                     preset_nvs_save(ui_prst_cur);
+                    ui_prst_loaded = ui_prst_cur;
+                    ui_msg_popup("SAVED");
                     break;
                 case 2: // CLR — no-op on empty slot
-                    if (preset_is_valid(ui_prst_cur)) preset_nvs_clear(ui_prst_cur);
+                    if (preset_is_valid(ui_prst_cur)) {
+                        preset_nvs_clear(ui_prst_cur);
+                        if (ui_prst_loaded == ui_prst_cur) ui_prst_loaded = -1;
+                        ui_msg_popup("CLEARED");
+                    }
                     break;
                 }
                 ui_prst_action = false;
@@ -596,7 +637,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
     // extra full redraw after an animation ends erases its last frame.
     ui_on_home = (s_sec == UI_HOME);
     static bool s_was_anim = false;
-    bool anim = ui_on_home || s_sec == UI_MAIN || ui_anim_busy();   // PARAMS icons are live too
+    bool anim = ui_on_home || s_sec == UI_MAIN || s_sec == UI_PRESETS || s_sec == UI_SETTINGS || ui_anim_busy();
     if (s_dirty || anim || s_was_anim) {
         // Layout / section change → full repaint (body + ribbon)
         s_dirty      = false;

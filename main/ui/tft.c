@@ -92,6 +92,9 @@ void tft_set_clip(int x0, int y0, int x1, int y1)
     s_cx0 = x0 < 0 ? 0 : x0; s_cy0 = y0 < 0 ? 0 : y0;
     s_cx1 = x1 > TFT_W - 1 ? TFT_W - 1 : x1; s_cy1 = y1 > TFT_H - 1 ? TFT_H - 1 : y1;
 }
+// Dark mode: the panel's own colour inversion (ST7735 INVON / INVOFF). UI task only.
+void tft_set_invert(bool on) { tft_cmd(on ? 0x21 : 0x20); }
+
 void tft_clip_reset(void) { s_cx0 = 0; s_cy0 = 0; s_cx1 = TFT_W - 1; s_cy1 = TFT_H - 1; }
 
 static inline void fb_px(int x, int y, uint16_t sw)

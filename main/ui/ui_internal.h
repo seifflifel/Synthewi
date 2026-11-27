@@ -84,12 +84,24 @@ void  ui_trans_draw(void);
 bool  ui_trans_rect(int r[4]);                // current transition window
 bool  ui_popup_active(void);
 void  ui_popup_draw(void);
+void  ui_msg_popup(const char *text);         // SAVED / LOADED / CLEARED box (~0.7 s)
 bool  ui_anim_busy(void);                     // a transition or pop-up needs per-tick redraws
 
 // ── Screen draw functions ─────────────────────────────────────
 // ui_home.c
 void ui_draw_home(void);
 void ui_home_tile_rect(int i, int r[4]);
+// ui_presets.c
+extern int ui_prst_loaded;
+void ui_presets_tile_rect(int i, int r[4]);
+// ui_settings.c
+#define UI_SET_ROWS 2                          // CALIBRATE, THEME
+extern int  ui_set_cur;
+extern bool ui_dark;
+void ui_draw_settings(void);
+void ui_settings_row_rect(int i, int r[4]);
+void ui_theme_load(void);
+void ui_theme_toggle(void);
 // ui_params.c (PARAMS grid + edit view, replaces ui_draw_main)
 void ui_draw_params(void);
 void ui_params_tile_rect(int i, int r[4]);
