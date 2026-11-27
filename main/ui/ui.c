@@ -17,6 +17,7 @@
 typedef enum { UI_HOME, UI_MAIN, UI_CALIB, UI_EFFECTS, UI_ADSR, UI_PRESETS } ui_section_t;
 
 static ui_section_t s_sec       = UI_HOME;
+#define TRANS_TAG_CARD 100            // transition tag: PARAMS grid tile -> edit view
 int                 ui_card_cur = 0;  // HOME tile: 0=PARAMS (MAIN) 1=PRESETS 2=SETTINGS (CAL for now)
 bool                ui_on_home  = true;
 static bool         s_dirty     = true;
@@ -75,17 +76,54 @@ static int echo_snap_idx(uint16_t v) {
     return best;
 }
 
+// Transition bookkeeping: the screen we came from, and whether the window opens
+// (new screen inside a growing window) or closes (old screen inside a shrinking one).
+static ui_section_t s_tr_sec;
+static bool         s_tr_card, s_tr_open;
+
+static void draw_section(void);
+// Draw a section's body as it looks in (sec, in_card), then restore the state.
+static void draw_body(ui_section_t sec, bool in_card)
+{
+    ui_section_t ss = s_sec; bool sc = ui_main_in_card;
+    s_sec = sec; ui_main_in_card = in_card;
+    draw_section();
+    s_sec = ss; ui_main_in_card = sc;
+}
+
 static void ui_redraw(void)
+{
+    int r[4];
+    if (ui_trans_rect(r)) {
+        // Outside the window: the screen being left (opening) or arrived at (closing).
+        if (s_tr_open) draw_body(s_tr_sec, s_tr_card); else draw_section();
+        tft_set_clip(r[0], r[1], r[2], r[3]);
+        tft_rect(r[0], r[1], r[2], r[3], C_BLACK);
+        if (s_tr_open) draw_section(); else draw_body(s_tr_sec, s_tr_card);
+        tft_clip_reset();
+    } else {
+        draw_section();
+    }
+    ui_draw_ribbon(); // always last — overwrites y=0..21
+}
+
+static void draw_section(void)
 {
     switch (s_sec) {
         case UI_HOME:    ui_draw_home();    break;   // ui_draw_cards() (old top screen) is kept but unused
-        case UI_MAIN:    ui_draw_main();    break;
+        case UI_MAIN:    ui_draw_params();  break;   // ui_draw_main() (old cards) kept but unused
         case UI_CALIB:   ui_draw_calib();   break;
         case UI_EFFECTS: ui_draw_effects(); break;
         case UI_ADSR:    ui_draw_adsr();    break;
         case UI_PRESETS: ui_draw_presets(); break;
     }
-    ui_draw_ribbon(); // always last — overwrites y=0..21
+}
+
+// Start a window transition from the current screen; call BEFORE switching state.
+static void trans_begin(const int from[4], const int to[4], bool open)
+{
+    s_tr_sec = s_sec; s_tr_card = ui_main_in_card; s_tr_open = open;
+    ui_trans_start(from, to, -1);
 }
 
 // ── Section enter helpers ─────────────────────────────────────
@@ -166,10 +204,10 @@ static void ui_exit_to_home(void)
     if (s_sec == UI_MAIN || s_sec == UI_EFFECTS || s_sec == UI_ADSR) {
         amy_engine_save_state();
     }
-    ui_enter(UI_HOME);
     int r[4];
     ui_home_tile_rect(ui_card_cur, r);
-    ui_trans_start(UI_BODY_RECT, r, -1);
+    trans_begin(UI_BODY_RECT, r, false);
+    ui_enter(UI_HOME);
 }
 
 // Persist the CAL edit values (MIN for every pad, MAX for note pads).
@@ -208,7 +246,9 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
     // While one runs, navigation input is ignored (the looper still works).
     {
         int tag = ui_trans_step();
-        if (tag >= 0) ui_enter((ui_section_t)tag);
+        if (tag == TRANS_TAG_CARD) {          // PARAMS grid -> edit view
+            ui_main_in_card = true; ui_main_param = 0; ui_main_editing = false; s_dirty = true;
+        } else if (tag >= 0) ui_enter((ui_section_t)tag);
         if (ui_trans_active()) { delta = 0; vdelta = 0; short_press = long_press = vlong_press = false; }
     }
 
@@ -232,7 +272,8 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             static const ui_section_t dest[3] = {UI_MAIN, UI_PRESETS, UI_CALIB};
             int r[4];
             ui_home_tile_rect(ui_card_cur, r);
-            ui_trans_start(r, UI_BODY_RECT, (int)dest[ui_card_cur]);
+            trans_begin(r, UI_BODY_RECT, true);
+            ui_enter(dest[ui_card_cur]);
         }
         // long_press on the top screen only arms the clear (see above)
         if (vlong_press && s_clear_armed) {
@@ -288,7 +329,12 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                 if (ui_main_card > 5) ui_main_card = 5;
                 s_dirty = true;
             }
-            if (short_press) { ui_main_in_card = true; ui_main_param = 0; ui_main_editing = false; s_dirty = true; }
+            if (short_press) {                // tile grows into the edit view (see TRANS_TAG_CARD)
+                int r[4];
+                ui_params_tile_rect(ui_main_card, r);
+                trans_begin(r, UI_BODY_RECT, true);
+                ui_main_in_card = true; ui_main_param = 0; ui_main_editing = false; s_dirty = true;
+            }
             if (long_press)  ui_exit_to_home();   // saves state
         } else {
             // Card edit, two modes (car-radio style "direct manipulation"):
@@ -360,6 +406,9 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             }
             if (long_press) {
                 amy_engine_save_state();
+                int r[4];                     // shrink back into the group's tile
+                ui_params_tile_rect(ui_main_card, r);
+                trans_begin(UI_BODY_RECT, r, false);
                 ui_main_in_card = false;
                 ui_main_editing = false;
                 ui_main_param   = 0;
@@ -547,7 +596,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
     // extra full redraw after an animation ends erases its last frame.
     ui_on_home = (s_sec == UI_HOME);
     static bool s_was_anim = false;
-    bool anim = ui_on_home || ui_anim_busy();
+    bool anim = ui_on_home || s_sec == UI_MAIN || ui_anim_busy();   // PARAMS icons are live too
     if (s_dirty || anim || s_was_anim) {
         // Layout / section change → full repaint (body + ribbon)
         s_dirty      = false;

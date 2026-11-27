@@ -75,11 +75,13 @@ static inline unsigned ui_lfo_oct10(uint16_t v)    { return (unsigned)lroundf(am
 // ── Motion (ui_anim.c) ────────────────────────────────────────
 extern const int UI_BODY_RECT[4];             // body area below the ribbon (transition target)
 float ui_now_s(void);                         // seconds (wraps hourly) for animations
-float ui_tween(float cur, float target, float *last_s); // time-based ease toward target
+float ui_tween(float cur, float target, float *last_s); // time-based ease toward target (pixels)
+float ui_tween_eps(float cur, float target, float *last_s, float eps);
 void  ui_trans_start(const int from[4], const int to[4], int tag);
 bool  ui_trans_active(void);
 int   ui_trans_step(void);                    // returns tag once the transition finished, else -1
 void  ui_trans_draw(void);
+bool  ui_trans_rect(int r[4]);                // current transition window
 bool  ui_popup_active(void);
 void  ui_popup_draw(void);
 bool  ui_anim_busy(void);                     // a transition or pop-up needs per-tick redraws
@@ -88,6 +90,11 @@ bool  ui_anim_busy(void);                     // a transition or pop-up needs pe
 // ui_home.c
 void ui_draw_home(void);
 void ui_home_tile_rect(int i, int r[4]);
+// ui_params.c (PARAMS grid + edit view, replaces ui_draw_main)
+void ui_draw_params(void);
+void ui_params_tile_rect(int i, int r[4]);
+// ui_ribbon.c — note activity for live icons: any pad held + last on/off times (us)
+bool ui_note_state(int64_t *on_us, int64_t *off_us);
 // ui_ribbon.c
 void ui_draw_wave_glyph(uint8_t wave_id, int x0, int y0, int x1, int y1, uint16_t fg);
 void ui_draw_ribbon(void);

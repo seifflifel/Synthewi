@@ -85,16 +85,27 @@ static void tft_send_pixels(const uint8_t *buf, int nbytes)
 }
 
 // -- Drawing into the framebuffer (no SPI here) ---------------
+// Clip rectangle (transitions draw a screen "through" a window). Full screen by default.
+static int s_cx0 = 0, s_cy0 = 0, s_cx1 = TFT_W - 1, s_cy1 = TFT_H - 1;
+void tft_set_clip(int x0, int y0, int x1, int y1)
+{
+    s_cx0 = x0 < 0 ? 0 : x0; s_cy0 = y0 < 0 ? 0 : y0;
+    s_cx1 = x1 > TFT_W - 1 ? TFT_W - 1 : x1; s_cy1 = y1 > TFT_H - 1 ? TFT_H - 1 : y1;
+}
+void tft_clip_reset(void) { s_cx0 = 0; s_cy0 = 0; s_cx1 = TFT_W - 1; s_cy1 = TFT_H - 1; }
+
 static inline void fb_px(int x, int y, uint16_t sw)
 {
-    if ((unsigned)x < TFT_W && (unsigned)y < TFT_H) s_fb[y * TFT_W + x] = sw;
+    if (x >= s_cx0 && x <= s_cx1 && y >= s_cy0 && y <= s_cy1) s_fb[y * TFT_W + x] = sw;
 }
 
 void tft_fill(uint8_t x0,uint8_t y0,uint8_t x1,uint8_t y1, uint16_t c)
 {
     int ix0 = x0, iy0 = y0, ix1 = x1, iy1 = y1;
-    if (ix1 >= TFT_W) ix1 = TFT_W - 1;
-    if (iy1 >= TFT_H) iy1 = TFT_H - 1;
+    if (ix0 < s_cx0) ix0 = s_cx0;
+    if (iy0 < s_cy0) iy0 = s_cy0;
+    if (ix1 > s_cx1) ix1 = s_cx1;
+    if (iy1 > s_cy1) iy1 = s_cy1;
     int w = ix1 - ix0 + 1;
     if (w <= 0 || iy1 < iy0 || ix0 >= TFT_W || iy0 >= TFT_H) return;
     uint16_t sw = swap16(c);
@@ -303,6 +314,21 @@ void tft_text(const char *str, int x, int y, uint16_t fg, uint16_t bg, int sc)
     int w = n * cw;
     if (x < 0 || y < 0) return;
     uint16_t sfg = swap16(fg), sbg = swap16(bg);
+    if (s_cx0 > 0 || s_cy0 > 0 || s_cx1 < TFT_W - 1 || s_cy1 < TFT_H - 1) {   // clipped: per pixel
+        for (int row = 0; row < ch; row++) {
+            int bit = row / sc;
+            for (int ci = 0; ci < n; ci++) {
+                char c = str[ci];
+                const uint8_t *g = (c>=32&&c<=90) ? FONT[c-32] : FONT[0];
+                for (int px = 0; px < cw; px++) {
+                    int col = px / sc;
+                    bool on = col < 5 && ((g[col] >> bit) & 1);
+                    fb_px(x + ci * cw + px, y + row, on ? sfg : sbg);
+                }
+            }
+        }
+        return;
+    }
     for (int row = 0; row < ch; row++) {
         int yy = y + row;
         if (yy >= TFT_H) break;

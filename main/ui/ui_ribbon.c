@@ -192,8 +192,26 @@ void ui_set_octave(int shift) { s_octave_shift = shift; }
 
 void ui_octave_limit_hit(void) { s_oct_flash_start = esp_timer_get_time(); }
 
+// Note activity for the live PARAMS icons (envelope dot, echo pulses, ...).
+static volatile int64_t s_note_on_us = 0, s_note_off_us = 0;
+
 void ui_set_pad_active(uint8_t pad, bool active)
 {
     if (pad >= TOUCH_NOTE_PADS) return;
+    bool was = s_pad_active[pad];
     s_pad_active[pad] = active;
+    if (active && !was) s_note_on_us = esp_timer_get_time();
+    if (!active && was) {
+        bool any = false;
+        for (int i = 0; i < TOUCH_NOTE_PADS; i++) any |= s_pad_active[i];
+        if (!any) s_note_off_us = esp_timer_get_time();
+    }
+}
+
+bool ui_note_state(int64_t *on_us, int64_t *off_us)
+{
+    *on_us = s_note_on_us;
+    *off_us = s_note_off_us;
+    for (int i = 0; i < TOUCH_NOTE_PADS; i++) if (s_pad_active[i]) return true;
+    return false;
 }

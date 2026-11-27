@@ -23,16 +23,18 @@ const int UI_BODY_RECT[4] = {1, 23, 158, 127};
 // and tweens (which treat a negative / huge dt as "snap"); transitions use int64.
 float ui_now_s(void) { return (float)((esp_timer_get_time() / 1000) % 3600000LL) / 1000.0f; }
 
-// Advance an exponential tween toward `target` over the time since *last_s.
-float ui_tween(float cur, float target, float *last_s)
+// Advance an exponential tween toward `target` over the time since *last_s;
+// snaps once closer than eps. ui_tween: pixels (eps 0.3).
+float ui_tween_eps(float cur, float target, float *last_s, float eps)
 {
     float now = ui_now_s(), dt = now - *last_s;
     *last_s = now;
     if (dt < 0.0f || dt > 0.5f) return target;          // first use / long gap: snap
     float k = 1.0f - expf(-dt / ANIM_TAU_S);
     float v = cur + (target - cur) * k;
-    return fabsf(target - v) < 0.3f ? target : v;
+    return fabsf(target - v) < eps ? target : v;
 }
+float ui_tween(float cur, float target, float *last_s) { return ui_tween_eps(cur, target, last_s, 0.3f); }
 
 // Double amber frame (the pop-up's look), filled with the background.
 static void anim_box(const int r[4])
@@ -70,13 +72,22 @@ int ui_trans_step(void)
     return s_tr.tag;
 }
 
+// Current window of the running transition (false if none).
+bool ui_trans_rect(int r[4])
+{
+    if (!s_tr.active) return false;
+    float p = trans_p(), e = 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p);
+    for (int i = 0; i < 4; i++) r[i] = (int)lrintf(s_tr.from[i] + (s_tr.to[i] - s_tr.from[i]) * e);
+    return true;
+}
+
+// The window's double amber frame (content is drawn by ui.c, see ui_redraw).
 void ui_trans_draw(void)
 {
-    if (!s_tr.active) return;
-    float p = trans_p(), e = 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p);
     int r[4];
-    for (int i = 0; i < 4; i++) r[i] = (int)lrintf(s_tr.from[i] + (s_tr.to[i] - s_tr.from[i]) * e);
-    anim_box(r);
+    if (!ui_trans_rect(r)) return;
+    tft_rrect(r[0], r[1], r[2], r[3], C_ORANGE);
+    if (r[2] - r[0] > 8 && r[3] - r[1] > 8) tft_rrect(r[0] + 1, r[1] + 1, r[2] - 1, r[3] - 1, C_ORANGE);
 }
 
 // ── Volume pop-up ─────────────────────────────────────────────

@@ -48,6 +48,10 @@ void tft_rrect(int x0, int y0, int x1, int y1, uint16_t c);
 // Filled rounded rectangle (corner radius ≈ 2 px).
 void tft_rrect_fill(int x0, int y0, int x1, int y1, uint16_t c);
 
+// Clip rectangle applied to all drawing (default: full screen).
+void tft_set_clip(int x0, int y0, int x1, int y1);
+void tft_clip_reset(void);
+
 // Clipped primitives (any int coordinates; off-screen parts are skipped).
 void tft_pixel(int x, int y, uint16_t c);
 void tft_rect(int x0, int y0, int x1, int y1, uint16_t c);          // filled, clipped
