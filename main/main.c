@@ -31,13 +31,21 @@ static void apply_octave(void)
     }
 }
 
-static void on_touch(uint8_t pad, bool on)
+// Touch expression (aftertouch) while a pad is held: gain + filter follow the
+// touch without retriggering the note. Fires up to 50×/s per pad — no logging.
+static void on_expression(uint8_t pad, float expression)
+{
+    if (pad >= 8) return;
+    amy_engine_set_expression(pad, expression);
+}
+
+static void on_touch(uint8_t pad, bool on, float velocity)
 {
     if (pad < 8) {
         ui_set_pad_active(pad, on);
         if (on) {
-            ESP_LOGI(TAG, "pad %u ON  note %u", pad + 1, s_notes[pad]);
-            amy_engine_note_on(pad, s_notes[pad]);
+            ESP_LOGI(TAG, "pad %u ON  note %u  vel %3d%%", pad + 1, s_notes[pad], (int)(velocity * 100.0f + 0.5f));
+            amy_engine_note_on(pad, s_notes[pad], velocity);
         } else {
             ESP_LOGI(TAG, "pad %u OFF", pad + 1);
             amy_engine_note_off(pad);
@@ -181,6 +189,7 @@ void app_main(void)
     // mux_pots_init();
 
     touch_telemetry_set_event_cb(on_touch);
+    touch_telemetry_set_expression_cb(on_expression);
     err = touch_telemetry_start();
     if (err != ESP_OK) ESP_LOGW(TAG, "touch init failed (0x%x)", err);
 

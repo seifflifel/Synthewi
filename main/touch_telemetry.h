@@ -4,7 +4,12 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
-typedef void (*touch_event_cb_t)(uint8_t pad, bool is_touching);
+// velocity: note pads 0.10-1.00 on touch (from MIN/MAX calibration), 1.0 for
+// the octave pads, 0 on release.
+typedef void (*touch_event_cb_t)(uint8_t pad, bool is_touching, float velocity);
+// Expression (aftertouch): while a note pad is held, its smoothed touch amount
+// (0.10..1.00, same MIN/MAX mapping as velocity) — up AND down. Rate-limited.
+typedef void (*touch_expression_cb_t)(uint8_t pad, float expression);
 typedef void (*touch_param_cb_t)(uint8_t param_id, uint16_t value);
 typedef void (*touch_pressure_cb_t)(uint8_t pad, float pressure_norm);
 
@@ -35,6 +40,7 @@ typedef void (*touch_pressure_cb_t)(uint8_t pad, float pressure_norm);
 
 esp_err_t touch_telemetry_start(void);
 void      touch_telemetry_set_event_cb(touch_event_cb_t cb);
+void      touch_telemetry_set_expression_cb(touch_expression_cb_t cb);
 void      touch_telemetry_set_param_cb(touch_param_cb_t cb);
 void      touch_telemetry_set_pressure_cb(touch_pressure_cb_t cb);
 void      touch_telemetry_set_pressure_range(uint16_t range_x100);
@@ -44,3 +50,11 @@ uint32_t  touch_telemetry_get_raw(uint8_t pad);
 uint32_t  touch_telemetry_get_baseline(uint8_t pad);
 uint16_t  touch_telemetry_get_threshold(uint8_t pad);
 void      touch_telemetry_set_threshold(uint8_t pad, uint16_t threshold);
+
+// Velocity calibration (note pads only). A touch that just crosses the MIN
+// threshold plays at TOUCH_VEL_MIN; a touch at or above MAX plays at 100 %.
+// If MAX was never set it defaults to 4 x MIN.
+#define TOUCH_VEL_MIN 0.10f
+uint16_t  touch_telemetry_get_threshold_max(uint8_t pad);
+void      touch_telemetry_set_threshold_max(uint8_t pad, uint16_t threshold_max);
+float     touch_telemetry_velocity(uint8_t pad, uint32_t delta);   // delta = |raw - baseline|

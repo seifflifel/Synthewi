@@ -121,6 +121,38 @@ static float    sc_ks_feedback(uint16_t v)    { return 0.85f + (v / 10000.0f) * 
 static uint16_t sc_portamento_ms(uint16_t v)  { return (uint16_t)((v / 10000.0f) * 500.0f); }
 static float    sc_echo_delay_ms(uint16_t v)  { return fmaxf(50.0f + (v / 10000.0f) * 450.0f, 10.0f); }
 
+// Touch expression (velocity at note-on + continuous pressure while held).
+// e is 0.10..1.00 (touch MIN..MAX calibration), f = normalized 0..1.
+//   amplitude = 0.10 + 0.90 * f^EXPR_AMP_CURVE   (concave "boost" curve: partial
+//               pressure is already loud — linear felt like the volume was fixed
+//               because typical touches sit at 20-40 %; MIN/MAX levels unchanged)
+//   cutoff    = preset cutoff * 2^(EXPR_FILTER_OCT * f)   (light touch = preset sound)
+// Future SETTINGS (UI redesign): target amp / filter / both, filter depth
+// (user found +2 oct too little → 3 for now), amp curve.
+#define EXPR_E_MIN       0.10f
+#define EXPR_FILTER_OCT  3.0f
+#define EXPR_AMP_CURVE   0.6f
+static bool s_expr_amp    = true;
+static bool s_expr_filter = true;
+
+static float expr_norm(float e)
+{
+    float f = (e - EXPR_E_MIN) / (1.0f - EXPR_E_MIN);
+    return f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f;
+}
+
+static float expr_gain(float e)
+{
+    return EXPR_E_MIN + (1.0f - EXPR_E_MIN) * powf(expr_norm(e), EXPR_AMP_CURVE);
+}
+
+static float expr_cutoff_hz(float e)
+{
+    float base = sc_filter_hz(s_filter_cutoff);
+    if (!s_expr_filter) return base;
+    return base * powf(2.0f, EXPR_FILTER_OCT * expr_norm(e));
+}
+
 // Public display wrappers (see amy_engine.h)
 uint32_t amy_engine_attack_ms(uint16_t v)       { return sc_attack_ms(v); }
 uint32_t amy_engine_decay_ms(uint16_t v)        { return sc_decay_ms(v); }
@@ -420,9 +452,11 @@ void amy_engine_init(void)
              s_wave_id, s_env_attack, s_env_release);
 }
 
-void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
+void amy_engine_note_on(uint8_t pad, uint8_t midi_note, float velocity)
 {
     if (!s_initialized || pad >= SYNTH_PAD_COUNT) return;
+    if (velocity < 0.01f) velocity = 0.01f;
+    if (velocity > 1.0f)  velocity = 1.0f;
     s_pad_midi_note[pad] = midi_note;
 
     amy_event e = amy_default_event();
@@ -435,7 +469,12 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
         e.osc                    = pad;
         e.freq_coefs[COEF_CONST] = freq;
         e.pan_coefs[COEF_CONST]  = 0.5f;
-        e.amp_coefs[COEF_CONST]  = 1.0f;
+        // Velocity is applied as the note's GAIN (amp CONST, linear: 0.1 = -20 dB),
+        // not as AMY velocity: sending a new velocity to a sounding osc retriggers
+        // it, while a new amp CONST just changes its level (see
+        // amy_engine_set_expression). AMY velocity stays 1.0 = plain note-on.
+        e.amp_coefs[COEF_CONST]  = s_expr_amp ? expr_gain(velocity) : 1.0f;
+        e.amp_coefs[COEF_VEL]    = 0.0f;
         e.amp_coefs[COEF_EG0]    = 1.0f;
         e.eg0_times[0]  = sc_attack_ms(s_env_attack);   e.eg0_values[0] = 1.0f;
         e.eg0_times[1]  = sc_decay_ms(s_env_decay);     e.eg0_values[1] = sc_sustain_f(s_env_sustain);
@@ -448,7 +487,7 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
         // Filter applied on every note so it stays current after wave/type changes.
         e.mod_source                    = LFO_OSC;
         e.filter_type                   = s_filter_type_map[s_filter_type];
-        e.filter_freq_coefs[COEF_CONST] = sc_filter_hz(s_filter_cutoff);
+        e.filter_freq_coefs[COEF_CONST] = expr_cutoff_hz(velocity);   // touch opens the filter
         e.filter_freq_coefs[COEF_EG1]   = sc_fenv_depth_oct(s_filter_env_depth);
         e.filter_freq_coefs[COEF_MOD]   = sc_lfo_depth_oct(s_lfo_depth);
         e.resonance                     = sc_filter_res(s_filter_resonance);
@@ -460,12 +499,26 @@ void amy_engine_note_on(uint8_t pad, uint8_t midi_note)
     } else {
         e.synth     = SYNTH_CH_PATCH;
         e.midi_note = (float)midi_note;
-        e.velocity  = 1.0f;
+        e.velocity  = velocity;
     }
 
     amy_add_event(&e);
     s_pad_active[pad] = true;
     ESP_LOGD(TAG, "note_on pad=%u note=%u", pad, midi_note);
+}
+
+// Continuous touch expression for a sounding note (CUSTOM mode only): updates
+// its gain and filter cutoff without retriggering it. e = 0.10..1.00.
+void amy_engine_set_expression(uint8_t pad, float e_in)
+{
+    if (!s_initialized || pad >= SYNTH_PAD_COUNT || s_mode != SYNTH_MODE_CUSTOM) return;
+    if (!s_pad_active[pad]) return;
+    float ex = e_in < 0.01f ? 0.01f : e_in > 1.0f ? 1.0f : e_in;
+    amy_event e = amy_default_event();
+    e.osc = pad;
+    if (s_expr_amp)    e.amp_coefs[COEF_CONST]        = expr_gain(ex);
+    if (s_expr_filter) e.filter_freq_coefs[COEF_CONST] = expr_cutoff_hz(ex);
+    amy_add_event(&e);
 }
 
 void amy_engine_note_off(uint8_t pad)

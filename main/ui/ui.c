@@ -60,6 +60,9 @@ int  ui_prst_act    = 0;     // 0=LOAD 1=SAVE 2=CLR
 int      ui_cal_pad     = 0;
 bool     ui_cal_editing = false;
 uint16_t ui_cal_thr     = 100;
+uint16_t ui_cal_thr_max = 400;
+int      ui_cal_stage   = 0;
+static void cal_save(void);   // CAL edit: persist MIN (+ MAX for note pads)
 
 // Nearest echo delay snap index (for encoder step-through).
 static int echo_snap_idx(uint16_t v) {
@@ -154,13 +157,21 @@ static void ui_enter(ui_section_t sec)
 static void ui_exit_to_cards(void)
 {
     if (s_sec == UI_CALIB && ui_cal_editing) {
-        touch_telemetry_set_threshold((uint8_t)ui_cal_pad, ui_cal_thr);
+        cal_save();
         ui_cal_editing = false;
     }
     if (s_sec == UI_MAIN || s_sec == UI_EFFECTS || s_sec == UI_ADSR) {
         amy_engine_save_state();
     }
     ui_enter(UI_CARDS);
+}
+
+// Persist the CAL edit values (MIN for every pad, MAX for note pads).
+static void cal_save(void)
+{
+    touch_telemetry_set_threshold((uint8_t)ui_cal_pad, ui_cal_thr);
+    if (ui_cal_pad < TOUCH_NOTE_PADS)
+        touch_telemetry_set_threshold_max((uint8_t)ui_cal_pad, ui_cal_thr_max);
 }
 
 void ui_init(void)
@@ -353,24 +364,41 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             }
             if (short_press) {
                 ui_cal_thr     = touch_telemetry_get_threshold((uint8_t)ui_cal_pad);
+                ui_cal_thr_max = touch_telemetry_get_threshold_max((uint8_t)ui_cal_pad);
+                ui_cal_stage   = 0;
                 ui_cal_editing = true;
                 s_dirty       = true;
             }
             if (long_press) ui_exit_to_cards();
         } else {
+            // Note pads: click 1 edits MIN (orange), click 2 edits MAX (blue),
+            // click 3 saves. Octave pads: single threshold, click saves.
+            bool note_pad = (ui_cal_pad < TOUCH_NOTE_PADS);
             if (delta) {
-                int t = (int)ui_cal_thr + vdelta * 50;
-                if (t < 10) t = 10;
-                ui_cal_thr  = (uint16_t)t;
-                s_cal_live = true;   // only bar/marker/THR change — no full redraw
+                if (ui_cal_stage == 0) {
+                    int t = (int)ui_cal_thr + vdelta * 50;
+                    if (t < 10) t = 10;
+                    if (note_pad && t > (int)ui_cal_thr_max - 50) t = (int)ui_cal_thr_max - 50;
+                    ui_cal_thr = (uint16_t)t;
+                } else {
+                    int t = (int)ui_cal_thr_max + vdelta * 50;
+                    if (t < (int)ui_cal_thr + 50) t = (int)ui_cal_thr + 50;
+                    if (t > 65000) t = 65000;
+                    ui_cal_thr_max = (uint16_t)t;
+                }
+                s_cal_live = true;   // only bar/markers/numbers change — no full redraw
             }
             if (short_press) {
-                touch_telemetry_set_threshold((uint8_t)ui_cal_pad, ui_cal_thr);
-                ui_cal_editing = false;
-                s_dirty       = true;
+                if (note_pad && ui_cal_stage == 0) {
+                    ui_cal_stage = 1;          // next: MAX
+                } else {
+                    cal_save();
+                    ui_cal_editing = false;
+                }
+                s_dirty = true;
             }
             if (long_press) {
-                touch_telemetry_set_threshold((uint8_t)ui_cal_pad, ui_cal_thr);
+                cal_save();
                 ui_exit_to_cards();
             }
         }

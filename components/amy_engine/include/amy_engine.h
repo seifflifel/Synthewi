@@ -59,8 +59,12 @@ typedef struct {
 void amy_engine_init(void);
 
 // Touch → note. pad must be < SYNTH_PAD_COUNT.
-void amy_engine_note_on(uint8_t pad, uint8_t midi_note);
+// velocity 0..1 (linear amplitude: 0.1 = -20 dB)
+void amy_engine_note_on(uint8_t pad, uint8_t midi_note, float velocity);
 void amy_engine_note_off(uint8_t pad);
+// Continuous touch expression (aftertouch) for a sounding note: gain + filter
+// opening follow e = 0.10..1.00 without retriggering the note.
+void amy_engine_set_expression(uint8_t pad, float e);
 
 // Session-level params (all values 0-10000). Applied immediately; persisted by amy_engine_save_state().
 void amy_engine_set_wave(uint8_t wave_id);

@@ -41,7 +41,9 @@ extern int      ui_prst_act;      // 0=LOAD 1=SAVE 2=CLR
 // Calibration screen
 extern int      ui_cal_pad;
 extern bool     ui_cal_editing;
-extern uint16_t ui_cal_thr;
+extern uint16_t ui_cal_thr;       // MIN threshold being edited (trigger, 10 % velocity)
+extern uint16_t ui_cal_thr_max;   // MAX threshold being edited (100 % velocity, note pads)
+extern int      ui_cal_stage;     // 0 = editing MIN, 1 = editing MAX (note pads only)
 
 // Legacy EFFECTS / ADSR screens (unreachable; defined in ui_legacy.c)
 extern int      ui_fx_cur;
