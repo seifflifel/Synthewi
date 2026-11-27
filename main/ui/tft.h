@@ -1,7 +1,8 @@
 #pragma once
 // ST7735 160x128 TFT driver + 5x8 font + drawing primitives.
-// The ONLY module that talks to the panel's SPI bus: every pixel goes through
-// the functions below (a framebuffer will be added here later).
+// The ONLY module that talks to the panel's SPI bus. Drawing functions write
+// into a RAM framebuffer; nothing reaches the panel until tft_flush(), which
+// sends only the pixels that changed since the last flush.
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -23,8 +24,14 @@
 #define C_DKGRAY  0x2104u
 #define C_LTGRAY  0x8410u
 
-// SPI bus + panel pins + ST7735 init sequence. Call once from the UI task.
+// SPI bus + panel pins + ST7735 init sequence + framebuffer. Call once from the UI task.
 void tft_init(void);
+
+// Send everything drawn since the last flush (changed pixels only). Call once
+// per UI tick, after all drawing. UI task only.
+void tft_flush(void);
+// Last non-empty flush: duration (us) and pixels sent. Diagnostics.
+void tft_get_flush_stats(uint32_t *us, uint32_t *pixels);
 
 void tft_fill(uint8_t x0,uint8_t y0,uint8_t x1,uint8_t y1, uint16_t c);
 void tft_line(int x0, int y0, int x1, int y1, uint16_t c);

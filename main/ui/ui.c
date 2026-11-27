@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "touch_telemetry.h"
 #include "looper.h"
 #include "presets.h"
@@ -167,6 +168,7 @@ void ui_init(void)
     tft_init();   // SPI bus + DC/RST pins + panel init (bus setup was inline here)
     presets_init();
     ui_redraw();
+    tft_flush();
 }
 
 // Called from main loop every ~20 ms.
@@ -513,4 +515,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
         }
         ui_ribbon_update();
     }
+
+    // Everything above only drew into the framebuffer; send the changes now.
+    tft_flush();
 }

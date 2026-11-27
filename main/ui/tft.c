@@ -1,4 +1,14 @@
 // ST7735 TFT driver — see tft.h. All SPI traffic to the panel lives here.
+//
+// Framebuffer design (2026-11):
+//   s_fb     — what the UI draws into (all tft_* drawing functions write here,
+//              never to SPI). Pixels are stored byte-swapped (SPI byte order).
+//   s_shown  — what the panel currently displays.
+//   tft_flush() compares the two row by row and sends ONLY the pixels that
+//   differ, grouped into rectangles, through a DMA staging buffer. A full-screen
+//   redraw that changes 3 characters therefore sends ~3 characters' worth of
+//   pixels, and the panel never shows a half-drawn or "cleared" frame (no flicker).
+//   RAM: 2 x 40 KB + 8 KB staging, internal DMA-capable memory.
 
 #include <string.h>
 #include <stdlib.h>
@@ -7,7 +17,32 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "tft.h"
+
+static const char *TAG = "tft";
+
+// SPI clock. ST7735 datasheet min write cycle is 66 ns (~15 MHz) but most panels
+// run faster; valid ESP32 values are 80 MHz / n (40, 26.7, 20, 16, 13.3, 10 ...).
+// 40 MHz verified on this panel 2026-11-27 (no corruption); a full-screen switch
+// takes ~7 ms instead of ~28 ms at the old 10 MHz. Drop to 26.7/20 MHz if a
+// different panel or longer wiring shows noise.
+#ifndef TFT_SPI_HZ
+#define TFT_SPI_HZ   (40*1000*1000)
+#endif
+
+#define FB_PIXELS     (TFT_W * TFT_H)
+#define STAGE_BYTES   8192           // DMA staging buffer (also SPI max transfer)
+
+static uint16_t *s_fb     = NULL;    // drawing target (byte-swapped RGB565)
+static uint16_t *s_shown  = NULL;    // panel contents (byte-swapped RGB565)
+static uint8_t  *s_stage  = NULL;    // DMA staging for one flush chunk
+static bool      s_force_full = true; // first flush sends everything
+static uint32_t  s_last_flush_us = 0, s_last_flush_px = 0;
+
+static inline uint16_t swap16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
 
 // ── TFT hardware pins ────────────────────────────────────────
 #define TFT_SCLK  GPIO_NUM_36
@@ -18,7 +53,6 @@
 
 // ── TFT primitives ───────────────────────────────────────────
 static spi_device_handle_t s_spi;
-static uint8_t             s_lb[TFT_W * 2]; // line buffer
 
 static void tft_xfer(const uint8_t *d, int n, int dc)
 {
@@ -30,42 +64,122 @@ static void tft_cmd(uint8_t c)               { tft_xfer(&c, 1, 0); }
 static void tft_byte(uint8_t b)              { tft_xfer(&b, 1, 1); }
 static void tft_data(const uint8_t *b, int n){ tft_xfer(b, n, 1); }
 
+// Set the panel's address window: 6 small transactions (was 11 byte-by-byte).
 static void tft_win(uint8_t x0,uint8_t y0,uint8_t x1,uint8_t y1)
 {
-    tft_cmd(0x2A); tft_byte(0); tft_byte(x0); tft_byte(0); tft_byte(x1);
-    tft_cmd(0x2B); tft_byte(0); tft_byte(y0); tft_byte(0); tft_byte(y1);
+    const uint8_t ca[4] = {0, x0, 0, x1};
+    const uint8_t ra[4] = {0, y0, 0, y1};
+    tft_cmd(0x2A); tft_data(ca, 4);
+    tft_cmd(0x2B); tft_data(ra, 4);
     tft_cmd(0x2C);
 }
 
-static void tft_pixels(int n)
+// Pixel data: interrupt/DMA transaction - the task sleeps instead of
+// busy-waiting, so the CPU stays free for audio rendering on the same core.
+static void tft_send_pixels(const uint8_t *buf, int nbytes)
 {
-    spi_transaction_t t = { .length = (size_t)n * 16, .tx_buffer = s_lb };
     gpio_set_level(TFT_DC, 1);
-    spi_device_polling_transmit(s_spi, &t);
+    spi_transaction_t t = { .length = (size_t)nbytes * 8, .tx_buffer = buf };
+    spi_device_transmit(s_spi, &t);
+}
+
+// -- Drawing into the framebuffer (no SPI here) ---------------
+static inline void fb_px(int x, int y, uint16_t sw)
+{
+    if ((unsigned)x < TFT_W && (unsigned)y < TFT_H) s_fb[y * TFT_W + x] = sw;
 }
 
 void tft_fill(uint8_t x0,uint8_t y0,uint8_t x1,uint8_t y1, uint16_t c)
 {
-    int w = x1 - x0 + 1;
-    if (w <= 0) return;
-    tft_win(x0, y0, x1, y1);
-    uint8_t hi = c >> 8, lo = c & 0xFF;
-    for (int i = 0; i < w; i++) { s_lb[i*2] = hi; s_lb[i*2+1] = lo; }
-    for (int r = y0; r <= y1; r++) tft_pixels(w);
+    int ix0 = x0, iy0 = y0, ix1 = x1, iy1 = y1;
+    if (ix1 >= TFT_W) ix1 = TFT_W - 1;
+    if (iy1 >= TFT_H) iy1 = TFT_H - 1;
+    int w = ix1 - ix0 + 1;
+    if (w <= 0 || iy1 < iy0 || ix0 >= TFT_W || iy0 >= TFT_H) return;
+    uint16_t sw = swap16(c);
+    for (int y = iy0; y <= iy1; y++) {
+        uint16_t *row = s_fb + y * TFT_W + ix0;
+        for (int i = 0; i < w; i++) row[i] = sw;
+    }
 }
 
 void tft_line(int x0, int y0, int x1, int y1, uint16_t c)
 {
+    uint16_t sw = swap16(c);
     int dx = abs(x1-x0), dy = abs(y1-y0);
     int sx = (x0<x1) ? 1 : -1, sy = (y0<y1) ? 1 : -1;
     int err = dx - dy;
     for (;;) {
-        tft_fill((uint8_t)x0, (uint8_t)y0, (uint8_t)x0, (uint8_t)y0, c);
+        fb_px(x0, y0, sw);
         if (x0==x1 && y0==y1) break;
         int e2 = 2*err;
         if (e2 > -dy) { err -= dy; x0 += sx; }
         if (e2 <  dx) { err += dx; y0 += sy; }
     }
+}
+
+// -- Flush: send only what changed ----------------------------
+// Rows whose contents differ are grouped into bands of consecutive rows; each
+// band is sent as one rectangle spanning the union of the rows' changed x
+// ranges. Band data is packed into the DMA staging buffer (<= STAGE_BYTES per
+// transaction), then copied into s_shown.
+static bool row_span(int y, int *a, int *b)
+{
+    const uint16_t *f = s_fb + y * TFT_W, *sh = s_shown + y * TFT_W;
+    if (s_force_full) { *a = 0; *b = TFT_W - 1; return true; }
+    if (memcmp(f, sh, TFT_W * 2) == 0) return false;
+    int l = 0, r = TFT_W - 1;
+    while (f[l] == sh[l]) l++;
+    while (f[r] == sh[r]) r--;
+    *a = l; *b = r;
+    return true;
+}
+
+void tft_flush(void)
+{
+    int64_t t0 = esp_timer_get_time();
+    uint32_t sent_px = 0;
+    int y = 0;
+    while (y < TFT_H) {
+        int a, b;
+        while (y < TFT_H && !row_span(y, &a, &b)) y++;
+        if (y >= TFT_H) break;
+        int y0 = y, y1 = y;
+        for (int yy = y + 1; yy < TFT_H; yy++) {
+            int aa, bb;
+            if (!row_span(yy, &aa, &bb)) break;
+            if (aa < a) a = aa;
+            if (bb > b) b = bb;
+            y1 = yy;
+        }
+        int w = b - a + 1;
+        tft_win((uint8_t)a, (uint8_t)y0, (uint8_t)b, (uint8_t)y1);
+        int rows_per_chunk = STAGE_BYTES / (w * 2);
+        if (rows_per_chunk < 1) rows_per_chunk = 1;
+        for (int ry = y0; ry <= y1; ry += rows_per_chunk) {
+            int nr = y1 - ry + 1;
+            if (nr > rows_per_chunk) nr = rows_per_chunk;
+            for (int k = 0; k < nr; k++) {
+                const uint16_t *src = s_fb + (ry + k) * TFT_W + a;
+                memcpy(s_stage + k * w * 2, src, w * 2);
+                memcpy(s_shown + (ry + k) * TFT_W + a, src, w * 2);
+            }
+            tft_send_pixels(s_stage, nr * w * 2);
+        }
+        sent_px += (uint32_t)w * (uint32_t)(y1 - y0 + 1);
+        y = y1 + 1;
+    }
+    s_force_full = false;
+    if (sent_px) {
+        s_last_flush_us = (uint32_t)(esp_timer_get_time() - t0);
+        s_last_flush_px = sent_px;
+    }
+}
+
+void tft_get_flush_stats(uint32_t *us, uint32_t *pixels)
+{
+    if (us)     *us     = s_last_flush_us;
+    if (pixels) *pixels = s_last_flush_px;
 }
 
 // Filled (active=green) or outline ring (inactive=gray) pad circle, radius 3.
@@ -125,13 +239,23 @@ static void tft_panel_init(void)
 
 void tft_init(void)
 {
+    s_fb    = heap_caps_malloc(FB_PIXELS * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_shown = heap_caps_malloc(FB_PIXELS * 2, MALLOC_CAP_INTERNAL);
+    s_stage = heap_caps_malloc(STAGE_BYTES,   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_ERROR_CHECK((s_fb && s_shown && s_stage) ? ESP_OK : ESP_ERR_NO_MEM);
+    memset(s_fb, 0, FB_PIXELS * 2);
+    memset(s_shown, 0, FB_PIXELS * 2);
+    ESP_LOGI(TAG, "framebuffer ready (2 x %u KB + %u KB staging), SPI %u MHz",
+             (unsigned)(FB_PIXELS * 2 / 1024), (unsigned)(STAGE_BYTES / 1024),
+             (unsigned)(TFT_SPI_HZ / 1000000));
+
     spi_bus_config_t bus = {
         .mosi_io_num = TFT_MOSI, .miso_io_num = -1, .sclk_io_num = TFT_SCLK,
-        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = TFT_W * 2,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = STAGE_BYTES,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
     spi_device_interface_config_t dev = {
-        .clock_speed_hz = 10*1000*1000, .mode = 0,
+        .clock_speed_hz = TFT_SPI_HZ, .mode = 0,
         .spics_io_num = TFT_CS, .queue_size = 1,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &s_spi));
@@ -176,23 +300,23 @@ void tft_text(const char *str, int x, int y, uint16_t fg, uint16_t bg, int sc)
     if (n > ml) n = ml;
     if (n <= 0) return;
     int w = n * cw;
-    tft_win(x, y, x+w-1, y+ch-1);
+    if (x < 0 || y < 0) return;
+    uint16_t sfg = swap16(fg), sbg = swap16(bg);
     for (int row = 0; row < ch; row++) {
+        int yy = y + row;
+        if (yy >= TFT_H) break;
         int bit = row / sc;
-        uint8_t bhi = bg>>8, blo = bg&0xFF;
-        for (int px = 0; px < w; px++) { s_lb[px*2]=bhi; s_lb[px*2+1]=blo; }
+        uint16_t *line = s_fb + yy * TFT_W + x;
+        for (int px = 0; px < w; px++) line[px] = sbg;   // character cells incl. spacing
         for (int ci = 0; ci < n; ci++) {
             char c = str[ci];
             const uint8_t *g = (c>=32&&c<=90) ? FONT[c-32] : FONT[0];
             for (int col = 0; col < 5; col++) {
-                uint16_t color = ((g[col]>>bit)&1) ? fg : bg;
+                uint16_t color = ((g[col]>>bit)&1) ? sfg : sbg;
                 int px = ci*cw + col*sc;
-                for (int s = 0; s < sc && (px+s)<w; s++) {
-                    s_lb[(px+s)*2]=color>>8; s_lb[(px+s)*2+1]=color&0xFF;
-                }
+                for (int s = 0; s < sc && (px+s)<w; s++) line[px+s] = color;
             }
         }
-        tft_pixels(w);
     }
 }
 
