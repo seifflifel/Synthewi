@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -17,6 +18,10 @@ static const char *TAG = "Synthewi";
 // C pentatonic: C4 D4 E4 G4 A4 C5 D5 E5
 static const uint8_t s_base_notes[8] = {60, 62, 64, 67, 69, 72, 74, 76};
 static uint8_t       s_notes[8]      = {60, 62, 64, 67, 69, 72, 74, 76};
+
+// Octave shift (-2..+2), owned here: written by on_touch() (touch task) via the
+// OCT pads, used to compute s_notes. The UI ribbon gets a copy via ui_set_octave().
+static volatile int  s_octave_shift  = 0;
 
 static void apply_octave(void)
 {

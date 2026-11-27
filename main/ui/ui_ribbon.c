@@ -1,0 +1,147 @@
+// Ribbon bar (y=0..21): pads, waveform, octave, looper dot — full + partial
+// redraw. Also the ribbon-state setters of the public API.
+
+#include <stdio.h>
+#include "touch_telemetry.h"
+#include "looper.h"
+#include "ui.h"
+#include "ui_internal.h"
+
+// Ribbon state (written by the touch task via on_touch, read by the UI task)
+// UI's copy of the octave shift — main.c owns the value and pushes it via ui_set_octave().
+static volatile int  s_octave_shift = 0;
+static volatile bool s_pad_active[TOUCH_NOTE_PADS] = {false};
+
+// Ribbon cache — what is currently on screen, so ui_ribbon_update() redraws only what changed.
+static bool           s_rb_valid = false;
+static bool           s_rb_pad[TOUCH_NOTE_PADS];
+static uint8_t        s_rb_wave;
+static int            s_rb_oct;
+static looper_state_t s_rb_loop;
+
+// Draws a waveform pixel-art glyph inside box (x0,y0)-(x1,y1).
+// Reusable for both the menu cell and the future ribbon bar.
+void ui_draw_wave_glyph(uint8_t wave_id, int x0, int y0, int x1, int y1, uint16_t fg)
+{
+    int xm = (x0 + x1) / 2;
+    int lw = (x1 - x0) / 4; // left/right flat width for square
+    switch (wave_id) {
+    case AMY_ENGINE_WAVE_SQUARE:
+        tft_line(x0,    y1, x0+lw, y1, fg); // left base
+        tft_line(x0+lw, y0, x0+lw, y1, fg); // rise
+        tft_line(x0+lw, y0, x1-lw, y0, fg); // top
+        tft_line(x1-lw, y0, x1-lw, y1, fg); // fall
+        tft_line(x1-lw, y1, x1,    y1, fg); // right base
+        break;
+    case AMY_ENGINE_WAVE_SAW_DOWN:
+        tft_line(x0,    y1, x1-lw, y0, fg); // rising diagonal
+        tft_line(x1-lw, y0, x1-lw, y1, fg); // instant drop
+        tft_line(x1-lw, y1, x1,    y1, fg); // right base
+        break;
+    case AMY_ENGINE_WAVE_TRIANGLE:
+        tft_line(x0, y1, xm, y0, fg); // rising half
+        tft_line(xm, y0, x1, y1, fg); // falling half
+        break;
+    default:
+        tft_line(x0, (y0+y1)/2, x1, (y0+y1)/2, fg);
+        break;
+    }
+}
+
+// ---- RIBBON BAR (y=0..21) -----------------------------------
+// 8 pad circles + waveform glyph + octave label + looper dot + separator.
+// Each element has its own draw helper so ui_ribbon_update() can repaint
+// just the element that changed (no full clear → no flicker while playing).
+
+// Pad circles: centers at x=6+i*10, y=10 — radius 3. Each circle paints its
+// whole footprint (filled or ring + hollow), so no clear is needed.
+static void ribbon_draw_pad(int i, bool active)
+{
+    tft_pad_circle(6 + i * 10, 10, active);
+    s_rb_pad[i] = active;
+}
+
+// Waveform glyph (x=90..110, y=3..17) — orange
+static void ribbon_draw_wave(uint8_t wave_id)
+{
+    tft_fill(90, 3, 110, 17, C_BLACK);
+    ui_draw_wave_glyph(wave_id, 90, 3, 110, 17, C_ORANGE);
+    s_rb_wave = wave_id;
+}
+
+// Octave label — yellow when shifted, dim gray at zero. Always 5 chars wide,
+// and tft_text paints its background, so it overwrites the previous label.
+static void ribbon_draw_oct(int shift)
+{
+    char oct_buf[8];
+    if (shift == 0)
+        snprintf(oct_buf, sizeof(oct_buf), "OCT 0");
+    else
+        snprintf(oct_buf, sizeof(oct_buf), "OCT%+d", shift);
+    tft_text(oct_buf, 116, 6, shift ? C_BLUE : C_DKGRAY, C_BLACK, 1);
+    s_rb_oct = shift;
+}
+
+// Looper dot (5×5, top-right)
+static void ribbon_draw_loop(looper_state_t ls)
+{
+    uint16_t lc = (ls == LOOPER_RECORDING) ? C_RED    :
+                  (ls == LOOPER_PLAYING)   ? C_GREEN  :
+                  (ls == LOOPER_OVERDUB)   ? C_BLUE   : C_BLACK;
+    tft_fill(154, 5, 158, 9, lc);
+    s_rb_loop = ls;
+}
+
+// Full ribbon repaint — used on section changes (called last by ui_redraw).
+void ui_draw_ribbon(void)
+{
+    tft_fill(0, 0, TFT_W-1, 19, C_BLACK);
+    for (int i = 0; i < TOUCH_NOTE_PADS; i++)
+        ribbon_draw_pad(i, s_pad_active[i]);
+    amy_engine_state_t st;
+    amy_engine_get_state(&st);
+    ribbon_draw_wave(st.wave_id);
+    ribbon_draw_oct(s_octave_shift);
+    ribbon_draw_loop(looper_get_state());
+    tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY); // separator
+    s_rb_valid = true;
+}
+
+// Partial ribbon refresh — compares live state against what is on screen and
+// repaints only the elements that differ. Cheap enough to run every UI tick.
+// Polling (instead of flags) also catches changes nobody signals, e.g. the
+// looper auto-switching REC → PLAY when its buffer fills.
+void ui_ribbon_update(void)
+{
+    if (!s_rb_valid) { ui_draw_ribbon(); return; }
+
+    for (int i = 0; i < TOUCH_NOTE_PADS; i++) {
+        bool a = s_pad_active[i]; // read once — touch task may change it concurrently
+        if (a != s_rb_pad[i]) ribbon_draw_pad(i, a);
+    }
+
+    amy_engine_state_t st;
+    amy_engine_get_state(&st);
+    if (st.wave_id != s_rb_wave) ribbon_draw_wave(st.wave_id);
+
+    int oct = s_octave_shift;
+    if (oct != s_rb_oct) ribbon_draw_oct(oct);
+
+    looper_state_t ls = looper_get_state();
+    if (ls != s_rb_loop) ribbon_draw_loop(ls);
+}
+
+// ── Public API ────────────────────────────────────────────────
+
+// Ribbon-only changes: no s_dirty here. ui_ribbon_update() (every UI tick)
+// notices the new state and repaints just that element. The main task owns
+// SPI — the touch task must never call tft_* directly.
+void ui_notify_lever(void) { }
+
+void ui_set_octave(int shift) { s_octave_shift = shift; }
+
+void ui_set_pad_active(uint8_t pad, bool active)
+{
+    if (pad >= TOUCH_NOTE_PADS) return;
+    s_pad_active[pad] = active;
+}
