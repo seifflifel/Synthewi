@@ -24,3 +24,7 @@ void ui_set_pad_active(uint8_t pad, bool active);
 void ui_set_octave(int shift);   // UI copy only — main.c owns the octave shift
 void ui_octave_limit_hit(void);  // octave pad pressed at ±2: flash the label red (any task)
 void ui_notify_lever(void);
+
+// Volume pop-up (hold + turn, from main.c): active=true while the gesture is held,
+// false on release (the box then shrinks away). percent = master volume 0-100.
+void ui_volume_popup(uint8_t percent, bool active);

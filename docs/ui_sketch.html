@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Synthewi UI Sketch</title>
+<style>
+  /* Pixel-exact 160x128 simulation of the proposed Synthewi UI.
+     Drawing code mirrors main/ui/tft.c (same 5x8 font, rrect, pad circles) so what you see
+     is what the ST7735 can show. Colours are approximations of the panel. */
+  :root { --bg:#141518; --panel:#1d1f23; --fg:#ebe8e2; --mute:#9b978e; --accent:#ff7a1a; --line:#2c2f35; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,"Segoe UI",sans-serif;
+         padding:24px max(16px,env(safe-area-inset-left)) 48px max(16px,env(safe-area-inset-right)); }
+  h1 { font-size:20px; margin:0 0 4px; letter-spacing:.02em; }
+  h2 { font-size:15px; margin:32px 0 12px; color:var(--accent); text-transform:uppercase; letter-spacing:.08em; }
+  p.lead { color:var(--mute); margin:0 0 20px; max-width:70ch; }
+  canvas { image-rendering:pixelated; image-rendering:crisp-edges; display:block; width:100%; height:auto; }
+  .sim { display:flex; gap:24px; flex-wrap:wrap; align-items:flex-start; }
+  .bezel { background:#0b0b0c; padding:14px; border-radius:14px; box-shadow:0 0 0 1px var(--line); width:min(100%,668px); }
+  .controls { display:flex; flex-direction:column; gap:12px; min-width:0; max-width:360px; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; }
+  button { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 12px;
+           font:inherit; cursor:pointer; user-select:none; touch-action:none; }
+  button:hover { border-color:var(--accent); }
+  button:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button.primary { border-color:var(--accent); }
+  label.chk { display:flex; gap:8px; align-items:center; color:var(--mute); }
+  .keys { color:var(--mute); font-size:13px; }
+  .keys kbd { background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:0 5px; font:12px ui-monospace,monospace; color:var(--fg); }
+  .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:18px; }
+  figure { margin:0; background:#0b0b0c; border-radius:10px; padding:10px; box-shadow:0 0 0 1px var(--line); }
+  figcaption { color:var(--mute); font-size:13px; margin-top:8px; }
+  .sliders { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:14px; }
+  fieldset { border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:0; }
+  legend { color:var(--accent); padding:0 4px; font-size:13px; letter-spacing:.06em; }
+  .sl { display:grid; grid-template-columns:52px 1fr; gap:8px; align-items:center; font-size:12px; color:var(--mute); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+</style>
+</head>
+<body>
+<h1>Synthewi UI sketch</h1>
+<p class="lead">Every canvas below is the real 160&times;128 screen, drawn pixel by pixel with the firmware's font and primitives,
+running at the device's ~30 fps. Notes auto-play so the live icons move. Use the simulator to navigate like the encoder.</p>
+
+<h2>Simulator</h2>
+<div class="sim">
+  <div class="bezel"><canvas id="dev" width="160" height="128"></canvas></div>
+  <div class="controls">
+    <div class="row">
+      <button id="bL">&#9664; Turn</button><button id="bR">Turn &#9654;</button>
+      <button id="bClick" class="primary">Click</button><button id="bBack">Back</button>
+    </div>
+    <div class="row">
+      <button id="bHold">Hold (+ turn = volume)</button><button id="bPlay">Play note</button>
+    </div>
+    <div class="row">
+      <button id="bLoop">Loop: next state</button><button id="bClear">Clear loop</button><button id="bWave">Lever wave</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="cAuto" checked> Auto-play notes</label>
+    <label class="chk"><input type="checkbox" id="cDark"> Dark mode</label>
+    <div class="keys">
+      Keys: <kbd>&larr;</kbd><kbd>&rarr;</kbd> turn &middot; <kbd>Enter</kbd> click &middot; <kbd>Esc</kbd> back &middot;
+      hold <kbd>V</kbd> + arrows = volume &middot; hold <kbd>Space</kbd> = note &middot; <kbd>L</kbd> loop &middot;
+      <kbd>C</kbd> clear &middot; <kbd>W</kbd> wave &middot; mouse wheel over the screen = turn
+    </div>
+  </div>
+</div>
+
+<h2>All screens</h2>
+<div class="gallery" id="gallery"></div>
+
+<h2>Values (drag to watch the icons tween)</h2>
+<div class="sliders" id="sliders"></div>
+
+<script>
+'use strict';
+const W = 160, H = 128;
+// 5x8 font, ASCII 32-90, copied from main/ui/tft.c (column bytes, bit0 = top row)
+const FONT = [
+  [0x00,0x00,0x00,0x00,0x00],[0x00,0x00,0x5F,0x00,0x00],[0x00,0x07,0x00,0x07,0x00],
+  [0x14,0x7F,0x14,0x7F,0x14],[0x24,0x2A,0x7F,0x2A,0x12],[0x23,0x13,0x08,0x64,0x62],
+  [0x36,0x49,0x55,0x22,0x50],[0x00,0x05,0x03,0x00,0x00],[0x00,0x1C,0x22,0x41,0x00],
+  [0x00,0x41,0x22,0x1C,0x00],[0x14,0x08,0x3E,0x08,0x14],[0x08,0x08,0x3E,0x08,0x08],
+  [0x00,0x50,0x30,0x00,0x00],[0x08,0x08,0x08,0x08,0x08],[0x00,0x60,0x60,0x00,0x00],
+  [0x20,0x10,0x08,0x04,0x02],[0x3E,0x51,0x49,0x45,0x3E],[0x00,0x42,0x7F,0x40,0x00],
+  [0x42,0x61,0x51,0x49,0x46],[0x21,0x41,0x45,0x4B,0x31],[0x18,0x14,0x12,0x7F,0x10],
+  [0x27,0x45,0x45,0x45,0x39],[0x3C,0x4A,0x49,0x49,0x30],[0x01,0x71,0x09,0x05,0x03],
+  [0x36,0x49,0x49,0x49,0x36],[0x06,0x49,0x49,0x29,0x1E],[0x00,0x36,0x36,0x00,0x00],
+  [0x00,0x56,0x36,0x00,0x00],[0x08,0x14,0x22,0x41,0x00],[0x14,0x14,0x14,0x14,0x14],
+  [0x00,0x41,0x22,0x14,0x08],[0x02,0x01,0x51,0x09,0x06],[0x32,0x49,0x79,0x41,0x3E],
+  [0x7E,0x11,0x11,0x11,0x7E],[0x7F,0x49,0x49,0x49,0x36],[0x3E,0x41,0x41,0x41,0x22],
+  [0x7F,0x41,0x41,0x22,0x1C],[0x7F,0x49,0x49,0x49,0x41],[0x7F,0x09,0x09,0x09,0x01],
+  [0x3E,0x41,0x49,0x49,0x7A],[0x7F,0x08,0x08,0x08,0x7F],[0x00,0x41,0x7F,0x41,0x00],
+  [0x20,0x40,0x41,0x3F,0x01],[0x7F,0x08,0x14,0x22,0x41],[0x7F,0x40,0x40,0x40,0x40],
+  [0x7F,0x02,0x0C,0x02,0x7F],[0x7F,0x04,0x08,0x10,0x7F],[0x3E,0x41,0x41,0x41,0x3E],
+  [0x7F,0x09,0x09,0x09,0x06],[0x3E,0x41,0x51,0x21,0x5E],[0x7F,0x09,0x19,0x29,0x46],
+  [0x46,0x49,0x49,0x49,0x31],[0x01,0x01,0x7F,0x01,0x01],[0x3F,0x40,0x40,0x40,0x3F],
+  [0x1F,0x20,0x40,0x20,0x1F],[0x3F,0x40,0x38,0x40,0x3F],[0x63,0x14,0x08,0x14,0x63],
+  [0x07,0x08,0x70,0x08,0x07],[0x61,0x51,0x49,0x45,0x43],
+];
+
+// ── Framebuffer + palette ─────────────────────────────────────
+const img = new ImageData(W, H);
+const fb = new Uint32Array(img.data.buffer);
+const hex = h => { const v = parseInt(h.slice(1), 16); return (0xFF000000 | ((v & 255) << 16) | (v & 0xFF00) | ((v >> 16) & 255)) >>> 0; };
+// light = today's palette (C_BLACK renders white). dark = black/white swapped, accents kept.
+// tint + grid are NEW colours (pale amber fill under curves, faint guide lines).
+const PALS = {
+  light: { bg:'#FFFFFF', fg:'#000000', dk:'#212021', lt:'#848284', grid:'#E0E0E0', amber:'#FF6A10', tint:'#FFD8BA', blue:'#103CCE', green:'#00FF00', red:'#FF0000' },
+};
+// Dark = true inversion of every colour (amber becomes blue, green becomes magenta, ...)
+const inv = h => '#' + (0xFFFFFF ^ parseInt(h.slice(1), 16)).toString(16).padStart(6, '0');
+PALS.dark = Object.fromEntries(Object.entries(PALS.light).map(([k, v]) => [k, inv(v)]));
+let theme = 'light';
+const C = {};
+function setPal() { const p = PALS[theme]; for (const k in p) C[k] = hex(p[k]); }
+
+// ── Primitives (mirror tft.c) ─────────────────────────────────
+const R = Math.round, clamp = (v, a, b) => Math.max(a, Math.min(b, v)), lerp = (a, b, t) => a + (b - a) * t;
+function px(x, y, c) { x = R(x); y = R(y); if (x < 0 || y < 0 || x >= W || y >= H) return; fb[y * W + x] = c; }
+function fill(x0, y0, x1, y1, c) {
+  x0 = Math.max(0, R(x0)); y0 = Math.max(0, R(y0)); x1 = Math.min(W - 1, R(x1)); y1 = Math.min(H - 1, R(y1));
+  for (let y = y0; y <= y1; y++) { const o = y * W; for (let x = x0; x <= x1; x++) fb[o + x] = c; }
+}
+function line(x0, y0, x1, y1, c, dash) {
+  x0 = R(x0); y0 = R(y0); x1 = R(x1); y1 = R(y1);
+  const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, n = 0;
+  for (;;) {
+    if (!dash || n % dash === 0) px(x0, y0, c);
+    n++;
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function tline(x0, y0, x1, y1, c) { line(x0, y0, x1, y1, c); line(x0, y0 + 1, x1, y1 + 1, c); line(x0 + 1, y0, x1 + 1, y1, c); }
+function rrect(x0, y0, x1, y1, c) {
+  fill(x0 + 2, y0, x1 - 2, y0, c); fill(x0 + 2, y1, x1 - 2, y1, c);
+  fill(x0, y0 + 2, x0, y1 - 2, c); fill(x1, y0 + 2, x1, y1 - 2, c);
+  px(x0 + 1, y0 + 1, c); px(x1 - 1, y0 + 1, c); px(x0 + 1, y1 - 1, c); px(x1 - 1, y1 - 1, c);
+}
+function rrectFill(x0, y0, x1, y1, c) {
+  for (let y = y0; y <= y1; y++) { const ins = (y === y0 || y === y1) ? 2 : (y === y0 + 1 || y === y1 - 1) ? 1 : 0; fill(x0 + ins, y, x1 - ins, y, c); }
+}
+function disc(cx, cy, r, c) { cx = R(cx); cy = R(cy); for (let dy = -r; dy <= r; dy++) { const hw = Math.floor(Math.sqrt(r * r - dy * dy) + 0.35); fill(cx - hw, cy + dy, cx + hw, cy + dy, c); } }
+function ring(cx, cy, r, c) {
+  cx = R(cx); cy = R(cy); let x = r, y = 0, e = 1 - r;
+  while (x >= y) {
+    px(cx + x, cy + y, c); px(cx + y, cy + x, c); px(cx - y, cy + x, c); px(cx - x, cy + y, c);
+    px(cx - x, cy - y, c); px(cx - y, cy - x, c); px(cx + y, cy - x, c); px(cx + x, cy - y, c);
+    y++; if (e < 0) e += 2 * y + 1; else { x--; e += 2 * (y - x) + 1; }
+  }
+}
+function arc(cx, cy, r, a0, a1, c) { const n = Math.max(6, r * 3); for (let i = 0; i <= n; i++) { const a = lerp(a0, a1, i / n); px(cx + Math.cos(a) * r, cy + Math.sin(a) * r, c); } }
+function text(s, x, y, fg, bg, sc = 1) {
+  x = R(x); y = R(y);
+  for (let ci = 0; ci < s.length; ci++) {
+    const ch = s.charCodeAt(ci), g = FONT[(ch >= 32 && ch <= 90) ? ch - 32 : 0], bx = x + ci * 6 * sc;
+    for (let col = 0; col < 6; col++) {
+      const bits = col < 5 ? g[col] : 0;
+      for (let row = 0; row < 8; row++) {
+        const c = ((bits >> row) & 1) ? fg : bg;
+        if (c == null) continue;
+        fill(bx + col * sc, y + row * sc, bx + col * sc + sc - 1, y + row * sc + sc - 1, c);
+      }
+    }
+  }
+}
+const tw = (s, sc = 1) => s.length * 6 * sc - sc;
+function textC(s, cx, y, fg, bg, sc = 1) { text(s, R(cx - tw(s, sc) / 2), y, fg, bg, sc); }
+function textBoldC(s, cx, y, fg, sc = 1) { const x = R(cx - tw(s, sc) / 2); text(s, x, y, fg, null, sc); text(s, x + 1, y, fg, null, sc); }
+// Curve helper: ys[i] is the y of column x0+i. Fills toward `base` with fc, then draws the line.
+function drawYs(x0, ys, base, lc, fc, thick) {
+  if (fc != null) for (let i = 0; i < ys.length; i++) {
+    const y = R(ys[i]);
+    if (y < base) fill(x0 + i, y + 1, x0 + i, base, fc); else if (y > base) fill(x0 + i, base, x0 + i, y - 1, fc);
+  }
+  const L = thick ? tline : line;
+  for (let i = 1; i < ys.length; i++) L(x0 + i - 1, ys[i - 1], x0 + i, ys[i], lc);
+}
+
+// ── Model (values, notes, looper, volume) ─────────────────────
+const GROUPS = [
+  { id:'env', name:'ENVELOPE',   short:'ENV', params:[{k:'a',l:'ATK'},{k:'d',l:'DEC'},{k:'s',l:'SUS'},{k:'r',l:'REL'}] },
+  { id:'flt', name:'FILTER',     short:'FLT', params:[{k:'type',l:'TYPE',steps:3},{k:'cut',l:'CUT'},{k:'res',l:'RES'}] },
+  { id:'eg1', name:'FILTER ENV', short:'EG1', params:[{k:'depth',l:'DEPTH'},{k:'decay',l:'DECAY'}] },
+  { id:'lfo', name:'LFO',        short:'LFO', params:[{k:'rate',l:'RATE'},{k:'depth',l:'DEPTH'}] },
+  { id:'fx',  name:'EFFECTS',    short:'FX',  params:[{k:'echo',l:'ECHO'},{k:'fb',l:'FDBK'},{k:'time',l:'TIME'},{k:'verb',l:'REV'},{k:'size',l:'SIZE'}] },
+  { id:'gld', name:'GLIDE',      short:'GLD', params:[{k:'time',l:'TIME'}] },
+];
+const tgt = { env:{a:.12,d:.35,s:.6,r:.4}, flt:{type:0,cut:.45,res:.55}, eg1:{depth:.6,decay:.4},
+              lfo:{rate:.35,depth:.5}, fx:{echo:.5,fb:.55,time:.4,verb:.45,size:.6}, gld:{time:.4} };
+const dsp = JSON.parse(JSON.stringify(tgt));   // displayed (tweened) values
+function tweenAll() {
+  for (const g in tgt) for (const k in tgt[g]) {
+    const d = tgt[g][k] - dsp[g][k];
+    dsp[g][k] = Math.abs(d) < 0.002 ? tgt[g][k] : dsp[g][k] + d * 0.3;
+  }
+}
+let now = 0, lfoPhase = 0, wave = 0, autoplay = true, nextAuto = 0.4, scopeFill = true;
+const note = { on:false, tOn:-99, tOff:-99, pad:2, manual:false };
+const loop = { state:'play', len:6.8, start:0, recStart:0, max:11.4 };
+const vol = { t:.72, d:.72 };
+const popup = { hold:false, p:0 };
+let themeT = 0;
+
+function noteOn()  { note.on = true; note.tOn = now; note.pad = Math.floor(Math.random() * 8); }
+function noteOff() { note.on = false; note.tOff = now; }
+const bump = t => (t < 0 || t > 1) ? 0 : Math.exp(-t * 6);
+
+function envTimes() { const v = dsp.env; return { ta:.005 + v.a * v.a * 2.5, td:.02 + v.d * v.d * 2.5, tr:.02 + v.r * v.r * 3 }; }
+function envState() {
+  const { ta, td, tr } = envTimes(), s = dsp.env.s;
+  if (note.on) {
+    const t = now - note.tOn;
+    if (t < ta) return { seg:0, frac:t / ta, level:t / ta };
+    if (t < ta + td) { const f = (t - ta) / td; return { seg:1, frac:f, level:1 - (1 - s) * f }; }
+    return { seg:2, frac:Math.min(1, (t - ta - td) / 0.8), level:s };
+  }
+  const t = now - note.tOff;
+  if (note.tOff > 0 && t < tr) { const f = t / tr; return { seg:3, frac:f, level:s * (1 - f) }; }
+  return null;
+}
+const eg1Level = () => Math.exp(-(now - note.tOn) / (.04 + dsp.eg1.decay ** 2 * 1.5));
+const lfoHz = () => .1 + dsp.lfo.rate ** 2 * 15;
+
+function loopNext() {
+  if (loop.state === 'idle') { loop.state = 'rec'; loop.recStart = now; }
+  else if (loop.state === 'rec') { loop.len = Math.max(.5, now - loop.recStart); loop.start = now; loop.state = 'play'; }
+  else if (loop.state === 'play') loop.state = 'ovr';
+  else loop.state = 'play';
+}
+function loopFracs() {   // [recorded fraction of max, playhead fraction of max]
+  if (loop.state === 'rec') { const f = Math.min(1, (now - loop.recStart) / loop.max); return [f, f]; }
+  const lf = loop.len / loop.max, pos = ((now - loop.start) % loop.len) / loop.max;
+  return [lf, pos];
+}
+
+// ── Display formatting (approximate units) ────────────────────
+const fmtMs = ms => ms < 1000 ? R(ms) + 'MS' : (ms / 1000).toFixed(1) + 'S';
+function fmt(g, k, v) {
+  switch (g + '.' + k) {
+    case 'env.a': return fmtMs(1 + v * v * 2500);
+    case 'env.d': return fmtMs(20 + v * v * 2500);
+    case 'env.s': return R(v * 100) + '%';
+    case 'env.r': return fmtMs(20 + v * v * 3000);
+    case 'flt.type': return ['LPF','BPF','HPF'][R(v)];
+    case 'flt.cut': { const hz = 40 * Math.pow(2, v * 9); return hz >= 1000 ? (hz / 1000).toFixed(1) + 'K' : R(hz) + ''; }
+    case 'flt.res': return 'Q' + (.6 + v * v * 8).toFixed(1);
+    case 'eg1.depth': return '+' + (v * 4).toFixed(1);
+    case 'eg1.decay': return fmtMs(40 + v * v * 1500);
+    case 'lfo.rate': return (.1 + v * v * 15).toFixed(1) + 'HZ';
+    case 'lfo.depth': return (v * 2).toFixed(1);
+    case 'fx.time': return ['1/16','1/8','1/6','1/4','1/3','1/2'][Math.min(5, Math.floor(v * 6))];
+    case 'gld.time': return v < .01 ? 'OFF' : fmtMs(v * v * 800);
+    default: return R(v * 100) + '%';
+  }
+}
+
+// ── Parameter icons ───────────────────────────────────────────
+// b = box {x0,y0,x1,y1}; st = {line, fill, thick, live, focus, big}
+function liveDot(x, y, st) { disc(x, y, st.big ? 3 : 2, st.line); disc(x, y, st.big ? 1 : 0, C.bg); }
+
+// Grid "hover" morph: hold a shape, then ease into the next one (like LPF -> BPF -> HPF).
+const smooth = t => t * t * (3 - 2 * t);
+function morphSeq(seq, speed = .55) {
+  const t = now * speed, i = Math.floor(t) % seq.length, e = smooth(clamp((t % 1 - .35) / .65, 0, 1));
+  return lerp(seq[i], seq[(i + 1) % seq.length], e);
+}
+const ENV_SHAPES = [ {a:.02,d:.3,s:0,r:.25}, {a:.65,d:.4,s:.75,r:.75}, {a:.02,d:.1,s:1,r:.12}, {a:.3,d:.6,s:.35,r:.5} ]; // pluck, pad, organ, swell
+function envMorph() {
+  const o = {}; for (const k of ['a', 'd', 's', 'r']) o[k] = morphSeq(ENV_SHAPES.map(s => s[k]), .5); return o;
+}
+function envPts(b, v = dsp.env) {
+  const w = b.x1 - b.x0;
+  const aw = (.03 + v.a * .27) * w, dw = (.03 + v.d * .27) * w, sw = .18 * w, rw = (.03 + v.r * .27) * w;
+  const tot = aw + dw + sw + rw, x0 = b.x0 + (w - tot) / 2, top = b.y0 + 2, bot = b.y1, sy = bot - v.s * (bot - top);
+  return [[x0, bot], [x0 + aw, top], [x0 + aw + dw, sy], [x0 + aw + dw + sw, sy], [x0 + tot, bot]];
+}
+function polyY(p, x) {
+  if (x <= p[0][0]) return p[0][1];
+  for (let i = 1; i < p.length; i++) if (x <= p[i][0]) {
+    const [xa, ya] = p[i - 1], [xb, yb] = p[i];
+    return xb === xa ? yb : ya + (yb - ya) * (x - xa) / (xb - xa);
+  }
+  return p[p.length - 1][1];
+}
+function drawEnv(b, st) {
+  const p = envPts(b, st.morph ? envMorph() : dsp.env);
+  if (st.big) { for (let i = 1; i < 4; i++) line(p[i][0], b.y0, p[i][0], b.y1, C.grid, 2); line(b.x0, b.y1, b.x1, b.y1, C.grid); }
+  for (let x = R(p[0][0]); x <= R(p[4][0]); x++) { const y = R(polyY(p, x)); if (y < b.y1) fill(x, y + 1, x, b.y1, st.fill); }
+  for (let i = 0; i < 4; i++) (st.thick ? tline : line)(p[i][0], p[i][1], p[i + 1][0], p[i + 1][1], st.focus === i ? C.fg : st.line);
+  if (st.live) { const e = envState(); if (e) { const a = p[e.seg], c = p[e.seg + 1]; liveDot(lerp(a[0], c[0], e.frac), lerp(a[1], c[1], e.frac), st); } }
+}
+
+function fltDb(f, c, q, t) {
+  const r = Math.pow(10, (f - c) * 2.4), den = Math.sqrt((1 - r * r) ** 2 + (r / q) ** 2);
+  const m = t === 0 ? 1 / den : t === 2 ? r * r / den : (r / q) / den;
+  return 20 * Math.log10(Math.max(m, 1e-5));
+}
+function fltYs(b, cut, res, type) {
+  const ys = [], q = .6 + res * res * 8, top = b.y0 + 1, bot = b.y1, lo = -30, hi = 20;
+  const t0 = Math.floor(type), t1 = Math.min(2, t0 + 1), fr = type - t0;
+  for (let x = b.x0; x <= b.x1; x++) {
+    const f = (x - b.x0) / (b.x1 - b.x0);
+    const m = lerp(fltDb(f, cut, q, t0), fltDb(f, cut, q, t1), fr);
+    ys.push(clamp(top + (hi - m) / (hi - lo) * (bot - top), top, bot));
+  }
+  return ys;
+}
+function drawFlt(b, st) {
+  const v = dsp.flt;
+  if (st.big) { const cx = b.x0 + v.cut * (b.x1 - b.x0); line(cx, b.y0, cx, b.y1, st.focus === 1 ? C.lt : C.grid, 2); }
+  const type = st.morph ? morphSeq([0, 1, 2, 1]) : v.type;
+  drawYs(b.x0, fltYs(b, v.cut, v.res, type), b.y1, st.line, st.fill, st.thick);
+}
+
+function drawEg1(b, st) {
+  const v = dsp.flt, peak = Math.min(1, v.cut + dsp.eg1.depth * .5);
+  const ghost = fltYs(b, peak, v.res, v.type);           // where the envelope pushes the filter to
+  for (let i = 0; i < ghost.length; i += 2) px(b.x0 + i, ghost[i], C.lt);
+  const cutNow = st.morph ? lerp(v.cut, peak, morphSeq([0, 1], .6))
+               : st.live ? Math.min(1, v.cut + dsp.eg1.depth * .5 * eg1Level()) : v.cut;
+  drawYs(b.x0, fltYs(b, cutNow, v.res, v.type), b.y1, st.line, st.fill, st.thick);
+}
+
+function drawLfo(b, st) {
+  const v = dsp.lfo, w = b.x1 - b.x0, cy = R((b.y0 + b.y1) / 2), A = (b.y1 - b.y0) / 2 - 2, cyc = 1 + v.rate * 3;
+  const ph = st.live ? lfoPhase : 0, ys = [];
+  for (let x = b.x0; x <= b.x1; x++) ys.push(cy - v.depth * A * Math.sin(2 * Math.PI * ((x - b.x0) / w * cyc) - ph));
+  line(b.x0, cy, b.x1, cy, C.grid, 3);
+  drawYs(b.x0, ys, cy, st.focus === 1 ? C.fg : st.line, st.fill, st.thick);
+  if (st.live) liveDot(b.x1 - 1, ys[ys.length - 2], st);
+}
+
+// Echo (Ableton-style): repeats are concentric arcs receding into a tunnel, with a dot on
+// top of each. TIME = spacing between arcs, FDBK = how many stay bright, ECHO = brightness.
+// `ext` widens the arcs past a semicircle (used in the small tile so they match the cube's height).
+function echoArcs(cx, cy, Rmax, st, ext) {
+  const v = dsp.fx;
+  if (v.echo < .02) { arc(cx, cy, Rmax, Math.PI - ext, 2 * Math.PI + ext, C.lt); return; }
+  const k = .84 - v.time * .3, fbk = .3 + v.fb * .62, delayS = .06 + v.time * .45;
+  let r = Rmax, a = .4 + .6 * v.echo, i = 0;
+  while (r >= 2 && a > .03) {
+    const hit = st.live && bump(now - note.tOn - i * delayS) > .35;
+    const c = hit ? C.fg : a > .35 ? (st.focus === 0 && i === 0 ? C.fg : st.line) : a > .12 ? C.lt : C.grid;
+    arc(cx, cy, r, Math.PI - ext, 2 * Math.PI + ext, c);
+    if (st.big) disc(cx, cy - r, hit ? 1 : 0, C.fg); else px(cx, cy - r, C.fg);
+    r *= k; a *= fbk; i++;
+  }
+}
+// Big view: arcs + the sync row (6 crosses = 1/16 .. 1/2, the selected one is the big accent cross).
+function drawEcho(b, st) {
+  const cx = R((b.x0 + b.x1) / 2), rowY = b.y1 - 3, cy = b.y1 - 9, sel = Math.min(5, Math.floor(tgt.fx.time * 6));
+  for (let i = 0; i < 6; i++) {
+    const x = R(lerp(b.x0 + 5, b.x1 - 5, i / 5));
+    if (i === sel) { const c = st.focus === 2 ? C.fg : st.line; fill(x - 3, rowY, x + 3, rowY, c); fill(x, rowY - 3, x, rowY + 3, c); fill(x - 1, rowY - 1, x + 1, rowY + 1, c); }
+    else { fill(x - 2, rowY, x + 2, rowY, C.lt); fill(x, rowY - 2, x, rowY + 2, C.lt); }
+  }
+  echoArcs(cx, cy, Math.min((b.x1 - b.x0) / 2 - 1, cy - b.y0 - 1), st, 0);
+}
+const CV = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
+const CE = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+function cube(cx, cy, s, ang, c, dash) {
+  const tilt = .45, P = CV.map(([x, y, z]) => {
+    const x1 = x * Math.cos(ang) - z * Math.sin(ang), z1 = x * Math.sin(ang) + z * Math.cos(ang);
+    const y2 = y * Math.cos(tilt) - z1 * Math.sin(tilt), z2 = y * Math.sin(tilt) + z1 * Math.cos(tilt);
+    const k = 3.2 / (3.2 + z2); return [cx + x1 * s * k, cy + y2 * s * k];
+  });
+  for (const [a, b2] of CE) line(P[a][0], P[a][1], P[b2][0], P[b2][1], c, dash);
+}
+// Reverb: rotating wireframe room. SIZE = cube size; amount adds nested "rooms" (big view only).
+function verbCube(cx, cy, Rr, st, rooms) {
+  const v = dsp.fx, kick = st.live ? bump(now - note.tOn) * .1 : 0, ang = st.live ? now * .7 : .6;
+  const s = Rr * (.42 + .22 * v.size) * (1 + kick);
+  if (v.verb < .02) { cube(cx, cy, s, ang, C.lt, 2); return; }
+  if (rooms) { const inner = v.verb > .66 ? 2 : v.verb > .33 ? 1 : 0; for (let i = inner; i >= 1; i--) cube(cx, cy, s * (1 - i * .3), -ang * (1 + i * .5), C.lt, 2); }
+  cube(cx, cy, s, ang, st.line);
+}
+function drawFx(b, st) {
+  const mid = R((b.x0 + b.x1) / 2);
+  if (st.big) {
+    line(mid, b.y0, mid, b.y1, C.grid, 2);
+    text('ECHO', b.x0 + 1, b.y0, st.focus >= 0 && st.focus <= 2 ? C.fg : C.lt, null);
+    text('REVERB', mid + 3, b.y0, st.focus >= 3 ? C.fg : C.lt, null);
+    const top = b.y0 + 10;
+    drawEcho({ x0:b.x0, y0:top, x1:mid - 2, y1:b.y1 }, st);
+    verbCube((mid + 2 + b.x1) / 2, (top + b.y1) / 2, Math.min(b.x1 - mid - 2, b.y1 - top) / 2 * 1.25, st, true);
+    return;
+  }
+  // Small tile: echo and reverb the same height, each centred in its half, both on the tile's centre line.
+  const hw = (b.x1 - b.x0) / 4, my = (b.y0 + b.y1) / 2, Rm = Math.min(hw - 1, (b.y1 - b.y0) / 2 - 1), ext = .5;
+  echoArcs(R(b.x0 + hw), R(my + Rm * (1 - Math.sin(ext)) / 2), Rm, st, ext);
+  verbCube(b.x1 - hw, my, Rm, st, false);
+}
+
+function drawGld(b, st) {
+  const g = dsp.gld.time, w = b.x1 - b.x0, lo = b.y1 - 3, hi = b.y0 + 4, xa = b.x0 + w * .28, gw = g * w * .45, ys = [];
+  for (let x = b.x0; x <= b.x1; x++) {
+    let y;
+    if (x <= xa) y = lo; else if (x >= xa + gw) y = hi; else { const t = (x - xa) / gw; y = lerp(lo, hi, t * t * (3 - 2 * t)); }
+    ys.push(y);
+  }
+  if (st.big && g > .02) { line(b.x0, lo, xa, lo, C.lt, 2); line(xa, lo, xa, hi, C.lt, 2); line(xa, hi, b.x1, hi, C.lt, 2); }
+  drawYs(b.x0, ys, b.y1, st.line, st.fill, st.thick);
+  if (st.big && g < .01) textC('OFF', b.x0 + w * .7, b.y1 - 12, C.lt, null);
+  if (st.live) { const u = Math.min(1, (now * .45) % 1.25), i = R(u * w); liveDot(b.x0 + i, ys[i] - (st.big ? 3 : 2), st); }
+}
+const DRAW = [drawEnv, drawFlt, drawEg1, drawLfo, drawFx, drawGld];
+
+// ── Home icons ────────────────────────────────────────────────
+function icoParams(cx, cy, c, act) {
+  for (let i = -1; i <= 1; i++) {
+    const x = cx + i * 11; ring(x, cy, 4, c);
+    const a = act ? .6 * Math.PI * Math.sin(now * 2.2 + i * 1.9) : i * .7;
+    line(x, cy, x + Math.sin(a) * 3.4, cy - Math.cos(a) * 3.4, c);
+  }
+}
+// Cassette: the reels spin when selected (tape moving = sound stored).
+function icoPresets(cx, cy, c, act) {
+  const x0 = cx - 13, x1 = cx + 13, y0 = cy - 8, y1 = cy + 6, ry = cy - 2;
+  rrect(x0, y0, x1, y1, c);
+  rrect(x0 + 4, y0 + 2, x1 - 4, y0 + 10, c);                 // tape window
+  line(x0 + 6, y1, x0 + 8, y1 - 3, c); line(x0 + 8, y1 - 3, x1 - 8, y1 - 3, c); line(x1 - 8, y1 - 3, x1 - 6, y1, c);
+  const a0 = act ? now * 4 : .3;
+  for (const rx of [cx - 6, cx + 6]) {
+    ring(rx, ry, 3, c);
+    for (let s = 0; s < 3; s++) { const a = a0 + s * 2 * Math.PI / 3; px(rx + Math.cos(a) * 1.6, ry + Math.sin(a) * 1.6, c); }
+  }
+}
+function icoGear(cx, cy, c, act) {
+  const a0 = act ? now * 1.4 : 0;
+  for (let k = 0; k < 8; k++) { const a = a0 + k * Math.PI / 4; disc(cx + Math.cos(a) * 5.5, cy + Math.sin(a) * 5.5, 1, c); }
+  ring(cx, cy, 4, c); disc(cx, cy, 1, c);
+}
+
+// ── Screens ───────────────────────────────────────────────────
+const LOOPC = () => ({ rec:C.red, play:C.green, ovr:C.blue });
+function padCircle(cx, cy, active) {
+  const hw3 = [0, 2, 2, 3, 2, 2, 0], hw2 = [0, 1, 2, 1, 0], col = active ? C.green : C.lt;
+  for (let i = 0; i < 7; i++) fill(cx - hw3[i], cy - 3 + i, cx + hw3[i], cy - 3 + i, col);
+  if (!active) for (let i = 0; i < 5; i++) fill(cx - hw2[i], cy - 2 + i, cx + hw2[i], cy - 2 + i, C.bg);
+}
+function waveGlyph(id, x0, y0, x1, y1, c) {
+  const xm = (x0 + x1) >> 1, lw = (x1 - x0) >> 2;
+  if (id === 1) { line(x0, y1, x0 + lw, y1, c); line(x0 + lw, y0, x0 + lw, y1, c); line(x0 + lw, y0, x1 - lw, y0, c); line(x1 - lw, y0, x1 - lw, y1, c); line(x1 - lw, y1, x1, y1, c); }
+  else if (id === 0) { line(x0, y1, x1 - lw, y0, c); line(x1 - lw, y0, x1 - lw, y1, c); line(x1 - lw, y1, x1, y1, c); }
+  else { line(x0, y1, xm, y0, c); line(xm, y0, x1, y1, c); }
+}
+function drawRibbon(v) {
+  for (let i = 0; i < 8; i++) padCircle(6 + i * 10, 10, note.on && note.pad === i);
+  waveGlyph(wave, 90, 3, 110, 17, C.amber);
+  text('OCT 0', 116, 6, C.dk, C.bg);
+  if (loop.state !== 'idle') fill(154, 5, 158, 9, LOOPC()[loop.state]);
+  fill(0, 20, W - 1, 21, C.dk);
+  // Off the home screen, the separator doubles as a tiny loop progress line
+  if (v.screen !== 'home' && loop.state !== 'idle') {
+    const [lf, hf] = loopFracs();
+    fill(0, 20, R(lf * (W - 1)), 21, LOOPC()[loop.state]);
+    const hx = R(hf * (W - 1)); fill(hx, 20, hx + 1, 21, C.fg);
+  }
+}
+
+// Loop bar: 4 groups of 9 vertical bars = the max loop length. A shorter loop just colours
+// a part of it (no resizing, no numbers). The playhead bar is taller.
+function drawLoopBarRaw(y, state, lf, hf) {
+  const N = 9, bw = 2, gap = 2, gW = N * (bw + gap) - gap, gGap = 6, x0 = 3, col = LOOPC()[state];
+  const head = Math.min(35, Math.floor(hf * 36));
+  for (let g = 0; g < 4; g++) for (let i = 0; i < N; i++) {
+    const idx = g * N + i, x = x0 + g * (gW + gGap) + i * (bw + gap);
+    const rec = (idx + .5) / 36 <= lf;
+    if (idx === head) { fill(x, y - 1, x + bw - 1, y + 8, C.fg); continue; }
+    const top = i === 0 ? y : y + 1;        // first bar of each quarter is 1 px taller
+    fill(x, top, x + bw - 1, y + 6, rec ? col : C.grid);
+  }
+}
+function drawLoopBar(y) { if (loop.state === 'idle') return; const [lf, hf] = loopFracs(); drawLoopBarRaw(y, loop.state, lf, hf); }
+
+function scopeYs() {
+  const n = 156, e = envState(); let amp = e ? e.level : 0; amp *= .35 + .65 * vol.d;
+  const cut = clamp(dsp.flt.cut + dsp.eg1.depth * .5 * eg1Level() + dsp.lfo.depth * .12 * Math.sin(lfoPhase), .03, 1);
+  const a = .04 + .96 * cut * cut;
+  const raw = i => { const f = (i / n * 3) % 1; return wave === 0 ? 2 * f - 1 : wave === 1 ? (f < .5 ? 1 : -1) : 4 * Math.abs(f - .5) - 1; };
+  let y = 0; for (let i = 0; i < n; i++) y += a * (raw(i) - y);
+  const out = []; let pk = 0;
+  for (let i = 0; i < n; i++) { y += a * (raw(i) - y); out.push(y); pk = Math.max(pk, Math.abs(y)); }
+  const g = 1 / Math.max(.4, pk), la = (loop.state === 'play' || loop.state === 'ovr') ? .16 : 0;
+  return out.map((s, i) => clamp(54 - (s * g * amp * .9 + la * Math.sin(i / n * 2 * Math.PI * 5 + now * 3)) * 28, 24, 85));
+}
+const HOME_TILES = [[1, 52], [54, 105], [107, 158]], HOME_LBL = ['PARAMS', 'PRESETS', 'SETTINGS'], HOME_ICO = [icoParams, icoPresets, icoGear];
+const GRID_X = [[1, 52], [54, 105], [107, 158]], GRID_Y = [[23, 74], [76, 127]];
+const BODY = [1, 23, 158, 127];
+const homeRect   = i => [HOME_TILES[i][0], 89, HOME_TILES[i][1], 116];
+const gridRect   = i => [GRID_X[i % 3][0], GRID_Y[i < 3 ? 0 : 1][0], GRID_X[i % 3][1], GRID_Y[i < 3 ? 0 : 1][1]];
+const setRect    = i => [2, 26 + i * 17, 157, 40 + i * 17];
+const presetRect = i => [GRID_X[i % 3][0], i < 3 ? 26 : 72, GRID_X[i % 3][1], (i < 3 ? 26 : 72) + 40];
+function paramRect(gi, i) { const cw = 160 / GROUPS[gi].params.length; return [R(i * cw) + 1, 95, R((i + 1) * cw) - 2, 123]; }
+function selTarget(v) {
+  switch (v.screen) {
+    case 'home': return homeRect(v.homeSel);
+    case 'grid': return gridRect(v.gridSel);
+    case 'settings': return setRect(v.setSel);
+    case 'edit': return paramRect(v.group, v.focus);
+    default: return presetRect(0);
+  }
+}
+// The amber selection frame slides between items (sim) instead of jumping.
+const selOf = v => (v.anim || selTarget(v)).map(R);
+
+function drawHome(v) {
+  line(2, 54, 157, 54, C.grid, 3);
+  drawYs(2, scopeYs(), 54, C.amber, C.tint, true);
+  for (let i = 0; i < 3; i++) {
+    const [x0, x1] = HOME_TILES[i], sel = i === v.homeSel, cx = (x0 + x1) / 2;
+    rrect(x0, 89, x1, 116, C.lt);
+    HOME_ICO[i](R(cx), 99, sel ? C.amber : C.lt, sel);
+    textC(HOME_LBL[i], cx, 107, sel ? C.amber : C.dk, null);
+  }
+  rrect(...selOf(v), C.amber);
+  drawLoopBar(119);
+}
+
+function drawGrid(v) {
+  for (let i = 0; i < 6; i++) {
+    const [x0, y0, x1, y1] = gridRect(i), sel = i === v.gridSel;
+    rrect(x0, y0, x1, y1, C.lt);
+    disc(x0 + 5, y0 + 5, 2, sel ? C.amber : C.lt);
+    text(GROUPS[i].short, x0 + 10, y0 + 2, sel ? C.fg : C.dk, null);
+    DRAW[i]({ x0:x0 + 4, y0:y0 + 13, x1:x1 - 4, y1:y1 - 5 },
+            { line:sel ? C.amber : C.lt, fill:sel ? C.tint : C.grid, thick:false, live:sel && i >= 3, morph:sel && i < 3, focus:-1, big:false });
+  }
+  rrect(...selOf(v), C.amber);
+}
+
+function drawParams(v) {
+  const g = GROUPS[v.group], n = g.params.length, ed = v.editing, sr = selOf(v);
+  if (ed) rrectFill(...sr, C.amber); else rrect(...sr, C.amber);
+  for (let i = 0; i < n; i++) {
+    const p = g.params[i], pr = paramRect(v.group, i), x0 = pr[0], x1 = pr[2], cx = (x0 + x1) / 2;
+    const val = tgt[g.id][p.k], fr = p.steps ? val / (p.steps - 1) : val, isF = i === v.focus;
+    let lab = C.lt, vc = C.dk, bar = C.lt, track = C.grid;
+    if (isF && ed) { lab = vc = bar = C.bg; track = C.tint; }
+    else if (isF) { lab = bar = C.amber; vc = C.fg; }
+    textC(p.l, cx, 98, lab, null);
+    textC(fmt(g.id, p.k, val), cx, 108, vc, null);
+    const bx0 = x0 + 4, bx1 = x1 - 4;
+    fill(bx0, 119, bx1, 119, track);
+    fill(bx0, 118, R(bx0 + fr * (bx1 - bx0)), 119, bar);
+  }
+}
+function drawEdit(v) {
+  const g = GROUPS[v.group];
+  disc(5, 27, 2, C.amber);
+  text(g.name, 10, 24, C.fg, null);
+  rrect(1, 33, 158, 92, C.grid);
+  DRAW[v.group]({ x0:6, y0:37, x1:153, y1:88 },
+                { line:C.amber, fill:C.tint, thick:true, live:true, focus:v.focus, big:true });
+  drawParams(v);
+}
+
+const SET_ROWS = ['CALIBRATE', 'KEY / SCALE', 'THEME', 'EXPRESSION'], SET_VAL = ['>', 'C MAJ >', null, 'AMP >'];
+function drawSettings(v) {
+  rrect(...selOf(v), C.amber);
+  for (let i = 0; i < 4; i++) {
+    const y = 26 + i * 17, sel = i === v.setSel;
+    text(SET_ROWS[i], 7, y + 4, sel ? C.fg : C.dk, null);
+    if (SET_VAL[i]) { const s = SET_VAL[i]; text(s, 152 - tw(s), y + 4, sel ? C.amber : C.lt, null); }
+    else {
+      const on = themeT > .5, kx = R(132 + themeT * 15);
+      text(on ? 'DARK' : 'LIGHT', 122 - tw(on ? 'DARK' : 'LIGHT'), y + 4, sel ? C.amber : C.lt, null);
+      if (on) rrectFill(126, y + 3, 152, y + 11, C.amber); else rrect(126, y + 3, 152, y + 11, C.lt);
+      disc(kx, y + 7, 3, on ? C.bg : C.lt);
+    }
+  }
+  textC('DARK = FULL INVERT', 80, 99, C.lt, null);
+}
+const PNAMES = ['ACID', 'DREAMPAD', 'KALIMBA', 'WOBBLE', 'WAHWAH', 'BRASS'];
+function drawPresets() {
+  for (let i = 0; i < 6; i++) {
+    const [x0, y0, x1, y1] = presetRect(i), sel = i === 0;
+    rrect(x0, y0, x1, y1, sel ? C.amber : C.lt);
+    text('P' + (i + 1), x0 + 4, y0 + 4, sel ? C.amber : C.dk, null);
+    textC(PNAMES[i], (x0 + x1) / 2, y0 + 24, sel ? C.fg : C.dk, null);
+  }
+  textC('(UNCHANGED FOR NOW)', 80, 118, C.lt, null);
+}
+
+// Screen transition = the volume pop-up's box animation. Entering: the selected tile's
+// frame grows to fill the screen. Going back: a full-screen box shrinks into the tile
+// you came from and becomes its selection frame.
+function drawTrans(v) {
+  const t = v.trans; if (!t) return;
+  const e = 1 - (1 - t.p) ** 3, r = t.from.map((a, i) => R(lerp(a, t.to[i], e)));
+  rrectFill(...r, C.bg);
+  rrect(...r, C.amber);
+  if (r[2] - r[0] > 8 && r[3] - r[1] > 8) rrect(r[0] + 1, r[1] + 1, r[2] - 1, r[3] - 1, C.amber);
+}
+
+function drawVolume(p, value) {
+  if (p <= .02) return;
+  const e = 1 - (1 - p) ** 3, hw = R(52 * e), hh = R(25 * e), cx = 80, cy = 64;
+  rrectFill(cx - hw, cy - hh, cx + hw, cy + hh, C.bg);
+  rrect(cx - hw, cy - hh, cx + hw, cy + hh, C.amber);
+  if (hw > 4) rrect(cx - hw + 1, cy - hh + 1, cx + hw - 1, cy + hh - 1, C.amber);
+  if (p < .9) return;
+  text('VOLUME', 35, 45, C.lt, null);
+  // speaker, vertically centred between the VOLUME label (ends y52) and the bar (starts y75)
+  const sy = 64;
+  fill(35, sy - 3, 38, sy + 3, C.fg);
+  for (let i = 0; i <= 4; i++) fill(39 + i, sy - 3 - i, 39 + i, sy + 3 + i, C.fg);
+  const lit = value > .05 ? (value > .4 ? (value > .75 ? 3 : 2) : 1) : 0;
+  for (let k = 0; k < 3; k++) arc(43, sy, 4 + k * 3, -.75, .75, k < lit ? C.amber : C.grid);
+  const s = String(R(value * 100)); text(s, 125 - tw(s, 3), 47, C.fg, null, 3);
+  rrect(34, 75, 125, 82, C.lt);
+  fill(36, 77, R(36 + value * 87), 80, C.amber);
+}
+
+function drawView(v) {
+  fb.fill(C.bg);
+  drawRibbon(v);
+  if (v.screen === 'home') drawHome(v);
+  else if (v.screen === 'grid') drawGrid(v);
+  else if (v.screen === 'edit') drawEdit(v);
+  else if (v.screen === 'settings') drawSettings(v);
+  else if (v.screen === 'presets') drawPresets(v);
+  drawTrans(v);
+  if (v.volForce != null) drawVolume(1, v.volForce);
+  else if (v.sim) drawVolume(popup.p, vol.d);
+}
+
+// ── Simulator state + input ───────────────────────────────────
+const newSim = extra => Object.assign({ screen:'home', homeSel:0, gridSel:0, group:0, focus:0, editing:false, setSel:2, anim:null, trans:null }, extra);
+const sim = newSim({ sim:true });
+const HOME_OF = { grid:0, presets:1, settings:2 };
+function openTo(s, from, apply) { s.trans = { from, to:BODY, p:0, apply }; }
+function closeTo(s, to, apply) { apply(); s.anim = null; s.trans = { from:BODY, to, p:0, apply:null }; }
+function stepSim(s) {
+  const t = selTarget(s);
+  if (!s.anim) s.anim = t.slice();
+  else for (let i = 0; i < 4; i++) { const d = t[i] - s.anim[i]; s.anim[i] = Math.abs(d) < .3 ? t[i] : s.anim[i] + d * .38; }
+  if (s.trans) {
+    s.trans.p += (1 - s.trans.p) * .4;
+    if (s.trans.p > .97) { const ap = s.trans.apply; s.trans = null; if (ap) { ap(); s.anim = null; } }
+  }
+}
+function turn(d, s = sim) {
+  if (s.trans) return;
+  if (s === sim && popup.hold) { vol.t = clamp(vol.t + d * .04, 0, 1); return; }
+  if (s.screen === 'home') s.homeSel = clamp(s.homeSel + d, 0, 2);
+  else if (s.screen === 'grid') s.gridSel = clamp(s.gridSel + d, 0, 5);
+  else if (s.screen === 'settings') s.setSel = clamp(s.setSel + d, 0, 3);
+  else if (s.screen === 'edit') {
+    const g = GROUPS[s.group];
+    if (!s.editing) s.focus = clamp(s.focus + d, 0, g.params.length - 1);
+    else {
+      const p = g.params[s.focus], o = tgt[g.id];
+      o[p.k] = p.steps ? clamp(R(o[p.k]) + d, 0, p.steps - 1) : clamp(R((o[p.k] + d * .02) * 100) / 100, 0, 1);
+      syncSliders();
+    }
+  }
+}
+function click(s = sim) {
+  if (s.trans) return;
+  if (s.screen === 'home') { const i = s.homeSel; openTo(s, homeRect(i), () => { s.screen = ['grid', 'presets', 'settings'][i]; }); }
+  else if (s.screen === 'grid') { const i = s.gridSel; openTo(s, gridRect(i), () => { s.screen = 'edit'; s.group = i; s.focus = 0; s.editing = false; }); }
+  else if (s.screen === 'edit') s.editing = !s.editing;
+  else if (s.screen === 'settings' && s.setSel === 2) setTheme(theme === 'light' ? 'dark' : 'light');
+}
+function back(s = sim) {
+  if (s.trans) return;
+  if (s.screen === 'edit') { if (s.editing) s.editing = false; else closeTo(s, gridRect(s.group), () => { s.screen = 'grid'; s.gridSel = s.group; }); }
+  else if (s.screen !== 'home') { const i = HOME_OF[s.screen]; closeTo(s, homeRect(i), () => { s.screen = 'home'; s.homeSel = i; }); }
+}
+function setTheme(t) { theme = t; document.getElementById('cDark').checked = t === 'dark'; }
+function manualNote(on) { note.manual = on; if (on) noteOn(); else noteOff(); }
+
+// Auto tour for the gallery: R/L = turn, C = click, B = back
+const tour = newSim({});
+const TOUR = 'RRLLCRRRRCRRRBLLLLBRCBRCRLBLL';
+let tourI = 0, tourNext = 1;
+function stepTour() {
+  if (now < tourNext) return;
+  const k = TOUR[tourI++ % TOUR.length];
+  if (k === 'R') turn(1, tour); else if (k === 'L') turn(-1, tour); else if (k === 'C') click(tour); else back(tour);
+  tourNext = now + (k === 'C' || k === 'B' ? 1.6 : .75);
+}
+
+const $ = id => document.getElementById(id);
+$('bL').onclick = () => turn(-1); $('bR').onclick = () => turn(1);
+$('bClick').onclick = click; $('bBack').onclick = back;
+$('bLoop').onclick = loopNext; $('bClear').onclick = () => { loop.state = 'idle'; };
+$('bWave').onclick = () => { wave = (wave + 1) % 3; };
+for (const [id, fnOn, fnOff] of [['bHold', () => popup.hold = true, () => popup.hold = false], ['bPlay', () => manualNote(true), () => manualNote(false)]]) {
+  const b = $(id);
+  b.addEventListener('pointerdown', fnOn);
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, () => { if (id === 'bHold' ? popup.hold : note.manual) fnOff(); });
+}
+$('cAuto').onchange = e => { autoplay = e.target.checked; };
+$('cDark').onchange = e => { theme = e.target.checked ? 'dark' : 'light'; };
+$('dev').addEventListener('wheel', e => { e.preventDefault(); turn(e.deltaY > 0 ? 1 : -1); }, { passive:false });
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key;
+  if (k === 'ArrowLeft') { turn(-1); e.preventDefault(); }
+  else if (k === 'ArrowRight') { turn(1); e.preventDefault(); }
+  else if (k === 'Enter') { click(); e.preventDefault(); }
+  else if (k === 'Escape' || k === 'Backspace') { back(); e.preventDefault(); }
+  else if (e.repeat) return;
+  else if (k === 'v' || k === 'V') popup.hold = true;
+  else if (k === ' ') { manualNote(true); e.preventDefault(); }
+  else if (k === 'l' || k === 'L') loopNext();
+  else if (k === 'c' || k === 'C') loop.state = 'idle';
+  else if (k === 'w' || k === 'W') wave = (wave + 1) % 3;
+});
+addEventListener('keyup', e => {
+  if (e.key === 'v' || e.key === 'V') popup.hold = false;
+  if (e.key === ' ' && note.manual) manualNote(false);
+});
+
+// ── Gallery ───────────────────────────────────────────────────
+const views = [];
+function addView(cap, fn, h = 128) {
+  const fig = document.createElement('figure'), cv = document.createElement('canvas'), fc = document.createElement('figcaption');
+  cv.width = 160; cv.height = h; fc.textContent = cap; fig.append(cv, fc); $('gallery').append(fig);
+  views.push({ ctx:cv.getContext('2d'), fn });
+}
+addView('Transitions tour: the selection frame slides, entering grows the tile to full screen, back shrinks it into its tile',
+  () => drawView(tour));
+addView('Home: amber scope, three icons (the selected one animates), loop bar at the bottom',
+  () => drawView({ screen:'home', homeSel:Math.floor(now / 3) % 3 }));
+addView('Volume pop-up: stays open while you hold + turn, closes with a shrink',
+  () => drawView({ screen:'home', homeSel:0, volForce:.5 + .45 * Math.sin(now * .9) }));
+addView('PARAMS: 6 groups, only the selected tile is live',
+  () => drawView({ screen:'grid', gridSel:Math.floor(now / 2.5) % 6 }));
+GROUPS.forEach((g, i) => addView(g.name + ': big live icon, focused parameter outlined (editing fills it amber)',
+  () => drawView({ screen:'edit', group:i, focus:Math.floor(now / 2.2) % g.params.length, editing:Math.floor(now / 2.2) % 3 === 2 })));
+addView('SETTINGS: light/dark toggle (the knob slides)', () => drawView({ screen:'settings', setSel:2 }));
+addView('Loop bar: recording (red, grows), playing (green), overdub (blue). No numbers, no resizing', () => {
+  fb.fill(C.bg);
+  const rec = (now * .08) % .75, pl = .62, hp = ((now * .1) % 1) * pl, ho = (((now * .1) + .4) % 1) * pl;
+  text('REC', 3, 3, C.dk, null);  drawLoopBarRaw(13, 'rec', rec, rec);
+  text('PLAY', 3, 24, C.dk, null); drawLoopBarRaw(34, 'play', pl, hp);
+  text('OVR', 3, 45, C.dk, null);  drawLoopBarRaw(55, 'ovr', pl, ho);
+}, 66);
+
+// ── Sliders ───────────────────────────────────────────────────
+const sliderEls = [];
+GROUPS.forEach(g => {
+  const fs = document.createElement('fieldset'), lg = document.createElement('legend');
+  lg.textContent = g.name; fs.append(lg);
+  g.params.forEach(p => {
+    const row = document.createElement('div'), lb = document.createElement('label'), inp = document.createElement('input');
+    row.className = 'sl'; inp.type = 'range'; inp.id = 's-' + g.id + '-' + p.k;
+    inp.min = 0; inp.max = p.steps ? p.steps - 1 : 1; inp.step = p.steps ? 1 : .01; inp.value = tgt[g.id][p.k];
+    lb.htmlFor = inp.id; lb.textContent = p.l;
+    inp.oninput = () => { tgt[g.id][p.k] = parseFloat(inp.value); };
+    row.append(lb, inp); fs.append(row); sliderEls.push([inp, g.id, p.k]);
+  });
+  $('sliders').append(fs);
+});
+function syncSliders() { for (const [inp, g, k] of sliderEls) inp.value = tgt[g][k]; }
+
+// ── Main loop (~30 fps like the device) ───────────────────────
+const devCtx = $('dev').getContext('2d');
+let last = performance.now();
+function frame() {
+  const t = performance.now(), dt = Math.min(.1, (t - last) / 1000); last = t; now += dt;
+  tweenAll();
+  vol.d += (vol.t - vol.d) * .35;
+  popup.p += ((popup.hold ? 1 : 0) - popup.p) * .4;
+  themeT += ((theme === 'dark' ? 1 : 0) - themeT) * .35;
+  lfoPhase += 2 * Math.PI * Math.min(lfoHz(), 4) * dt;
+  if (autoplay && !note.manual) {
+    if (!note.on && now >= nextAuto) noteOn();
+    else if (note.on && now - note.tOn > .7) { noteOff(); nextAuto = now + 1.1 + Math.random() * .6; }
+  }
+  if (loop.state === 'rec' && now - loop.recStart >= loop.max) { loop.len = loop.max; loop.start = now; loop.state = 'play'; }
+  setPal();
+  stepSim(sim); stepSim(tour); stepTour();
+  drawView(sim); devCtx.putImageData(img, 0, 0);
+  for (const v of views) { v.fn(); v.ctx.putImageData(img, 0, 0); }
+}
+setInterval(frame, 33);
+</script>
+</body>
+</html>

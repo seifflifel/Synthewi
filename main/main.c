@@ -356,6 +356,7 @@ void app_main(void)
                         int v = (int)master_vol + delta * 5 * accel;   // 5 % per detent
                         master_vol = (uint8_t)(v < 0 ? 0 : v > 100 ? 100 : v);
                         output_set_master_volume(master_vol);
+                        ui_volume_popup(master_vol, true);    // stays open while held
                         delta = 0;
                     }
                     if (!g_turned_held) {
@@ -364,6 +365,7 @@ void app_main(void)
                     }
                 } else {                                   // released
                     if (g_turned_held) {                   // volume gesture: persist, no click
+                        ui_volume_popup(master_vol, false);    // pop-up shrinks away
                         nvs_handle_t h;
                         if (nvs_open("ui", NVS_READWRITE, &h) == ESP_OK) {
                             nvs_set_u8(h, "mvol", master_vol); nvs_commit(h); nvs_close(h);

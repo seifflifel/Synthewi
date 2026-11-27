@@ -33,6 +33,15 @@ void output_limiter_get_stats(limiter_stats_t *out);       // read + reset
 // Master volume 0-100 % (perceptual curve), applied after the limiter. Any task.
 void output_set_master_volume(uint8_t percent);
 
+// Oscilloscope tap: mono output (after the limiter, before master volume), every
+// SCOPE_DECIM-th frame, kept in a ring of SCOPE_RING samples. Written by the audio
+// thread, read by the UI. Samples stay below ~13000 (limiter ceiling).
+#define SCOPE_RING        512        // power of two
+#define SCOPE_DECIM       4          // 48 kHz / 4 = 12 kHz → 512 samples ≈ 43 ms
+// Copies the newest n (<= SCOPE_RING) samples into dst, oldest first. Any task;
+// a block written during the copy can tear the oldest samples (display only).
+void output_scope_read(int16_t *dst, int n);
+
 // Loop playback volume 0-100 % (perceptual curve), independent of master
 // volume (which still applies to everything). Non-destructive: only affects
 // how loud the loop is mixed in, not what is recorded.

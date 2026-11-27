@@ -11,13 +11,18 @@
 // (LIM_MAKEUP) for normal playing, and a peak limiter keeps build-ups below
 // LIM_THRESHOLD by turning the whole mix down smoothly (~500 ms recovery).
 //
+// Levels measured 2026-11-27 with make-up x2 were far below the limiter (it never
+// engaged): soft note -41 dBFS, firm note -31, 3-pad chord -22, 8 pads -16,
+// DREAMPAD chord -19. Make-up is now x8 (+12 dB more): a firm note ≈ -19 dBFS,
+// 3-pad chords stay just under the threshold, only 8-pad chords get limited.
+//
 // Runs in AMY's fill task (core 1) once per block: no logging, no allocation,
 // no locks. Cost: one peak scan + one multiply per sample.
 
 #include <math.h>
 #include "looper.h"
 
-#define LIM_MAKEUP        2.0f       // +6 dB: undoes amy_engine's volume 0.5
+#define LIM_MAKEUP        8.0f       // +18 dB: +6 undoes amy_engine's volume 0.5, +12 for level (see above)
 #define LIM_THRESHOLD     13000.0f   // ~-8 dBFS: just under AMY's old -6 dBFS ceiling
 #define LIM_RELEASE_COEF  0.0106f    // per block: 1-exp(-Tblock/500ms), Tblock = 256/48k (measured: 188 blocks/s)
 
@@ -27,6 +32,10 @@ static float s_gain = LIM_MAKEUP;    // current total gain (audio thread only)
 // limiter works). Set from the UI task; the audio thread ramps toward it.
 static volatile float s_master_target = 1.0f;
 static float          s_master        = 1.0f;   // audio thread only
+
+// Scope ring (written by the audio thread only; see output_scope_read)
+static int16_t           s_scope[SCOPE_RING];
+static volatile uint32_t s_scope_w = 0;
 
 // Diagnostics (written by audio thread, read+reset by output_limiter_get_stats)
 static volatile int16_t s_stat_peak     = 0;
@@ -63,6 +72,20 @@ void output_limiter_process(int16_t *block, int n_frames)
     float red = g1 / LIM_MAKEUP;  // 1.0 = no limiting
     if (red < s_stat_min_gain) s_stat_min_gain = red;
 
+    // Scope tap: limiter gain only (no master volume), so the display size
+    // doesn't depend on the volume knob. Every SCOPE_DECIM-th frame, mono.
+    {
+        float sg = g0, sstep = (g1 - g0) * SCOPE_DECIM / (float)n_frames;
+        uint32_t w = s_scope_w;
+        for (int f = 0; f < n_frames; f += SCOPE_DECIM) {
+            int32_t m = (int32_t)lrintf((block[f * 2] + block[f * 2 + 1]) * 0.5f * sg);
+            s_scope[w & (SCOPE_RING - 1)] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m);
+            w++;
+            sg += sstep;
+        }
+        s_scope_w = w;
+    }
+
     // Master volume: move toward the target within one block (no zipper noise)
     float m0 = s_master, m1 = s_master_target;
     s_master = m1;
@@ -79,6 +102,14 @@ void output_limiter_process(int16_t *block, int n_frames)
         block[f * 2]     = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
         block[f * 2 + 1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
     }
+}
+
+void output_scope_read(int16_t *dst, int n)
+{
+    if (n > SCOPE_RING) n = SCOPE_RING;
+    uint32_t w = s_scope_w;                    // newest sample is w-1
+    for (int i = 0; i < n; i++)
+        dst[i] = s_scope[(w - (uint32_t)n + (uint32_t)i) & (SCOPE_RING - 1)];
 }
 
 void output_set_master_volume(uint8_t percent)

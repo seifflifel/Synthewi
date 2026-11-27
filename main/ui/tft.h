@@ -23,6 +23,8 @@
 #define C_ORANGE  0x029Fu  // warm amber — TE accent (R=255,G=160,B=0 as seen on panel)
 #define C_DKGRAY  0x2104u
 #define C_LTGRAY  0x8410u
+#define C_TINT    0xBE9Fu  // pale amber (C_ORANGE at ~25 % on white) — fill under curves / scope
+#define C_GRID    0xE71Cu  // faint gray (~224) — guide lines, unrecorded loop bars
 
 // SPI bus + panel pins + ST7735 init sequence + framebuffer. Call once from the UI task.
 void tft_init(void);
@@ -45,3 +47,13 @@ void tft_text_bold(const char *str, int x, int y, uint16_t fg, uint16_t bg, int 
 void tft_rrect(int x0, int y0, int x1, int y1, uint16_t c);
 // Filled rounded rectangle (corner radius ≈ 2 px).
 void tft_rrect_fill(int x0, int y0, int x1, int y1, uint16_t c);
+
+// Clipped primitives (any int coordinates; off-screen parts are skipped).
+void tft_pixel(int x, int y, uint16_t c);
+void tft_rect(int x0, int y0, int x1, int y1, uint16_t c);          // filled, clipped
+void tft_line_dash(int x0, int y0, int x1, int y1, int every, uint16_t c); // 1 px every `every`
+void tft_line_thick(int x0, int y0, int x1, int y1, uint16_t c);    // ~2 px (right/down)
+void tft_disc(int cx, int cy, int r, uint16_t c);                   // filled circle
+void tft_ring(int cx, int cy, int r, uint16_t c);                   // circle outline
+// Arc of radius r from angle a0 to a1 (radians, 0 = right, +y = down).
+void tft_arc(int cx, int cy, int r, float a0, float a1, uint16_t c);

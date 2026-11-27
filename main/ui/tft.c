@@ -12,6 +12,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -346,5 +347,73 @@ void tft_rrect_fill(int x0, int y0, int x1, int y1, uint16_t c)
     for (int y = y0; y <= y1; y++) {
         int ins = (y == y0 || y == y1) ? 2 : (y == y0+1 || y == y1-1) ? 1 : 0;
         tft_fill(x0+ins, y, x1-ins, y, c);
+    }
+}
+
+// ── Clipped primitives (redesign 2026-11) ────────────────────
+void tft_pixel(int x, int y, uint16_t c) { fb_px(x, y, swap16(c)); }
+
+void tft_rect(int x0, int y0, int x1, int y1, uint16_t c)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > TFT_W - 1) x1 = TFT_W - 1;
+    if (y1 > TFT_H - 1) y1 = TFT_H - 1;
+    if (x1 < x0 || y1 < y0) return;
+    tft_fill((uint8_t)x0, (uint8_t)y0, (uint8_t)x1, (uint8_t)y1, c);
+}
+
+void tft_line_dash(int x0, int y0, int x1, int y1, int every, uint16_t c)
+{
+    uint16_t sw = swap16(c);
+    int dx = abs(x1-x0), dy = abs(y1-y0);
+    int sx = (x0<x1) ? 1 : -1, sy = (y0<y1) ? 1 : -1;
+    int err = dx - dy, n = 0;
+    if (every < 1) every = 1;
+    for (;;) {
+        if (n++ % every == 0) fb_px(x0, y0, sw);
+        if (x0==x1 && y0==y1) break;
+        int e2 = 2*err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+void tft_line_thick(int x0, int y0, int x1, int y1, uint16_t c)
+{
+    tft_line(x0, y0, x1, y1, c);
+    tft_line(x0, y0 + 1, x1, y1 + 1, c);
+    tft_line(x0 + 1, y0, x1 + 1, y1, c);
+}
+
+void tft_disc(int cx, int cy, int r, uint16_t c)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        int hw = (int)(sqrtf((float)(r * r - dy * dy)) + 0.35f);
+        tft_rect(cx - hw, cy + dy, cx + hw, cy + dy, c);
+    }
+}
+
+void tft_ring(int cx, int cy, int r, uint16_t c)
+{
+    uint16_t sw = swap16(c);
+    int x = r, y = 0, e = 1 - r;
+    while (x >= y) {
+        fb_px(cx + x, cy + y, sw); fb_px(cx + y, cy + x, sw);
+        fb_px(cx - y, cy + x, sw); fb_px(cx - x, cy + y, sw);
+        fb_px(cx - x, cy - y, sw); fb_px(cx - y, cy - x, sw);
+        fb_px(cx + y, cy - x, sw); fb_px(cx + x, cy - y, sw);
+        y++;
+        if (e < 0) e += 2 * y + 1; else { x--; e += 2 * (y - x) + 1; }
+    }
+}
+
+void tft_arc(int cx, int cy, int r, float a0, float a1, uint16_t c)
+{
+    uint16_t sw = swap16(c);
+    int n = r * 3; if (n < 6) n = 6;
+    for (int i = 0; i <= n; i++) {
+        float a = a0 + (a1 - a0) * (float)i / (float)n;
+        fb_px(cx + (int)lrintf(cosf(a) * r), cy + (int)lrintf(sinf(a) * r), sw);
     }
 }

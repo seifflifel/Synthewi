@@ -26,6 +26,7 @@ static bool           s_rb_pad[TOUCH_NOTE_PADS];
 static uint8_t        s_rb_wave;
 static int            s_rb_oct;
 static looper_state_t s_rb_loop;
+static int            s_rb_sep = -1;   // separator key (home flag + loop progress pixels)
 
 // Draws a waveform pixel-art glyph inside box (x0,y0)-(x1,y1).
 // Reusable for both the menu cell and the future ribbon bar.
@@ -112,6 +113,32 @@ static void ribbon_draw_loop(looper_state_t ls)
     s_rb_loop = ls;
 }
 
+// Separator (y=20..21). Off the HOME screen it doubles as a thin loop progress
+// line: recorded part in the loop colour, playhead dark. Returns a key that
+// changes whenever the drawing would.
+static int ribbon_sep_key(void)
+{
+    if (ui_on_home) return 0;
+    looper_progress_t lp;
+    looper_get_progress(&lp);
+    if (lp.state == LOOPER_IDLE || lp.max_length == 0) return 0;
+    uint32_t len = (lp.state == LOOPER_RECORDING) ? lp.position : lp.length;
+    int lf = (int)((uint64_t)len * (TFT_W - 1) / lp.max_length);
+    int hf = (int)((uint64_t)lp.position * (TFT_W - 1) / lp.max_length);
+    return 1 + (int)lp.state * 100000 + lf * 256 + hf;
+}
+static void ribbon_draw_sep(void)
+{
+    s_rb_sep = ribbon_sep_key();
+    tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY);
+    if (s_rb_sep == 0) return;
+    int st = (s_rb_sep - 1) / 100000, rest = (s_rb_sep - 1) % 100000;
+    int lf = rest / 256, hf = rest % 256;
+    uint16_t col = st == LOOPER_RECORDING ? C_RED : st == LOOPER_PLAYING ? C_GREEN : C_BLUE;
+    tft_rect(0, 20, lf, 21, col);
+    tft_rect(hf, 20, hf + 1, 21, C_WHITE);
+}
+
 // Full ribbon repaint — used on section changes (called last by ui_redraw).
 void ui_draw_ribbon(void)
 {
@@ -123,7 +150,7 @@ void ui_draw_ribbon(void)
     ribbon_draw_wave(st.wave_id);
     ribbon_draw_oct(s_octave_shift, oct_flash_red());
     ribbon_draw_loop(looper_get_state());
-    tft_fill(0, 20, TFT_W-1, 21, C_DKGRAY); // separator
+    ribbon_draw_sep();
     s_rb_valid = true;
 }
 
@@ -150,6 +177,8 @@ void ui_ribbon_update(void)
 
     looper_state_t ls = looper_get_state();
     if (ls != s_rb_loop) ribbon_draw_loop(ls);
+
+    if (ribbon_sep_key() != s_rb_sep) ribbon_draw_sep();
 }
 
 // ── Public API ────────────────────────────────────────────────

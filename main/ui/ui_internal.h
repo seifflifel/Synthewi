@@ -10,7 +10,8 @@
 #include "tft.h"
 
 // ── Shared UI state ───────────────────────────────────────────
-extern int      ui_card_cur;      // 0=MAIN 1=PRST 2=CAL
+extern int      ui_card_cur;      // HOME tile: 0=PARAMS (MAIN) 1=PRESETS 2=SETTINGS (CAL for now)
+extern bool     ui_on_home;       // HOME is the current screen (ribbon separator shows loop progress elsewhere)
 
 // MAIN 6-card overview + per-card edit
 extern int      ui_main_card;     // 0-5: selected card in overview
@@ -71,7 +72,22 @@ static inline uint32_t ui_glide_ms(uint16_t v)     { return amy_engine_glide_ms(
 static inline unsigned ui_fenv_oct10(uint16_t v)   { return (unsigned)lroundf(amy_engine_fenv_depth_oct(v) * 10.0f); }
 static inline unsigned ui_lfo_oct10(uint16_t v)    { return (unsigned)lroundf(amy_engine_lfo_depth_oct(v) * 10.0f); }
 
+// ── Motion (ui_anim.c) ────────────────────────────────────────
+extern const int UI_BODY_RECT[4];             // body area below the ribbon (transition target)
+float ui_now_s(void);                         // seconds (wraps hourly) for animations
+float ui_tween(float cur, float target, float *last_s); // time-based ease toward target
+void  ui_trans_start(const int from[4], const int to[4], int tag);
+bool  ui_trans_active(void);
+int   ui_trans_step(void);                    // returns tag once the transition finished, else -1
+void  ui_trans_draw(void);
+bool  ui_popup_active(void);
+void  ui_popup_draw(void);
+bool  ui_anim_busy(void);                     // a transition or pop-up needs per-tick redraws
+
 // ── Screen draw functions ─────────────────────────────────────
+// ui_home.c
+void ui_draw_home(void);
+void ui_home_tile_rect(int i, int r[4]);
 // ui_ribbon.c
 void ui_draw_wave_glyph(uint8_t wave_id, int x0, int y0, int x1, int y1, uint16_t fg);
 void ui_draw_ribbon(void);

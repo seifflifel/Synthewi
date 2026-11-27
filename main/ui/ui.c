@@ -14,10 +14,11 @@
 #include "ui_internal.h"
 
 // ── UI state ─────────────────────────────────────────────────
-typedef enum { UI_CARDS, UI_MAIN, UI_CALIB, UI_EFFECTS, UI_ADSR, UI_PRESETS } ui_section_t;
+typedef enum { UI_HOME, UI_MAIN, UI_CALIB, UI_EFFECTS, UI_ADSR, UI_PRESETS } ui_section_t;
 
-static ui_section_t s_sec       = UI_CARDS;
-int                 ui_card_cur = 0;  // 0=MAIN 1=PRST 2=CAL
+static ui_section_t s_sec       = UI_HOME;
+int                 ui_card_cur = 0;  // HOME tile: 0=PARAMS (MAIN) 1=PRESETS 2=SETTINGS (CAL for now)
+bool                ui_on_home  = true;
 static bool         s_dirty     = true;
 
 // CAL edit live refresh: redraw only bar + numbers, not the whole screen.
@@ -77,7 +78,7 @@ static int echo_snap_idx(uint16_t v) {
 static void ui_redraw(void)
 {
     switch (s_sec) {
-        case UI_CARDS:   ui_draw_cards();   break;
+        case UI_HOME:    ui_draw_home();    break;   // ui_draw_cards() (old top screen) is kept but unused
         case UI_MAIN:    ui_draw_main();    break;
         case UI_CALIB:   ui_draw_calib();   break;
         case UI_EFFECTS: ui_draw_effects(); break;
@@ -154,7 +155,9 @@ static void ui_enter(ui_section_t sec)
     }
 }
 
-static void ui_exit_to_cards(void)
+// Back to HOME: save what needs saving, then a full-body box shrinks into the
+// tile we came from (ui_card_cur) and becomes its selection frame.
+static void ui_exit_to_home(void)
 {
     if (s_sec == UI_CALIB && ui_cal_editing) {
         cal_save();
@@ -163,7 +166,10 @@ static void ui_exit_to_cards(void)
     if (s_sec == UI_MAIN || s_sec == UI_EFFECTS || s_sec == UI_ADSR) {
         amy_engine_save_state();
     }
-    ui_enter(UI_CARDS);
+    ui_enter(UI_HOME);
+    int r[4];
+    ui_home_tile_rect(ui_card_cur, r);
+    ui_trans_start(UI_BODY_RECT, r, -1);
 }
 
 // Persist the CAL edit values (MIN for every pad, MAX for note pads).
@@ -198,15 +204,23 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
     // Looper: double click works everywhere; recording starts on the 2nd click.
     if (double_click) looper_cycle();   // ribbon dot updates via ui_ribbon_update()
 
+    // Screen transition: an "enter" transition switches section when it ends.
+    // While one runs, navigation input is ignored (the looper still works).
+    {
+        int tag = ui_trans_step();
+        if (tag >= 0) ui_enter((ui_section_t)tag);
+        if (ui_trans_active()) { delta = 0; vdelta = 0; short_press = long_press = vlong_press = false; }
+    }
+
     // A loop clear is armed only by a hold whose long-press fired on the top
     // screen. Every hold fires long_press before vlong_press, so this is
     // re-evaluated for each hold.
     static bool s_clear_armed = false;
-    if (long_press) s_clear_armed = (s_sec == UI_CARDS);
+    if (long_press) s_clear_armed = (s_sec == UI_HOME);
 
     switch (s_sec) {
 
-    case UI_CARDS:
+    case UI_HOME:
         if (delta) {
             ui_card_cur = ui_card_cur + delta;              // lists stop at the ends (no wrap)
             if (ui_card_cur < 0) ui_card_cur = 0;
@@ -214,11 +228,11 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             s_dirty = true;
         }
         if (short_press) {
-            switch (ui_card_cur) {
-                case 0: ui_enter(UI_MAIN);    break;
-                case 1: ui_enter(UI_PRESETS); break;
-                case 2: ui_enter(UI_CALIB);   break;
-            }
+            // Enter: the tile's frame grows to fill the body, then the section opens.
+            static const ui_section_t dest[3] = {UI_MAIN, UI_PRESETS, UI_CALIB};
+            int r[4];
+            ui_home_tile_rect(ui_card_cur, r);
+            ui_trans_start(r, UI_BODY_RECT, (int)dest[ui_card_cur]);
         }
         // long_press on the top screen only arms the clear (see above)
         if (vlong_press && s_clear_armed) {
@@ -275,7 +289,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                 s_dirty = true;
             }
             if (short_press) { ui_main_in_card = true; ui_main_param = 0; ui_main_editing = false; s_dirty = true; }
-            if (long_press)  { amy_engine_save_state(); ui_enter(UI_CARDS); }
+            if (long_press)  ui_exit_to_home();   // saves state
         } else {
             // Card edit, two modes (car-radio style "direct manipulation"):
             //   focus: rotate moves between params (stops at the ends), click → edit
@@ -369,7 +383,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                 ui_cal_editing = true;
                 s_dirty       = true;
             }
-            if (long_press) ui_exit_to_cards();
+            if (long_press) ui_exit_to_home();
         } else {
             // Note pads: click 1 edits MIN (orange), click 2 edits MAX (blue),
             // click 3 saves. Octave pads: single threshold, click saves.
@@ -399,7 +413,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             }
             if (long_press) {
                 cal_save();
-                ui_exit_to_cards();
+                ui_exit_to_home();
             }
         }
         break;
@@ -449,7 +463,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             }
             if (short_press) { ui_fx_editing = false; s_dirty = true; }
         }
-        if (long_press) ui_exit_to_cards();
+        if (long_press) ui_exit_to_home();
         break;
 
     case UI_ADSR:
@@ -472,7 +486,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
             }
             if (short_press) { ui_adsr_editing = false; s_dirty = true; }
         }
-        if (long_press) ui_exit_to_cards();
+        if (long_press) ui_exit_to_home();
         break;
 
     case UI_PRESETS:
@@ -489,7 +503,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                 ui_prst_act = preset_is_valid(ui_prst_cur) ? 0 : 1;
                 s_dirty = true;
             }
-            if (long_press) ui_exit_to_cards();
+            if (long_press) ui_exit_to_home();
         } else {
             if (delta) {
                 ui_prst_act = ui_prst_act + delta;          // stop at the ends
@@ -528,12 +542,20 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
     if (s_sec == UI_CALIB && ui_cal_editing && (now - last_refresh) >= pdMS_TO_TICKS(50))
         s_cal_live = true;
 
-    if (s_dirty) {
+    // HOME (live scope, animated icons) and running transitions / pop-ups are
+    // redrawn every tick; the framebuffer diff only sends what changed. One
+    // extra full redraw after an animation ends erases its last frame.
+    ui_on_home = (s_sec == UI_HOME);
+    static bool s_was_anim = false;
+    bool anim = ui_on_home || ui_anim_busy();
+    if (s_dirty || anim || s_was_anim) {
         // Layout / section change → full repaint (body + ribbon)
         s_dirty      = false;
         s_cal_live   = false;
         last_refresh = now;
         ui_redraw();
+        ui_trans_draw();
+        ui_popup_draw();
     } else {
         // Partial refresh only
         if (s_cal_live) {
@@ -543,6 +565,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
         }
         ui_ribbon_update();
     }
+    s_was_anim = anim;
 
     // Everything above only drew into the framebuffer; send the changes now.
     tft_flush();
