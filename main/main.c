@@ -11,12 +11,12 @@
 #include "touch_telemetry.h"
 #include "looper.h"
 #include "ui.h"
+#include "scale.h"
 // #include "mux_pots.h"  // MUX pots disabled — encoder-only control
 
 static const char *TAG = "Synthewi";
 
-// C pentatonic: C4 D4 E4 G4 A4 C5 D5 E5
-static const uint8_t s_base_notes[8] = {60, 62, 64, 67, 69, 72, 74, 76};
+// Pad notes = key + scale (scale.c, default C pentatonic C4 D4 E4 G4 A4 C5 D5 E5) + octave
 static uint8_t       s_notes[8]      = {60, 62, 64, 67, 69, 72, 74, 76};
 
 // Octave shift (-2..+2), owned here: written by on_touch() (touch task) via the
@@ -26,7 +26,7 @@ static volatile int  s_octave_shift  = 0;
 static void apply_octave(void)
 {
     for (int i = 0; i < 8; i++) {
-        int n = (int)s_base_notes[i] + s_octave_shift * 12;
+        int n = (int)scale_pad_note(i) + s_octave_shift * 12;   // key + scale (SETTINGS)
         s_notes[i] = (uint8_t)(n < 0 ? 0 : n > 127 ? 127 : n);
     }
 }
@@ -44,6 +44,7 @@ static void on_touch(uint8_t pad, bool on, float velocity)
     if (pad < 8) {
         ui_set_pad_active(pad, on);
         if (on) {
+            apply_octave();   // picks up key / scale changes made in SETTINGS
             ESP_LOGI(TAG, "pad %u ON  note %u  vel %3d%%", pad + 1, s_notes[pad], (int)(velocity * 100.0f + 0.5f));
             amy_engine_note_on(pad, s_notes[pad], velocity);
         } else {
@@ -178,6 +179,7 @@ void app_main(void)
         ESP_ERROR_CHECK(err);
     }
 
+    scale_init();   // key + scale for the pads (NVS ui/key, ui/scale)
     amy_engine_init();
     esp_log_level_set("AMY_ENGINE", ESP_LOG_WARN);
     vTaskDelay(pdMS_TO_TICKS(200)); // let AMY render task process echo event and allocate PSRAM before looper grabs it

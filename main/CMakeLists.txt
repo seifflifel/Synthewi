@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "touch_telemetry.c"
+idf_component_register(SRCS "main.c" "touch_telemetry.c" "scale.c"
                             "ui/ui.c" "ui/tft.c" "ui/presets.c"
                             "ui/ui_ribbon.c" "ui/ui_cards.c" "ui/ui_main.c"
                             "ui/ui_presets.c" "ui/ui_calib.c" "ui/ui_legacy.c"

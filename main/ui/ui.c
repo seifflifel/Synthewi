@@ -11,6 +11,7 @@
 #include "looper.h"
 #include "presets.h"
 #include "ui.h"
+#include "scale.h"
 #include "ui_internal.h"
 
 // ── UI state ─────────────────────────────────────────────────
@@ -372,9 +373,9 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                     amy_engine_set_adsr(ui_main_adsr[0],ui_main_adsr[1],ui_main_adsr[2],ui_main_adsr[3]);
                     break;
                 case 1: // FLT
-                    if (p == 0)      { ui_main_flt_cut = u16clamp((int)ui_main_flt_cut + vdelta*500); amy_engine_set_filter(ui_main_flt_cut,ui_main_flt_res); }
-                    else if (p == 1) { ui_main_flt_res = u16clamp((int)ui_main_flt_res + vdelta*500); amy_engine_set_filter(ui_main_flt_cut,ui_main_flt_res); }
-                    else { // TYPE: LPF/BPF/HPF, stops at the ends
+                    if (p == 1)      { ui_main_flt_cut = u16clamp((int)ui_main_flt_cut + vdelta*500); amy_engine_set_filter(ui_main_flt_cut,ui_main_flt_res); }
+                    else if (p == 2) { ui_main_flt_res = u16clamp((int)ui_main_flt_res + vdelta*500); amy_engine_set_filter(ui_main_flt_cut,ui_main_flt_res); }
+                    else { // p == 0 TYPE: LPF/BPF/HPF, stops at the ends
                         int t = (int)ui_main_flt_type + (delta > 0 ? 1 : -1);
                         if (t < 0) t = 0;
                         if (t > 2) t = 2;
@@ -430,7 +431,12 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
         break;
 
     case UI_SETTINGS:
-        if (delta) {
+        if (delta && ui_set_editing) {        // KEY / SCALE: applied at once (audible), saved on click
+            int k = scale_key(), t = scale_type();
+            if (ui_set_cur == 1) { k += delta; k = k < 0 ? 0 : k > SCALE_KEYS - 1 ? SCALE_KEYS - 1 : k; }
+            else                 { t += delta; t = t < 0 ? 0 : t > SCALE_TYPES - 1 ? SCALE_TYPES - 1 : t; }
+            scale_set((uint8_t)k, (uint8_t)t);
+        } else if (delta) {
             ui_set_cur += delta;
             if (ui_set_cur < 0) ui_set_cur = 0;
             if (ui_set_cur > UI_SET_ROWS - 1) ui_set_cur = UI_SET_ROWS - 1;
@@ -441,11 +447,17 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
                 ui_settings_row_rect(0, r);
                 trans_begin(r, UI_BODY_RECT, true);
                 ui_enter(UI_CALIB);
+            } else if (ui_set_cur == 1 || ui_set_cur == 2) {
+                if (ui_set_editing) ui_settings_picker_close(true);   // keep + save
+                else                ui_settings_picker_open();
             } else {
                 ui_theme_toggle();
             }
         }
-        if (long_press) ui_exit_to_home();
+        if (long_press) {
+            if (ui_set_editing) ui_settings_picker_close(false);  // cancel: restore
+            else ui_exit_to_home();
+        }
         break;
 
     case UI_CALIB:
@@ -637,7 +649,7 @@ void ui_tick(int delta, int accel, bool short_press, bool long_press, bool vlong
     // extra full redraw after an animation ends erases its last frame.
     ui_on_home = (s_sec == UI_HOME);
     static bool s_was_anim = false;
-    bool anim = ui_on_home || s_sec == UI_MAIN || s_sec == UI_PRESETS || s_sec == UI_SETTINGS || ui_anim_busy();
+    bool anim = ui_on_home || s_sec == UI_MAIN || s_sec == UI_PRESETS || s_sec == UI_SETTINGS || s_sec == UI_CALIB || ui_anim_busy();
     if (s_dirty || anim || s_was_anim) {
         // Layout / section change → full repaint (body + ribbon)
         s_dirty      = false;

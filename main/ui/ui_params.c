@@ -36,7 +36,7 @@ static const char * const s_short[6] = {"ENV", "FLT", "EG1", "LFO", "FX", "GLD"}
 static const char * const s_name[6]  = {"ENVELOPE", "FILTER", "FILTER ENV", "LFO", "EFFECTS", "GLIDE"};
 static const int s_np[6] = {4, 3, 2, 2, 5, 1};
 static const char * const s_lbl[6][5] = {
-    {"ATK", "DEC", "SUS", "REL"}, {"CUT", "RES", "TYPE"}, {"DEPTH", "DECAY"},
+    {"ATK", "DEC", "SUS", "REL"}, {"TYPE", "CUT", "RES"}, {"DEPTH", "DECAY"},
     {"RATE", "DEPTH"}, {"ECHO", "FDBK", "TIME", "REV", "SIZE"}, {"TIME"},
 };
 
@@ -223,7 +223,7 @@ static void draw_flt(const box_t *b, const ico_t *st)
     float cut = s_v[V_CUT];
     if (st->big) {
         int cx = ri(b->x0 + cut * (b->x1 - b->x0));
-        tft_line_dash(cx, b->y0, cx, b->y1, 2, st->focus == 0 ? C_LTGRAY : C_GRID);
+        tft_line_dash(cx, b->y0, cx, b->y1, 2, st->focus == 1 ? C_LTGRAY : C_GRID);
     }
     static const float seq[4] = {0, 1, 2, 1};
     float type = st->morph ? morph_seq(seq, 4, 0.55f) : s_v[V_TYPE];
@@ -415,11 +415,11 @@ static void fmt_param(int card, int p, char *b, size_t n)
         else fmt_ms(b, n, ui_r_ms(ui_main_adsr[3]));
         break;
     case 1:
-        if (p == 0) {
+        if (p == 1) {
             float hz = ui_filter_hz(ui_main_flt_cut);
             if (hz >= 1000.0f) { unsigned d = (unsigned)lrintf(hz / 100.0f); snprintf(b, n, "%u.%uK", d / 10, d % 10); }
             else snprintf(b, n, "%uHZ", (unsigned)hz);
-        } else if (p == 1) {
+        } else if (p == 2) {
             unsigned q = (unsigned)lrintf(ui_filter_q(ui_main_flt_res) * 10.0f);
             snprintf(b, n, "Q%u.%u", q / 10, q % 10);
         } else snprintf(b, n, "%s", flt[ui_main_flt_type % 3]);
@@ -451,7 +451,7 @@ static float param_frac(int card, int p)
 {
     switch (card) {
     case 0: return u01(ui_main_adsr[p]);
-    case 1: return p == 0 ? u01(ui_main_flt_cut) : p == 1 ? u01(ui_main_flt_res) : ui_main_flt_type / 2.0f;
+    case 1: return p == 0 ? ui_main_flt_type / 2.0f : p == 1 ? u01(ui_main_flt_cut) : u01(ui_main_flt_res);
     case 2: return p == 0 ? u01(ui_main_eg1_depth) : u01(ui_main_eg1_decay);
     case 3: return p == 0 ? u01(ui_main_lfo_rate) : u01(ui_main_lfo_depth);
     case 4: {

@@ -95,13 +95,16 @@ void ui_home_tile_rect(int i, int r[4]);
 extern int ui_prst_loaded;
 void ui_presets_tile_rect(int i, int r[4]);
 // ui_settings.c
-#define UI_SET_ROWS 2                          // CALIBRATE, THEME
+#define UI_SET_ROWS 4                          // CALIBRATE, KEY, SCALE, THEME
 extern int  ui_set_cur;
+extern bool ui_set_editing;                    // KEY / SCALE row being edited
 extern bool ui_dark;
 void ui_draw_settings(void);
 void ui_settings_row_rect(int i, int r[4]);
 void ui_theme_load(void);
 void ui_theme_toggle(void);
+void ui_settings_picker_open(void);
+void ui_settings_picker_close(bool keep);
 // ui_params.c (PARAMS grid + edit view, replaces ui_draw_main)
 void ui_draw_params(void);
 void ui_params_tile_rect(int i, int r[4]);
